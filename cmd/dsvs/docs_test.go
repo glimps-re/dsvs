@@ -8,11 +8,11 @@ import (
 	"testing"
 )
 
-// The usage block of the README comes from the help: it is not written by hand, and this test keeps
+// The usage block of BETA.md comes from the help: it is not written by hand, and this test keeps
 // it in line — in CI as under the pre-commit hook. inserted is the only one that knows how to replace
 // the block, so comparing its output to the file is exactly what go generate would write there.
 func TestTheREADMEBlockIsTheHelp(t *testing.T) {
-	path := filepath.Join("..", "..", "README.md")
+	path := filepath.Join("..", "..", "BETA.md")
 	readme, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -22,7 +22,7 @@ func TestTheREADMEBlockIsTheHelp(t *testing.T) {
 		t.Fatal(err)
 	}
 	if updated != string(readme) {
-		t.Error("the usage block of the README drifted from the help: go generate ./cmd/dsvs brings it back in line")
+		t.Error("the usage block of BETA.md drifted from the help: go generate ./cmd/dsvs brings it back in line")
 	}
 }
 

@@ -33,12 +33,12 @@ Les mêmes sessions, pilotées d'où vous êtes. Fermez n'importe laquelle : les
 
 ```sh
 dsvs start front api   # démarre ces apps, et ce dont elles ont besoin autour
-dsvs logs api          # la fin du journal de l'api
+dsvs logs -f front     # suit le journal du front
 dsvs status            # ce qui tourne sur la machine, et qui tient les ports
 dsvs quit              # arrête les apps du projet d'ici, et ferme sa session
 ```
 
-`dsvs help` liste toutes les commandes, comme le montre [Les commandes](#les-commandes), et `dsvs help <commande>` en détaille une.
+`dsvs help` liste toutes les commandes, `dsvs help <commande>` en détaille une.
 
 **L'interface en terminal**, `dsvs --tui` : les apps et les façades du projet d'ici à gauche, le journal de celle qu'on a choisie à droite. `?` liste ses touches.
 
@@ -148,10 +148,6 @@ dsvs démarre ce dont il a besoin autour, et le dit.
 
 Tout démarre au besoin, et le dit.
 
-## Les commandes
-
-La liste des commandes et des options est la sortie de `dsvs help`, reproduite dans la [section Commands du README anglais](README.md#commands). `dsvs help <commande>` détaille une commande et ses options ; `?` liste les touches de la TUI.
-
 ## L'installation en détail
 
 ### Prérequis
@@ -206,11 +202,9 @@ export default {
 } satisfies Config;
 ```
 
-[`config.ts`](config.ts) déclare chaque champ et le documente : c'est la référence. Il n'y a pas encore de paquet : un projet en garde une copie, prise au tag de son binaire. Il exporte aussi `group(nom, apps)`, qui construit un groupe à partir de déclarations d'apps.
+[`config.ts`](https://github.com/glimps-re/dsvs/blob/v0.1.0/config.ts) déclare chaque champ et le documente : c'est la référence. Il n'y a pas encore de paquet : un projet en garde une copie, prise au tag de son binaire. Il exporte aussi `group(nom, apps)`, qui construit un groupe à partir de déclarations d'apps.
 
-Le fichier est du code : il peut lire un manifeste, interroger le workspace, ou importer un fichier de cibles resté hors de git. `DSVS_CONFIG` porte son chemin absolu pendant l'évaluation, de quoi se situer sans rien deviner. L'`export default` peut aussi être une fonction, `async` comprise.
-
-Node retire les types sans les vérifier : `satisfies Config` ne protège que dans l'éditeur. dsvs vérifie donc la forme de ce que le fichier construit, et le refuse comme une faute de syntaxe — la configuration d'avant continue de tourner — pour une clé qu'il ne lit pas, en proposant celle que vous vouliez sans doute dire, comme pour une valeur du mauvais type, chacune par son chemin : `apps[1]: unknown key "evn" (did you mean "env"?)`, `port: a number, not "4380"`. Un dsvs plus ancien le dit de même d'une clé qu'il ne connaît pas encore.
+Le fichier est du code : il peut lire un manifeste, interroger le workspace, ou importer un fichier de cibles resté hors de git. `DSVS_CONFIG` porte son chemin absolu pendant l'évaluation, de quoi se situer sans rien deviner. L'`export default` peut aussi être une fonction, `async` comprise. Node retire les types sans les vérifier : `satisfies Config` ne protège que dans l'éditeur.
 
 C'est ainsi qu'un worktree sert ses propres hôtes à côté du checkout principal, sur le même port — ici, le dossier du checkout le nomme :
 
@@ -327,7 +321,7 @@ Chaque paquet porte ses décisions, ce qui a été essayé puis écarté, et ses
 
 ## La beta
 
-La beta donne un avant-goût de la prochaine version. Elle s'installe **à côté** de `dsvs`, sous le nom `dsvs-beta`, avec son propre fichier de configuration, et le stable reste votre filet. [BETA.fr.md](BETA.fr.md) dit comment l'installer et comment la retirer.
+La beta donne un avant-goût de la prochaine version — un formulaire de paramètres dans la configuration, une icône qui dit ce qui tourne, démarre et tombe, une page qui attend une app qui démarre… Elle s'installe **à côté** de `dsvs`, sous le nom `dsvs-beta`, avec son propre fichier de configuration, et le stable reste votre filet. [BETA.fr.md](BETA.fr.md) dit ce qu'elle ajoute, comment l'installer et comment la retirer.
 
 ## Contribuer
 

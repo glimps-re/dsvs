@@ -1,6 +1,6 @@
 package main
 
-//go:generate go run . --readme ../../README.md
+//go:generate go run . --readme ../../BETA.md
 
 import (
 	"fmt"
@@ -9,8 +9,8 @@ import (
 	"strings"
 )
 
-// The markers bounding the generated block in the README. What lies between them comes from the
-// help; the rest of the file is written by hand and never touched.
+// The markers bounding the generated block in BETA.md, the document of the version this tree builds.
+// What lies between them comes from the help; the rest of the file is written by hand and never touched.
 const (
 	blockOpens  = "<!-- dsvs help -->"
 	blockCloses = "<!-- /dsvs help -->"
@@ -47,10 +47,10 @@ much by an agent as by a human, and --json is there where a machine reads.
 			fmt.Fprintf(out, "- `dsvs %s` — %s\n", cmd.usage(), cmd.summary)
 		}
 	}
-	fmt.Fprintln(out, "- The README of the repository documents the configuration file itself, field by field.")
+	fmt.Fprintln(out, "- The README and BETA.md of the repository document the configuration file itself, field by field.")
 }
 
-// refreshREADME brings the README block back in line with the help, rendered in memory: this is what
+// refreshREADME brings the block of BETA.md back in line with the help, rendered in memory: this is what
 // go generate ./cmd/dsvs runs, and the pre-commit hook with it. Nothing else in the file moves, and a
 // block already in line rewrites nothing.
 func refreshREADME(path string) error {

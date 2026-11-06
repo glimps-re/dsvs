@@ -33,12 +33,12 @@ The same sessions, driven from wherever you are. Close any of them: the apps kee
 
 ```sh
 dsvs start front api   # start these apps, and what they need around them
-dsvs logs api          # the end of the log of the api
+dsvs logs -f front     # follow the log of the front
 dsvs status            # what runs on this machine, and who holds the ports
 dsvs quit              # stop the apps of the project here, and close its session
 ```
 
-`dsvs help` lists every command, as [Commands](#commands) shows, and `dsvs help <command>` details one.
+`dsvs help` lists every command, `dsvs help <command>` details one.
 
 **The terminal interface**, `dsvs --tui`: the apps and facades of the project here on the left, the log of the selected one on the right. `?` lists its keys.
 
@@ -148,75 +148,6 @@ dsvs starts what it needs around it and says so.
 
 Everything starts on demand, and says so.
 
-## Commands
-
-The block below is the output of `dsvs help`, generated from the command table by `go generate ./cmd/dsvs`: do not edit it by hand.
-
-<!-- dsvs help -->
-```
-dsvs — control panel for dev-servers
-
-  dsvs [options] <command> [options] [arguments]
-
-Commands:
-  start [--all] <name...>        start the apps these names pull in
-  stop [--all] <name...>         stop the apps these names pull in
-  restart [--all] <name...>      restart the apps these names pull in
-  reload                         make the session read its configuration again
-  set <name=value...>            give parameters of the configuration a value, and replay it
-  quit                           stop the apps of the session and close it
-  state [--json]                 write what the session here is doing
-  logs [-n <lines>] [name...]    write the end of the logs, or follow them with -f
-  run [name...] [name=value...]  hold the session in this terminal, streaming the logs
-  status [--json]                write what runs on this machine, and who holds the ports
-  service [stop|restart]         start the background service and its icon, or stop it
-  update                         take a newer version, the beta for dsvs-beta, and restart the service
-  panel [--png <file>]           open the panel of the running sessions
-  remember                       remember the project here, so that the panel lists it cold
-  forget                         forget the project here, which the panel stops listing
-  config [name=value...]         write the resolved configuration as JSON
-  types                          write the package specifier of the TypeScript types matching this binary
-  skill                          write a skill that teaches this tool to a coding agent
-  help [command]                 write what a command does, or the list of them
-
-A name is an app, a facade — which pulls in the apps of its routes — or a group declared in the
-configuration. The session port is taken when it starts, follows the configuration, and is released
-when it stops; every facade answers on it, and a path leading to a stopped app answers 502. A
-browser opening the path of an app that is starting gets a page that reloads by itself when the app
-answers, or says why it fell. An applied configuration reloads nothing but what an app declares with
-its reload key: "page" reloads the pages it serves, { stdin: "…" } types exactly that text in its
-terminal.
-
-dsvs needs a configuration: the one named by --config, or the first one found searching up from the
-current directory. Everything it needs around it starts on demand and says so — the background
-service and its icon, then the session, which lives without a terminal and survives the commands and
-interfaces that watch it.
-
-dsvs with no command starts what the configuration found here needs, writes the state of its session
-and returns; --tui opens the interface on that session instead. A configuration runs only once, and
-two sessions never fight over a host: the second one is refused, and says so.
-
-A few flags are the binary talking to itself — --tray, --hub, --session, --install-unit,
---remove-unit, --version — and are not commands.
-
-Options, before or after the command:
-  --config <file>
-    	path of the configuration file (default: the first config.dsvs.ts found searching up)
-  --net <network>
-    	apps network: "auto", "netns" to require it, "loopback" to do without (default: auto)
-  --port <port>
-    	session port, instead of the one in the configuration
-  --port-shift <offset>
-    	offset added to the port the configuration declares, so that a second binary can serve the same projects
-  --tui
-    	open the interface on the session, instead of returning
-  --watch <path>
-    	path whose save makes the configuration reload, on top of those it declares; repeatable
-```
-<!-- /dsvs help -->
-
-`dsvs help <command>` details a command and its options; `?` lists the keys of the TUI.
-
 ## Install in detail
 
 ### Requirements
@@ -271,11 +202,9 @@ export default {
 } satisfies Config;
 ```
 
-[`config.ts`](config.ts) declares every field and documents it: it is the reference. There is no package yet: a project keeps a copy of it, taken at the tag of its binary. It also exports `group(name, apps)`, which builds a group from app declarations.
+[`config.ts`](https://github.com/glimps-re/dsvs/blob/v0.1.0/config.ts) declares every field and documents it: it is the reference. There is no package yet: a project keeps a copy of it, taken at the tag of its binary. It also exports `group(name, apps)`, which builds a group from app declarations.
 
-The file is code: it can read a manifest, query the workspace, or import a file of targets kept out of git. `DSVS_CONFIG` holds its absolute path while it is evaluated, enough to locate itself without guessing. `export default` can also be a function, `async` included.
-
-Node strips the types without checking them: `satisfies Config` only protects you in the editor. dsvs therefore checks the shape of what the file builds, and refuses it like a syntax error — the previous configuration keeps running — for a key it does not read, suggesting the one you probably meant, as for a value of the wrong type, each by its path: `apps[1]: unknown key "evn" (did you mean "env"?)`, `port: a number, not "4380"`. An older dsvs says the same of a key it does not know yet.
+The file is code: it can read a manifest, query the workspace, or import a file of targets kept out of git. `DSVS_CONFIG` holds its absolute path while it is evaluated, enough to locate itself without guessing. `export default` can also be a function, `async` included. Node strips the types without checking them: `satisfies Config` only protects you in the editor.
 
 That is how a worktree serves its own hosts beside the main checkout, on the same port — here, the folder of the checkout names it:
 
@@ -392,7 +321,7 @@ Each package carries its decisions, what was tried and set aside, and its known 
 
 ## The beta
 
-The beta previews the next version. It installs **beside** `dsvs`, as `dsvs-beta`, with its own configuration file, and the stable stays your fallback. [BETA.md](BETA.md) says how to install it and how to remove it.
+The beta previews the next version — a form of parameters in the configuration, an icon that tells what runs, starts and fell, a page that waits for an app that starts… It installs **beside** `dsvs`, as `dsvs-beta`, with its own configuration file, and the stable stays your fallback. [BETA.md](BETA.md) says what it adds, how to install it and how to remove it.
 
 ## Contributing
 

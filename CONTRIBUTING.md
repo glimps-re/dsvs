@@ -19,7 +19,7 @@ Once per clone, enable the repository hooks:
 git config core.hooksPath .githooks
 ```
 
-The `pre-commit` hook regenerates the usage block of `README.md` from the command table, and refuses the commit if it had drifted.
+The `pre-commit` hook regenerates the usage block of `BETA.md` from the command table, and refuses the commit if it had drifted. That block documents what this tree builds, the beta; the README describes the stable, and sends to `dsvs help`.
 
 ## Commit messages
 
