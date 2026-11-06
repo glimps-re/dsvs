@@ -112,7 +112,7 @@ Un `dsvs.json` minimal, une façade et une app :
 Le même en TypeScript, dans un `config.dsvs.ts` :
 
 ```ts
-import type { Config } from "./config.ts";
+import type { Config } from "dsvs";
 
 export default {
   port: 4200,
@@ -121,11 +121,19 @@ export default {
 } satisfies Config;
 ```
 
-[`config.ts`](config.ts) déclare chaque champ et le documente : c'est la référence. Il n'y a pas encore de paquet : un projet en garde une copie, prise au tag de son binaire. Il exporte aussi `group(name, apps)`, qui construit un groupe à partir de déclarations d'apps.
-
 Le fichier est du code : il peut lire un manifeste, interroger le workspace, ou importer un fichier de cibles resté hors de git. `DSVS_CONFIG` porte son chemin absolu pendant l'évaluation, de quoi se situer sans rien deviner. L'`export default` peut aussi être une fonction, `async` comprise.
 
 Node retire les types sans les vérifier : `satisfies Config` ne protège que dans l'éditeur. dsvs vérifie donc la forme de ce que le fichier construit, et le refuse comme une faute de syntaxe — la configuration d'avant continue de tourner — pour une clé qu'il ne lit pas, en proposant celle que vous vouliez sans doute dire, comme pour une valeur du mauvais type, chacune par son chemin : `apps[1]: unknown key "evn" (did you mean "env"?)`, `port: a number, not "4380"`. Un dsvs plus ancien le dit de même d'une clé qu'il ne connaît pas encore.
+
+### Les types TypeScript
+
+Le paquet `types/` déclare chaque champ et le documente : c'est la référence. Il ne contient que des déclarations, importées par `import type` : le paquet n'est donc pas nécessaire pour que la configuration tourne, et un projet l'installe en dépendance optionnelle, épinglée sur le tag du binaire :
+
+```sh
+pnpm add --save-optional "dsvs@$(dsvs types)"
+```
+
+Le spécificateur est une URL `git+ssh` sur ce dépôt : il faut donc une clé SSH que GitHub connaît. Sans elle, pnpm installe tout le reste et sort en succès ; seul l'éditeur montre que les types manquent, par un import non résolu. Ce que pnpm en dit dépend de sa version et du lockfile : une ligne d'information, un avertissement qui porte l'erreur de git, ou rien du tout. pnpm 11 n'écrit même pas dans `package.json` une dépendance qu'il n'a pas pu résoudre : `pnpm add` ne change alors rien, et c'est depuis une machine qui a la clé qu'on ajoute les types. La CI du projet installe avec `pnpm install --frozen-lockfile --no-optional` et sort `*.dsvs.ts` de son tsconfig de build, pour ne pas typer un import absent.
 
 ### Référence
 
@@ -162,7 +170,7 @@ Node retire les types sans les vérifier : `satisfies Config` ne protège que da
 |---|---|---|
 | `name` | string | |
 | `command` | string[] | Argv, exécuté sans shell, dans un terminal que dsvs lui prête. Une app ne choisit pas son adresse : dsvs lui en réserve une et remplace `{port}` et `{ip}`, ici comme dans `env`. `{port}` est obligatoire : sans lui, rien ne saurait où joindre l'app. |
-| `env` | `Record<string, string>` | Les variables posées par-dessus l'environnement de la session. |
+| `env` | `Record<string, string \| undefined>` | Les variables posées par-dessus l'environnement de la session. Une valeur `undefined` n'en pose aucune. |
 | `dir` | string | Le dossier de travail, absolu ou relatif à la configuration. Défaut : son dossier. |
 | `color` | string | Sa couleur dans les journaux : `red`, `green`, `yellow`, `blue`, `magenta` ou `cyan`. Défaut : prise dans une palette, dans l'ordre. |
 

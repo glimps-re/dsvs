@@ -97,6 +97,7 @@ Commands:
   update                       take a newer version of this binary, and restart the service
   panel                        open the panel of the running sessions
   config                       write the resolved configuration as JSON
+  types                        write the package specifier of the TypeScript types matching this binary
   skill                        write a skill that teaches this tool to a coding agent
   help [command]               write what a command does, or the list of them
 
@@ -167,7 +168,7 @@ A minimal `dsvs.json`, one facade and one app:
 The same in TypeScript, in a `config.dsvs.ts`:
 
 ```ts
-import type { Config } from "./config.ts";
+import type { Config } from "dsvs";
 
 export default {
   port: 4200,
@@ -176,11 +177,19 @@ export default {
 } satisfies Config;
 ```
 
-[`config.ts`](config.ts) declares every field and documents it: it is the reference. There is no package yet: a project keeps a copy of it, taken at the tag of its binary. It also exports `group(name, apps)`, which builds a group from app declarations.
-
 The file is code: it can read a manifest, query the workspace, or import a file of targets kept out of git. `DSVS_CONFIG` holds its absolute path while it is evaluated, enough to locate itself without guessing. `export default` can also be a function, `async` included.
 
 Node strips the types without checking them: `satisfies Config` only protects you in the editor. dsvs therefore checks the shape of what the file builds, and refuses it like a syntax error — the previous configuration keeps running — for a key it does not read, suggesting the one you probably meant, as for a value of the wrong type, each by its path: `apps[1]: unknown key "evn" (did you mean "env"?)`, `port: a number, not "4380"`. An older dsvs says the same of a key it does not know yet.
+
+### The TypeScript types
+
+The `types/` package declares every field and documents it: it is the reference. It holds declarations only, imported with `import type`: the package is therefore not needed for the configuration to run, and a project installs it as an optional dependency, pinned to the tag of the binary:
+
+```sh
+pnpm add --save-optional "dsvs@$(dsvs types)"
+```
+
+The specifier is a `git+ssh` URL on this repository, so it needs an SSH key that GitHub knows. Without one, pnpm installs everything else and exits with success; only the editor shows the missing types, by an unresolved import. What pnpm says depends on its version and on the lockfile: an info line, a warning that carries the git error, or nothing at all. pnpm 11 does not even write into `package.json` a dependency it could not resolve, so `pnpm add` then changes nothing: add the types from a machine that has the key. The project's CI installs with `pnpm install --frozen-lockfile --no-optional` and leaves `*.dsvs.ts` out of its build tsconfig, so as not to type an import that is absent.
 
 ### Reference
 
@@ -217,7 +226,7 @@ Node strips the types without checking them: `satisfies Config` only protects yo
 |---|---|---|
 | `name` | string | |
 | `command` | string[] | Argv, run without a shell, in a terminal dsvs lends it. An app does not choose its address: dsvs reserves one and replaces `{port}` and `{ip}`, here as in `env`. `{port}` is required: without it, nothing would know where to reach the app. |
-| `env` | `Record<string, string>` | Variables set on top of the session's environment. |
+| `env` | `Record<string, string \| undefined>` | Variables set on top of the session's environment. An `undefined` value sets nothing. |
 | `dir` | string | Working directory, absolute or relative to the configuration. Default: its folder. |
 | `color` | string | Its color in the logs: `red`, `green`, `yellow`, `blue`, `magenta` or `cyan`. Default: taken from a palette, in order. |
 

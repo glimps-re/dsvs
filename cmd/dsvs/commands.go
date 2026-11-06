@@ -137,6 +137,16 @@ JSON format it can read back. What the configuration script says on its console 
 so that the output stays replayable as it is.`,
 		declare: direct(func([]string) error { return printConfig(s) }),
 	}, {
+		name:    "types",
+		summary: "write the package specifier of the TypeScript types matching this binary",
+		long: `types writes the pnpm specifier of the TypeScript types matching this binary, to put in the
+optional dependencies of a project:
+
+  pnpm add --save-optional "dsvs@$(dsvs types)"
+
+A binary built from a clone ahead of its last tag writes that tag, and says so on stderr.`,
+		declare: direct(func([]string) error { return writeTypes(os.Stdout, os.Stderr) }),
+	}, {
 		name:    "skill",
 		summary: "write a skill that teaches this tool to a coding agent",
 		long: `skill writes on stdout the skill a coding agent loads to know this tool: what it is, the list of
