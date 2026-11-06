@@ -1,0 +1,40 @@
+version: 2
+
+project_name: dsvs
+
+builds:
+  - main: ./cmd/dsvs
+    binary: dsvs
+    env:
+      - CGO_ENABLED=0
+    goos: [linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -X dsvs/internal/build.Version={{ .Tag }}
+
+# install.sh and dsvs update download these exact names.
+archives:
+  - formats: [binary]
+    name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+changelog:
+  use: git
+  groups:
+    - title: Features
+      regexp: '^feat(\([^)]+\))?!?:'
+      order: 0
+    - title: Bug fixes
+      regexp: '^fix(\([^)]+\))?!?:'
+      order: 1
+
+# install.sh is uploaded as is: it runs before anything could check it, and checksums.txt lists what
+# it checks.
+release:
+  prerelease: auto
+  extra_files:
+    - glob: ./install.sh

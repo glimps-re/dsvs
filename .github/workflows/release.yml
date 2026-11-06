@@ -1,0 +1,45 @@
+# A release is a signed tag pushed by a maintainer: vX.Y.Z for stable, vX.Y.Z-beta.N for a beta,
+# which GoReleaser marks as a prerelease. The tagged commit is tested again, since a beta tag may sit
+# on a commit that never went through main.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # No build cache: a cache written by another ref must not reach published binaries.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
+        with:
+          version: v2.20.0
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A beta promoted as is leaves two tags on one commit, and git sorts vX.Y.Z-beta.N after
+          # vX.Y.Z: without this, GoReleaser would release the beta again.
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/checksums.txt

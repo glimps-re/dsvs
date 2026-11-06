@@ -1,0 +1,51 @@
+# Pushing to main publishes nothing: a release is a signed tag, see release.yml, which calls this
+# workflow before building anything.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      # The tests of internal/config and internal/core load a config.dsvs.ts by importing the
+      # TypeScript as is: below node 23.6, twelve of them fail.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: go vet ./...
+      # A test that never returns would otherwise cost the default ten minutes to report a failure.
+      # The slowest package takes eleven seconds on eight cores; 180 leaves the margin of a two-vCPU
+      # runner. -p stays at its default: the suite peaks at 0.75 GB, the runner has seven.
+      - run: go test -timeout 180s ./...
+
+  commits:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          npx --yes -p @commitlint/cli@21.2.4 -p @commitlint/config-conventional@21.2.4 \
+            commitlint --from "$BASE" --to "$HEAD" --verbose
