@@ -1,5 +1,5 @@
 #!/bin/sh
-# The usage block of the README comes from the command table: this hook regenerates it and refuses
+# The usage block of BETA.md comes from the command table: this hook regenerates it and refuses
 # the commit if it had drifted. Git only reads it after a `git config core.hooksPath .githooks`, once
 # per clone.
 set -eu
@@ -13,9 +13,9 @@ command -v go >/dev/null || {
     exit 1
 }
 
-before=$(git hash-object README.md)
+before=$(git hash-object BETA.md)
 go generate ./cmd/dsvs
-if [ "$before" != "$(git hash-object README.md)" ]; then
-    echo "README.md regenerated from the help: add it and commit again" >&2
+if [ "$before" != "$(git hash-object BETA.md)" ]; then
+    echo "BETA.md regenerated from the help: add it and commit again" >&2
     exit 1
 fi
