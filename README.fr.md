@@ -56,7 +56,7 @@ La beta donne un avant-goût de la prochaine version. Son binaire, `dsvs-beta`, 
 
 Une mise à jour n'arrête pas vos apps. Chaque session passe la main au nouveau binaire sans changer de PID : sa boîte systemd ne voit rien passer, et ses apps restent ses enfants. La mise à jour en rend compte session par session, en demandant à chacune la version qu'elle porte désormais. Le service et le portier du réseau privé passent la main de la même façon. Le répartiteur n'est pas dérangé : il prend le nouveau binaire en s'en allant avec sa dernière session, et une session qui le perd entre-temps en relance un sans rien lâcher.
 
-Une session qui tourne hors de la boîte systemd garde son binaire jusqu'à ce qu'elle s'arrête : là, le signal de mort du parent est le seul filet contre les apps orphelines, et il ne survivrait pas à la passation. Une version qui change le protocole entre les sessions et leur répartiteur — c'est rare, et le journal le dit — refuse de se mélanger : tant qu'une session de l'ancienne tourne, une nouvelle session s'arrête sur un message qui nomme les deux versions. Fermer les sessions ouvertes suffit.
+Deux sortes de session gardent leur binaire jusqu'à ce qu'elles s'arrêtent, et la mise à jour le dit : celle qui tourne hors de la boîte systemd, où le signal de mort du parent est le seul filet contre les apps orphelines et ne survivrait pas à la passation, et celle que tient `dsvs run`, qui appartient à son terminal. Une version qui change le protocole entre les sessions et leur répartiteur — c'est rare, et le journal le dit — refuse de se mélanger : tant qu'une session de l'ancienne tourne, une nouvelle session s'arrête sur un message qui nomme les deux versions. Fermer les sessions ouvertes suffit.
 
 ## Construire depuis les sources
 
@@ -250,42 +250,6 @@ export default config(params, ({ api, deployed, slowApi, products, locale }) => 
 
 Sans formulaire, l'export par défaut reste un objet, ou une fonction qui ignore ses arguments. `export const params` est l'ancienne forme, et elle est refusée.
 
-### N'importe quel programme est une configuration
-
-Node n'est qu'une implémentation d'un contrat que tout exécutable peut remplir, passé par `--config` : `.json` est une configuration nue, `.ts`, `.mts`, `.js` et `.mjs` passent par node, tout autre fichier est exécuté lui-même. Il reçoit dans `DSVS_INPUT` une ligne de JSON — les intentions couche par couche, en texte, flags compris, et `observed`, `null` quand rien n'observe le réseau :
-
-```json
-{"asked":{"deployed.version":"v3"},"network":{"api":"staging"},"session":{"slowApi":"true"},"kept":{"locale":"en"},"observed":{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}],"exits":[{"via":"198.51.100.1","dev":"eth0"}]}}
-```
-
-`DSVS_CONFIG` porte son chemin, et son dossier courant est celui du fichier. Il écrit sur stdout `{"form":{"fields":[…],"errors":[…],"notices":[…]},"config":{…}}` : chaque champ résolu, dans l'ordre — `name`, `type` (`choice`, `flag`, `text` ou `number`), `choices`, `disabledChoices` avec chaque raison, `value`, `from` (`asked`, `network`, `session`, `kept` ou `default`), ses états `hidden`, `disabled` et ses `reasons`, `readonly`, `keep`, `network`, `errors`, et `yielded`, la valeur retenue qui ne tient plus, avec sa couche et ses erreurs —, puis `notices`, ce que le formulaire dit sans rien refuser, et la configuration que ces valeurs construisent, `null` quand le formulaire a une erreur. Ce qu'il écrit sur stderr va au journal de la session. Un code de sortie non nul, un JSON illisible ou dix secondes sans réponse sont une erreur qui ne change rien. Un `dsvs.json` est une configuration nue, sans formulaire.
-
-### Sauvegarder suffit
-
-Les façades, les routes, les cibles de proxy et les groupes sont relus sans rien redémarrer. Le port aussi : la session passe sur le nouveau et quitte l'ancien, ou, s'il est pris, refuse la configuration et dit qui le tient. Ce qui est vivant — le sous-réseau, les processus — reste tel quel, et le journal le dit. dsvs surveille le fichier de configuration lui-même, quel que soit son nom, les chemins qu'il déclare (`watch`), ceux de la ligne de commande (`--watch`), et à défaut son dossier : un import qui vit ailleurs doit être déclaré, sinon le sauvegarder ne recharge rien.
-
-Les apps suivent la déclaration, sans qu'aucun processus ne soit coupé sous les pieds de qui s'en sert. Une app déclarée en cours de session apparaît, prête à démarrer. Une app dont la commande a changé se marque `↻ restart pending` : elle tourne avec la précédente, et c'est son redémarrage qui prend la nouvelle. Une app retirée de la configuration se marque `⊘ gone from the configuration` : elle tourne tant qu'on la laisse tourner, repart avec ce qu'elle avait, et quitte la liste une fois arrêtée. Son journal se lit jusqu'à la fin de la session : `dsvs logs worker` le montre, terminé par son départ. La remettre en fait de nouveau une app ordinaire, à redémarrer, qui reprend ce journal.
-
-## Ce qui tourne pendant une session
-
-Par défaut, les apps n'ouvrent **aucun port** sur la machine : elles vivent sur des adresses virtuelles dans un namespace réseau sans privilèges, dont le trafic et le DNS sortent par la pile de la machine elle-même, VPN et proxy système compris. `--net loopback` s'en passe, `--net netns` l'exige au lieu de retomber en silence. La session se réexécute dans une unité systemd éphémère, sa boîte : un arrêt brutal ne laisse alors aucun processus derrière, pas même ce qu'un runner détache. Sans session systemd, elle tourne sans boîte, le dit, et cette garantie-là n'est plus.
-
-`dsvs config` écrit la configuration telle que dsvs la voit — défauts appliqués, routes ordonnées — dans le format JSON qu'il sait relire. Une configuration à formulaire sort construite de ce qu'aurait une session ouverte ici, plus les valeurs demandées par-dessus, sans son formulaire : `dsvs config api=staging` donne l'instantané de la boutique sur staging. `dsvs config --session` écrit celle qui est en vigueur dans la session qui tourne, et `--params --session` dit d'où vient chaque valeur.
-
-## Comment c'est construit
-
-Chaque paquet porte ses décisions, ce qui a été essayé puis écarté, et ses limites connues dans son commentaire de paquet : `go doc ./internal/hub`, `go doc ./internal/core`, `go doc ./cmd/dsvs`, et ainsi de suite. Les coutures entre eux :
-
-- `config` charge et valide, et rien en aval ne revérifie ; `core` supervise ; `gateway` sert ; `hub` tient le port et le répartit ; `fdpass` fait voyager les descripteurs de fichier, par une socket comme à travers un exec, et porte le cadrage des lignes du protocole ; `ui/*` consomment des instantanés et un flux d'événements qui peut déborder sans perdre un réveil — les lignes de journal, elles, peuvent tomber, et le flux dit combien.
-- `core.Network` dit où les apps écoutent, `core.Front` qui tient le port : deux questions, deux interfaces. `core.Gateway` et `core.Network` sont les points de remplacement — un nginx piloté, loopback ou netns — et une interface web ne serait qu'un consommateur de plus du core.
-
-## Contribuer
-
-Les issues et les pull requests sont les bienvenues. [CONTRIBUTING.md](CONTRIBUTING.md) explique comment construire et tester, les conventions de commit et la façon dont se font les releases ; [SECURITY.md](SECURITY.md) comment signaler une vulnérabilité.
-
-## Licence
-
-dsvs est publié sous [licence MIT](LICENSE).
 ### N'importe quel programme est une configuration
 
 Node n'est qu'une implémentation d'un contrat que tout exécutable peut remplir, passé par `--config` : `.json` est une configuration nue, `.ts`, `.mts`, `.js` et `.mjs` passent par node, tout autre fichier est exécuté lui-même. Il reçoit dans `DSVS_INPUT` une ligne de JSON — les intentions couche par couche, en texte, flags compris, et `observed`, `null` quand rien n'observe le réseau :

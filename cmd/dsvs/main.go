@@ -33,7 +33,6 @@ import (
 	"dsvs/internal/netns"
 	"dsvs/internal/projects"
 	"dsvs/internal/ui/panel"
-	"dsvs/internal/ui/plain"
 	"dsvs/internal/ui/tray"
 	"dsvs/internal/update"
 )
@@ -69,7 +68,7 @@ func main() {
 		{"tray", *icon, hold},
 		{"install-unit", *unit, func() error { return installUnit(s.shift) }},
 		{"remove-unit", *noUnit, removeUnit},
-		{"session", *headless, func() error { return serve(true, s, fs.Args()) }},
+		{"session", *headless, func() error { return serve(s, fs.Args()) }},
 		{"readme", *readme != "", func() error { return refreshREADME(*readme) }},
 	}, func() error { return dispatch(s, fs.Args()) })
 	if err != nil {
@@ -80,10 +79,9 @@ func main() {
 	}
 }
 
-// serve holds the session of this configuration in this process: the systemd box first, then the
-// private network, then the session. headless leaves it without a terminal, for the clients that attach
-// to it; otherwise the logs stream onto this one.
-func serve(headless bool, s *shape, names []string) error {
+// serve holds the session of this configuration in this process, without a terminal, for the clients
+// that attach to it: the systemd box first, then the private network, then the session.
+func serve(s *shape, names []string) error {
 	// An inherited manifest says a running session is being taken over: its box, its private network
 	// and its apps are already there, and none of it is set up again. If it is unreadable, there is
 	// nothing to take over: exit, and the cgroup takes the apps away rather than leaving them with
@@ -99,7 +97,7 @@ func serve(headless bool, s *shape, names []string) error {
 	// supervisor does not have to ask — it is already in its gatekeeper's box, and above all in
 	// namespaces that systemd-run could not join.
 	if !inside {
-		box(headless)
+		box()
 	}
 	fallback := ""
 	switch {
@@ -121,7 +119,7 @@ func serve(headless bool, s *shape, names []string) error {
 			fallback = cause(err).Error()
 		}
 	}
-	return run(s, headless, ctl, fallback, names, taken)
+	return run(s, ctl, fallback, names, taken)
 }
 
 // hold holds the status bar icon. Only one at a time, and the socket says so: taking it fails when
@@ -451,6 +449,24 @@ func raise() (bool, error) {
 // only for the service, a mere note for the session that does without it.
 var errNoStatusBar = errors.New("no status bar on this display; the panel opens with: " + build.Name() + " panel")
 
+// running holds the session of the configuration here in this terminal: an ordinary session, which
+// state, set, stop, the TUI, the panel and the icon see and drive, born for this terminal with the
+// names and values it is given, and which stops with it. It therefore cannot be the one already
+// serving: that one belongs to whoever started it.
+func running(s *shape, args []string) error {
+	config, err := resolve(s.config)
+	if err != nil {
+		return err
+	}
+	if hub.Answers(hub.SessionAddr(config)) {
+		return fmt.Errorf("a session already serves %s: %s logs -f follows it, %[2]s quit closes it", config, build.Name())
+	}
+	if err := serving(); err != nil {
+		return err
+	}
+	return attach.Run(config, func() error { return spawn(config, append(s.args(), args...)) })
+}
+
 // lend lends the terminal of this process to the session of the configuration here, starting it if it
 // is not there yet, and the service with it. names are the apps to start, ordered after attaching.
 func lend(s *shape, names []string) error {
@@ -525,7 +541,7 @@ func die(err error) {
 // would write it twice.
 var errSaid = errors.New("the session said why on its socket")
 
-func run(s *shape, headless bool, ctl, fallback string, args []string, taken *core.Handover) error {
+func run(s *shape, ctl, fallback string, args []string, taken *core.Handover) error {
 	path, err := resolve(s.config)
 	if err != nil {
 		return err
@@ -537,20 +553,16 @@ func run(s *shape, headless bool, ctl, fallback string, args []string, taken *co
 	// The session's socket opens before anything is read: it is named by the configuration, which is
 	// the identity of the session, and it is through it that a client will learn the session did not
 	// start — otherwise it would only have a silent wait.
-	var attachers *attach.Server
-	if headless {
-		server, err := bind(path, taken)
-		if errors.Is(err, hub.ErrTaken) {
-			return nil // another session already serves this configuration: nothing to do, and nothing to say
-		}
-		if err != nil {
-			return err
-		}
-		defer server.Close()
-		attachers = server
+	attachers, err := bind(path, taken)
+	if errors.Is(err, hub.ErrTaken) {
+		return nil // another session already serves this configuration: nothing to do, and nothing to say
 	}
+	if err != nil {
+		return err
+	}
+	defer attachers.Close()
 	failed := func(err error) error {
-		if attachers != nil && attachers.Fail(err) {
+		if attachers.Fail(err) {
 			return errSaid
 		}
 		return err
@@ -668,24 +680,16 @@ func run(s *shape, headless bool, ctl, fallback string, args []string, taken *co
 	}()
 
 	// A SIGTERM stops cleanly whatever the interface — that is what makes the session killable from
-	// outside the private network. In plain, ctrl+c adds to it; in the TUI it is a key.
+	// outside the private network.
 	ctx, release := signal.NotifyContext(context.Background(), syscall.SIGTERM)
 	defer release()
 
-	if headless {
-		attachers.Ready(ctx, session, stop)
-		// Without an interface, the session waits: for a signal, or for an interface that asked to
-		// close everything. Clients come and go in the meantime.
-		select {
-		case <-ctx.Done():
-		case <-serving.Done():
-		}
-	} else {
-		// dsvs run holds the session here, logs streaming: the shape of scripts, where ctrl+c must
-		// stop everything.
-		ctx, release := signal.NotifyContext(ctx, os.Interrupt)
-		defer release()
-		plain.Run(ctx, session, os.Stdout)
+	attachers.Ready(ctx, session, stop)
+	// The session waits: for a signal, or for an interface that asked to close everything — the
+	// terminal of dsvs run going away included. Clients come and go in the meantime.
+	select {
+	case <-ctx.Done():
+	case <-serving.Done():
 	}
 
 	stop()

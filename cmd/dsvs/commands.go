@@ -119,11 +119,14 @@ names or not. A session must be running.`,
 		args:    "[name...] [name=value...]",
 		summary: "hold the session in this terminal, streaming the logs",
 		long: `run holds the session of the configuration found here in this terminal, streaming the logs
-as they are written; ctrl+c stops everything. That is the shape of a script, where nothing must
-survive the command. The apps these names pull in are started with it, and name=value pairs among them
-are asked for at the first reading, as set asks for them: that is how a session starts when what the
-project keeps makes its form invalid.`,
-		declare: direct(func(names []string) error { return serve(false, s, names) }),
+as they are written; ctrl+c stops everything, and so does closing the terminal. That is the shape of a
+script, where nothing must survive the command. It is an ordinary session otherwise: state, logs, set,
+stop, the interface, the panel and the icon see it and steer it. Only the update in place passes it
+by, and says so: it belongs to this terminal. The apps these names pull in are started with it, and
+name=value pairs among them are asked for at the first reading, as set asks for them: that is how a
+session starts on other values than the ones the project keeps. A session already serving here is not
+taken over: run is refused.`,
+		declare: direct(func(args []string) error { return running(s, args) }),
 	}, {
 		name:    "status",
 		args:    "[--json]",

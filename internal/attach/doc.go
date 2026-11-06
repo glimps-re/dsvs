@@ -59,7 +59,17 @@
 // accepting, and Adopt picks it up on the other side — so a client has nothing to wait for to
 // reattach. Attached interfaces receive the word "reloading" just before: their TUI does not cross,
 // the lent terminal is handed back, and the client asks for an interface again instead of exiting with
-// an error.
+// an error. renew is also asked as a question: a session that hands over does not answer, its
+// connection closing in the exec, and a refusal is said there, to the update that asked for it. A
+// session from before the question receives the order on a driver's stream.
+//
+// # A session held by a terminal
+//
+// dsvs run is not a second path: it launches an ordinary session, which everyone sees and drives, and
+// attaches to it under the name "run", which renders the logs as they come like "plain". The
+// difference is that the session belongs to it: when that interface goes away, for whatever reason,
+// the session stops, and ctrl+c, which the client relays as quit, stops it right there. For the
+// same reason it does not move to the binary on disk: its terminal would see it leave.
 //
 // The socket is opened before the configuration is read, and that is what also makes it the session's
 // voice: a session that does not start says so there, to whoever waits for it, instead of dying on a

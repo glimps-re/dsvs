@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -22,6 +23,8 @@ import (
 	"dsvs/internal/build"
 	"dsvs/internal/config"
 	"dsvs/internal/core"
+	"dsvs/internal/fdpass"
+	"dsvs/internal/hub"
 	"dsvs/internal/projects"
 )
 
@@ -511,7 +514,7 @@ func TestARefusedSessionSaysWhyOnce(t *testing.T) {
 	}
 	ended := make(chan error, 1)
 	go func() {
-		ended <- run(&shape{config: path}, true, filepath.Join(t.TempDir(), "absent"), "asked for by hand", nil, nil)
+		ended <- run(&shape{config: path}, filepath.Join(t.TempDir(), "absent"), "asked for by hand", nil, nil)
 	}()
 
 	if _, err := attach.Ensure(path, func() error { return nil }); err == nil || !strings.Contains(err.Error(), "discount: at most 30") {
@@ -536,7 +539,13 @@ func TestARefusedSessionDoesNotRememberItsProject(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`throw new Error("refused");`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := run(&shape{config: path}, false, filepath.Join(t.TempDir(), "absent"), "asked for by hand", nil, nil); err == nil {
+	ended := make(chan error, 1)
+	go func() {
+		ended <- run(&shape{config: path}, filepath.Join(t.TempDir(), "absent"), "asked for by hand", nil, nil)
+	}()
+	// The refused session waits for a client to read its reason: read it, and it goes away.
+	_, _ = attach.Ensure(path, func() error { return nil })
+	if err := <-ended; err == nil {
 		t.Fatal("the session started on a configuration that throws")
 	}
 	if got := projects.List(); len(got) != 0 {
@@ -766,6 +775,51 @@ func TestAnOrderTheSessionRefusesFails(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), `"ghost"`) {
 			t.Errorf("dsvs %s ghost = %v, want the session's refusal", verb, err)
 		}
+	}
+}
+
+// The session of dsvs run does not move to the binary on disk under its terminal's eyes, and the update
+// that asks it to reads why.
+func TestARunSessionKeepsItsBinaryAndSaysSo(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv(boxEnv, inBox)
+	dir := t.TempDir()
+	cfg := config.Config{Dir: dir, Path: filepath.Join(dir, "config.dsvs.json"), Port: 4399}
+	session := core.NewSession(config.Form{}, cfg, core.Loopback{}, closedFront{}, func(*core.Session) core.Gateway { return idleGateway{} })
+	server, err := attach.Bind(cfg.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session.SetRenewal(renewal(session, server, core.Loopback{}))
+	ctx, stop := context.WithCancel(context.Background())
+	server.Ready(ctx, session, stop)
+	t.Cleanup(func() {
+		stop()
+		server.Close()
+	})
+
+	conn, err := net.Dial("unix", hub.SessionAddr(cfg.Path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	in, out, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	defer out.Close()
+	if err := fdpass.Send(conn.(*net.UnixConn), "attach run 80 24 1 -", int(in.Fd()), int(out.Fd())); err != nil {
+		t.Fatal(err)
+	}
+	if line, _ := bufio.NewReader(conn).ReadString('\n'); line != "ok\n" {
+		t.Fatalf("the session answered %q", line)
+	}
+	for deadline := time.Now().Add(5 * time.Second); !server.Held() && time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+	}
+
+	if err := attach.Renew(cfg.Path); err == nil || !strings.Contains(err.Error(), "belongs to the terminal of "+build.Name()+" run") {
+		t.Errorf("renew = %v, want the refusal of the dsvs run session", err)
 	}
 }
 
