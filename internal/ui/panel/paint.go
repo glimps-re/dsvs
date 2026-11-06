@@ -76,6 +76,11 @@ const (
 	// look searches for a new version of the binary, renew takes it.
 	look  deed = "look"
 	renew deed = "renew"
+
+	// installBeta puts dsvs-beta beside dsvs, removeBeta takes it away from its own panel. Each is its
+	// button's label.
+	installBeta deed = "install the beta"
+	removeBeta  deed = "uninstall the beta"
 )
 
 // project is a panel row: a project already seen, what of it runs when it runs, and what a gesture
@@ -98,6 +103,9 @@ type renewal struct {
 	said  string
 	// to is the version found, and only means something under found.
 	to string
+	// beta is the gesture offered on the beta outside of work, and betaOut the beta installBeta takes.
+	beta    deed
+	betaOut string
 }
 
 // stage is where the update stands. Zero is the working state: nothing to click, and said tells the
@@ -366,6 +374,14 @@ func (p *painter) global(projects []project, news renewal) {
 		p.button(top, right, "update to "+news.to, renew, "", "")
 	case idle:
 		p.button(top, right, "check for updates", look, "", "")
+	}
+	if news.stage == working || news.beta == nothing {
+		return
+	}
+	top = p.reserve(actionRow)
+	left := p.button(top, width-pad, string(news.beta), news.beta, "", "")
+	if news.beta == installBeta {
+		p.write(pad, top+16, p.fitting(news.betaOut+" is out", left-pad, p.with.text), p.with.text, faint)
 	}
 }
 

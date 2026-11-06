@@ -10,22 +10,153 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"dsvs/internal/attach"
 	"dsvs/internal/build"
+	"dsvs/internal/hub"
 )
 
 // downloading bounds the download of a binary, which weighs megabytes where every other request
 // weighs a page.
 const downloading = 5 * time.Minute
+
+// InstallBeta puts dsvs-beta beside this binary, at the newest version of the beta channel, then
+// writes its unit and starts its service: a second icon, amber, comes up next to this one. It
+// returns what the beta said once installed.
+func InstallBeta(step func(string)) (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return installBeta(exe, step)
+}
+
+// BetaToInstall is the beta dsvs can put beside it, empty when there is none to offer: no
+// pre-release ahead of the stable, a dsvs-beta already there, or a binary that is not dsvs — the beta
+// itself, or one built from a branch.
+func BetaToInstall() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return betaToInstall(exe)
+}
+
+func betaToInstall(exe string) (string, error) {
+	if filepath.Base(exe) != build.Stable {
+		return "", nil
+	}
+	if _, err := os.Stat(betaBeside(exe)); err == nil {
+		return "", nil
+	}
+	version, err := newest(true)
+	if err != nil || !prerelease(version) {
+		return "", err
+	}
+	return version, nil
+}
+
+// RemoveBeta takes the beta off this machine: its sessions close, its unit and its binary go, and
+// its service leaves last — the panel that asked lives in it. Only dsvs-beta removes itself this way,
+// and nothing it touches carries another name: the stable beside it stays as it was.
+func RemoveBeta(step func(string)) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return removeBeta(exe, step)
+}
+
+func installBeta(stable string, step func(string)) (string, error) {
+	version, err := newest(true)
+	if err != nil {
+		return "", err
+	}
+	beta := betaBeside(stable)
+	if err := fetch(version, beta, step); err != nil {
+		return "", err
+	}
+	step("checking " + build.Beta)
+	if _, err := VersionOf(beta); err != nil {
+		os.Remove(beta)
+		return "", fmt.Errorf("%s %s does not run, and was removed: %w", build.Beta, version, err)
+	}
+	step("starting its service")
+	// The port shift in this environment is this binary's unit speaking, not the beta's: the beta's own
+	// configuration declares its port.
+	out, err := runWith(nil, "", beta, "--port-shift=0", "--install-unit")
+	if err != nil {
+		return "", fmt.Errorf("%s --install-unit: %w%s", build.Beta, err, said(lastLine(out)))
+	}
+	return build.Beta + " " + version + " installed: " + lastLine(out), nil
+}
+
+func removeBeta(beta string, step func(string)) error {
+	if filepath.Base(beta) != build.Beta {
+		return fmt.Errorf("%s is not the beta: only %s uninstalls itself", filepath.Base(beta), build.Beta)
+	}
+	if living, _ := hub.Sessions(); len(living) > 0 {
+		step(fmt.Sprintf("closing %d session(s)", len(living)))
+		for _, session := range living {
+			closeSession(session.Config)
+		}
+	}
+	step("removing " + build.Beta + ".service")
+	if out, err := runWith(nil, "", beta, "--remove-unit"); err != nil {
+		return fmt.Errorf("%s --remove-unit: %w%s", build.Beta, err, said(lastLine(out)))
+	}
+	step("removing " + beta)
+	for _, file := range []string{beta, beta + ".old", beta + ".new", beta + ".lock"} {
+		if err := os.Remove(file); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	if conn, err := net.Dial("unix", hub.TrayAddr()); err == nil {
+		step("stopping its service")
+		fmt.Fprintln(conn, "quit")
+		conn.Close()
+	}
+	return nil
+}
+
+// closeSession orders a session to close and waits for its link to drop, which is the
+// acknowledgement. One still stopping its apps after a while is left to it: it is on its way out, and
+// the binary it runs can go from under it.
+func closeSession(config string) {
+	link, err := attach.Watch(config)
+	if err != nil {
+		return
+	}
+	defer link.Close()
+	if link.Order("quit") != nil {
+		return
+	}
+	waited := time.After(passing)
+	for {
+		select {
+		case _, live := <-link.States():
+			if !live {
+				return
+			}
+		case <-waited:
+			return
+		}
+	}
+}
+
+func betaBeside(stable string) string { return filepath.Join(filepath.Dir(stable), build.Beta) }
 
 // fromRelease puts in place the newest version of the channel this binary follows.
 func fromRelease(step func(string), exe string) error {
@@ -42,7 +173,7 @@ func fromRelease(step func(string), exe string) error {
 // published is the newest version of the channel this binary follows, empty when it is the one
 // running.
 func published() (string, error) {
-	version, err := newest(false)
+	version, err := newest(build.Name() == build.Beta)
 	if err != nil || version == build.Version {
 		return "", err
 	}

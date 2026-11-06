@@ -77,6 +77,38 @@ func TestTheUpdateOffersOneButtonAtATime(t *testing.T) {
 	}
 }
 
+// The beta's gesture stands on its own row, beside nothing it could be mistaken for, and leaves while
+// something works: an install pressed twice would run twice.
+func TestTheBetaIsOfferedOutsideOfWork(t *testing.T) {
+	shown, with := demo(t)
+	cases := []struct {
+		news   renewal
+		wanted deed
+	}{
+		{renewal{stage: idle, said: "up to date", beta: installBeta, betaOut: "v0.6.0-beta.1"}, installBeta},
+		{renewal{stage: found, to: "v0.6.0-beta.2", beta: removeBeta}, removeBeta},
+		{renewal{stage: idle, said: "up to date"}, nothing},
+		{doing("downloading v0.6.0-beta.1"), nothing},
+	}
+	for _, c := range cases {
+		_, zones, _ := paint(shown, c.news, with, time.Now(), image.Pt(-1, -1))
+		var offered []deed
+		for i, z := range zones {
+			if z.do == installBeta || z.do == removeBeta {
+				offered = append(offered, z.do)
+			}
+			for _, other := range zones[i+1:] {
+				if z.at.Overlaps(other.at) {
+					t.Errorf("%+v: %v and %v overlap", c.news, z.do, other.do)
+				}
+			}
+		}
+		if c.wanted == nothing && len(offered) > 0 || c.wanted != nothing && !slices.Equal(offered, []deed{c.wanted}) {
+			t.Errorf("%+v offers %v, wanted %q alone", c.news, offered, c.wanted)
+		}
+	}
+}
+
 // A project whose session is coming up offers nothing to click: forgetting it removed its row, and
 // the link that arrived next had nowhere left to show — the session ran, invisible.
 func TestAProjectWakingUpOffersNothing(t *testing.T) {
@@ -224,8 +256,9 @@ func TestLookLeavesThePanelAsAPNG(t *testing.T) {
 	}
 	shown, with := demo(t)
 	for name, news := range map[string]renewal{
-		"panel.png":      {stage: found, to: "v0.1.1-rc.1+build.2026"},
-		"panel-work.png": doing("downloading v0.1.1-rc.1+build.2026"),
+		"panel.png":      {stage: found, to: "v0.1.1-rc.1+build.2026", beta: installBeta, betaOut: "v0.2.0-beta.1"},
+		"panel-beta.png": {stage: idle, said: "up to date", beta: removeBeta},
+		"panel-work.png": doing("downloading v0.2.0-beta.1"),
 	} {
 		canvas, _, _ := paint(shown, news, with, time.Now(), image.Pt(292, 52))
 		file, err := os.Create(into + "/" + name)

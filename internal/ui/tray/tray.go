@@ -271,7 +271,7 @@ func bars(size int) []xproto.Rectangle {
 // is already what isolates the rest, it also decides the tint, and two icons in the same status bar
 // tell apart without hovering.
 func tint(name string) uint32 {
-	if name == "dsvs" {
+	if name == build.Stable {
 		return 0xf0f0f0
 	}
 	return 0xf0b040

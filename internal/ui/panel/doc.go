@@ -29,6 +29,10 @@
 // lists them. With no session running, only quitting dsvs is left: there is nothing to stop, and
 // quitting would otherwise be unreachable.
 //
+// The beta adds one, on a row of its own: dsvs offers to install it once one is out and none is
+// beside it, and the beta offers to uninstall itself. Like the update, it shows its steps while it
+// works and offers nothing to press again.
+//
 // Nothing is started when the panel opens: opening a session does not hand back control with four dev
 // servers and their ports.
 //

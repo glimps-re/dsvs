@@ -34,6 +34,24 @@ func TestInstallUnitWritesTheUnitWithoutASystemdSession(t *testing.T) {
 	}
 }
 
+// Removing the unit is the same contract the other way: without a systemd session to disable it, the
+// file goes all the same, and removing it twice is no failure.
+func TestRemoveUnitTakesTheFileWithoutASystemdSession(t *testing.T) {
+	config := hidden(t)
+	if err := installUnit(0); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if err := removeUnit(); err != nil {
+			t.Fatalf("removeUnit = %v", err)
+		}
+	}
+	units, _ := filepath.Glob(filepath.Join(config, "systemd", "user", "*"))
+	if len(units) > 0 {
+		t.Errorf("left behind: %v", units)
+	}
+}
+
 // The requirement is not an encoding but a path systemd reads back whole: an install directory may
 // contain a space, which would split ExecStart, and a % followed by a letter, which it would replace
 // with the specifier's value.

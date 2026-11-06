@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"dsvs/internal/build"
 )
 
 func TestLoadRunsAScript(t *testing.T) {
@@ -361,6 +363,31 @@ func TestFindPrefersTheScript(t *testing.T) {
 	}
 	if got, err := Find(dir); err != nil || got != filepath.Join(dir, FileName) {
 		t.Errorf("Find = %q, %v; want %s", got, err, FileName)
+	}
+}
+
+// The beta finds its own file and never the stable's: a directory holding only config.dsvs.ts gets a
+// refusal that says how to start, and one holding both gives the beta its own.
+func TestTheBetaReadsItsOwnFile(t *testing.T) {
+	stable := Names
+	Names = namesFor(build.Beta)
+	defer func() { Names = stable }()
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, FileName), []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Find(dir)
+	if err == nil || !strings.Contains(err.Error(), "config.beta.dsvs.ts") || !strings.Contains(err.Error(), "copy of "+FileName) {
+		t.Fatalf("Find = %v; wanted a refusal naming the beta's file and how to start", err)
+	}
+
+	own := filepath.Join(dir, "config.beta.dsvs.ts")
+	if err := os.WriteFile(own, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := Find(dir); err != nil || got != own {
+		t.Errorf("Find = %q, %v; wanted %s", got, err, own)
 	}
 }
 

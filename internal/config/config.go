@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+
+	"dsvs/internal/build"
 )
 
 // Suffix marks every configuration file of this tool — the entry one as well as those it imports,
@@ -29,7 +31,7 @@ const (
 
 // Names are the configurations looked for while walking up the tree, in order: TypeScript first,
 // because a repository that has both wrote the static one for someone else.
-var Names = []string{FileName, JSONName}
+var Names = namesFor(build.Name())
 
 type Config struct {
 	Port      int       `json:"port"`
@@ -380,7 +382,7 @@ func Find(dir string) (string, error) {
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			return "", fmt.Errorf("no %s found searching up from %s", strings.Join(Names, " or "), from)
+			return "", missing(from)
 		}
 		dir = parent
 	}
@@ -658,4 +660,21 @@ func (i Ingress) validateTarget(route Route, apps map[string]bool, fail func(str
 			fail("%s: target %q of %q has no host", i.Name, route.Proxy.URL, route.Path)
 		}
 	}
+}
+
+// namesFor gives the configurations a binary looks for. The beta has its own and never falls back to
+// the stable's: a file written for the stable runs on the beta only once someone has decided so.
+func namesFor(binary string) []string {
+	if binary == build.Beta {
+		return []string{"config.beta" + Suffix, "dsvs.beta.json"}
+	}
+	return []string{FileName, JSONName}
+}
+
+func missing(from string) error {
+	err := fmt.Errorf("no %s found searching up from %s", strings.Join(Names, " or "), from)
+	if Names[0] == FileName {
+		return err
+	}
+	return fmt.Errorf("%w: the beta reads its own configuration, never the stable's — start from a copy of %s", err, FileName)
 }

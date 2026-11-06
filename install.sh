@@ -3,6 +3,7 @@
 # checksum is checked before it takes any place.
 #
 #   ./install.sh                        the latest stable, dsvs, in ~/.local/bin
+#   DSVS_CHANNEL=beta ./install.sh      the beta, dsvs-beta, which runs beside the stable
 #   DSVS_VERSION=v1.2.0 ./install.sh    a given version
 #   DSVS_DIR=/usr/local/bin ./install.sh
 #
@@ -12,7 +13,14 @@ set -eu
 releases=${DSVS_RELEASES:-https://github.com/glimps-re/dsvs/releases}
 releases=${releases%/}
 dir=${DSVS_DIR:-$HOME/.local/bin}
-name=dsvs
+case ${DSVS_CHANNEL:-stable} in
+stable) name=dsvs ;;
+beta) name=dsvs-beta ;;
+*)
+    echo "DSVS_CHANNEL is stable or beta, not $DSVS_CHANNEL" >&2
+    exit 1
+    ;;
+esac
 
 os=$(uname -s | tr '[:upper:]' '[:lower:]')
 if [ "$os" != linux ]; then
@@ -31,14 +39,19 @@ if ! command -v curl >/dev/null; then
     exit 1
 fi
 
-# The stable is what GitHub calls the latest release, which never is a pre-release.
+# The stable is what GitHub calls the latest release, which never is a pre-release. The beta takes
+# the highest version among the recent ones, stable or not: in version order a pre-release comes
+# before its release, which is what sort -V does with ~ in place of the first -.
 version=${DSVS_VERSION:-}
-if [ -z "$version" ]; then
+if [ -z "$version" ] && [ "$name" = dsvs ]; then
     version=$(curl -fsSL -o /dev/null -w '%{url_effective}' "$releases/latest")
     case $version in
     */tag/*) version=${version##*/} ;;
     *) version="" ;;
     esac
+elif [ -z "$version" ]; then
+    version=$(curl -fsSL "$releases.atom" | grep -o 'releases/tag/v[0-9][^"]*' | sed 's|.*/||; s/-/~/' |
+        sort -V | tail -n 1 | sed 's/~/-/')
 fi
 if [ -z "$version" ]; then
     echo "no release is published at $releases" >&2

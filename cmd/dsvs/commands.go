@@ -120,8 +120,8 @@ sends it away, icon included, and restart makes it take the binary on disk.`,
 		long: `update takes a newer version of this binary if there is one, hands the running sessions over to
 it and restarts the service. Where it looks was decided when this binary was built: the clone it
 came out of, or the published releases. A released binary is downloaded over HTTPS and checked
-against the checksums of its release before it replaces anything. DSVS_RELEASES points at a mirror
-of the releases.`,
+against the checksums of its release before it replaces anything; dsvs follows the stable
+releases, dsvs-beta the pre-releases too. DSVS_RELEASES points at a mirror of the releases.`,
 		declare: direct(func([]string) error { return upgrade() }),
 	}, {
 		name:    "panel",
@@ -299,7 +299,7 @@ type shape struct {
 // declare sets the global options on this FlagSet, with the values it already holds as defaults.
 func (s *shape) declare(fs *flag.FlagSet) {
 	fs.StringVar(&s.config, "config", s.config,
-		"path of the configuration `file` (default: the first "+config.FileName+" found searching up)")
+		"path of the configuration `file` (default: the first "+config.Names[0]+" found searching up)")
 	fs.IntVar(&s.port, "port", s.port, "session `port`, instead of the one in the configuration")
 	fs.IntVar(&s.shift, "port-shift", s.shift,
 		"`offset` added to the port the configuration declares, so that a second binary can serve the same projects")

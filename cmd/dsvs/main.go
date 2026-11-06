@@ -45,6 +45,7 @@ func main() {
 	headless := fs.Bool("session", false, "hold the session without an interface, for the clients that attach to it")
 	icon := fs.Bool("tray", false, "hold the status bar icon, which opens the panel on a click")
 	unit := fs.Bool("install-unit", false, "install the systemd --user unit that starts the service at session start")
+	noUnit := fs.Bool("remove-unit", false, "remove the systemd --user unit of this binary, leaving its service running")
 	tell := fs.Bool("version", false, "write the version of the binary and quit")
 	switch err := fs.Parse(os.Args[1:]); {
 	case errors.Is(err, flag.ErrHelp):
@@ -62,6 +63,7 @@ func main() {
 		{"hub", *ports, hub.Serve},
 		{"tray", *icon, hold},
 		{"install-unit", *unit, func() error { return installUnit(s.shift) }},
+		{"remove-unit", *noUnit, removeUnit},
 		{"session", *headless, func() error { return serve(true, s, fs.Args()) }},
 	}, func() error { return dispatch(s, fs.Args()) })
 	if err != nil {

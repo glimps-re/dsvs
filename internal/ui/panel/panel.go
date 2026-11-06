@@ -508,6 +508,12 @@ func (p *panel) act(z zone) bool {
 	case renew:
 		p.work("starting the update", p.renew)
 		return true
+	case installBeta:
+		p.work("installing the beta", p.addBeta)
+		return true
+	case removeBeta:
+		p.work("uninstalling the beta", p.dropBeta)
+		return true
 	case openTUI:
 		// The panel only goes away if the interface really opens: on a machine with no known
 		// terminal, it stays in place rather than saying nothing at all.
@@ -548,6 +554,7 @@ func (p *panel) through(config string, do deed, name string) error {
 func (p *panel) look() {
 	newer, err := update.Newer()
 	news := renewal{stage: idle}
+	news.beta, news.betaOut = besideBeta()
 	switch {
 	case err != nil:
 		news.said = err.Error()
@@ -557,6 +564,19 @@ func (p *panel) look() {
 		news.stage, news.to = found, newer
 	}
 	p.tell(news)
+}
+
+// besideBeta is the gesture this binary offers on the beta: dsvs installs one once it is out, the
+// beta uninstalls itself, and any other binary has nothing to do with it. Why no beta is offered is
+// not worth a line: the update says it already when the releases are out of reach.
+func besideBeta() (deed, string) {
+	if build.Name() == build.Beta {
+		return removeBeta, ""
+	}
+	if out, _ := update.BetaToInstall(); out != "" {
+		return installBeta, out
+	}
+	return nothing, ""
 }
 
 // looking is what a search that just started shows: its step, and nothing to click.
@@ -580,6 +600,18 @@ func (p *panel) renew() {
 	if err := update.Apply(p.step); err != nil {
 		p.over("update", "", err)
 	}
+}
+
+// addBeta installs the beta beside this binary: its icon comes up next to this one.
+func (p *panel) addBeta() {
+	said, err := update.InstallBeta(p.step)
+	p.over("installing the beta", said, err)
+}
+
+// dropBeta uninstalls the beta this panel belongs to. Its service leaves last, and the panel with it:
+// what follows is only read when there was no service to stop.
+func (p *panel) dropBeta() {
+	p.over("uninstalling the beta", build.Beta+" is uninstalled", update.RemoveBeta(p.step))
 }
 
 func (p *panel) step(said string) { p.tell(doing(said)) }

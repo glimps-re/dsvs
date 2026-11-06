@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"dsvs/internal/build"
 )
 
 // Without a clone, the new version is the one the stable channel publishes: never a pre-release,
@@ -68,6 +70,119 @@ func TestNewerSaysWhenNothingIsPublished(t *testing.T) {
 	newer, err := Newer()
 	if newer != "" || err == nil || !strings.Contains(err.Error(), "no release is published") {
 		t.Errorf("Newer = %q, %v; want no release said", newer, err)
+	}
+}
+
+// The beta channel takes the highest version published, stable or not: pre-releases in their
+// numeric order, and a stable that overtook them.
+func TestTheBetaChannelTakesTheHighestVersion(t *testing.T) {
+	cases := []struct {
+		published []string
+		wanted    string
+	}{
+		{[]string{"v0.1.0", "v0.2.0-beta.9", "v0.2.0-beta.10"}, "v0.2.0-beta.10"},
+		{[]string{"v0.2.0-beta.2", "v0.2.0", "v0.1.1"}, "v0.2.0"},
+		{[]string{"v0.3.0-beta.1", "v0.2.1"}, "v0.3.0-beta.1"},
+	}
+	for _, c := range cases {
+		publish(t, c.published...)
+		if got, err := newest(true); err != nil || got != c.wanted {
+			t.Errorf("%v: newest = %q, %v; want %s", c.published, got, err, c.wanted)
+		}
+	}
+}
+
+// A tag shows in the feed before its release carries its files: the channel keeps to the highest
+// version it can take.
+func TestTheBetaChannelSkipsATagWithoutItsFiles(t *testing.T) {
+	building := publish(t, "v0.1.0", "v0.2.0-beta.1")
+	delete(building, "v0.2.0-beta.1/checksums.txt")
+	if got, err := newest(true); err != nil || got != "v0.1.0" {
+		t.Errorf("newest = %q, %v; want v0.1.0", got, err)
+	}
+}
+
+// dsvs offers the beta when one is out ahead of the stable and none is beside it yet. The other
+// binaries offer nothing: the beta itself, and the ones built from a branch.
+func TestOnlyDsvsWithoutABetaBesideOffersOne(t *testing.T) {
+	dir := t.TempDir()
+	stable := filepath.Join(dir, build.Stable)
+	publish(t, "v0.1.0", "v0.2.0-beta.1")
+
+	if got, err := betaToInstall(stable); err != nil || got != "v0.2.0-beta.1" {
+		t.Errorf("dsvs alone: %q, %v; want the beta", got, err)
+	}
+	for _, other := range []string{build.Beta, "dsvs-next"} {
+		if got, err := betaToInstall(filepath.Join(dir, other)); err != nil || got != "" {
+			t.Errorf("%s: %q, %v; want nothing to offer", other, got, err)
+		}
+	}
+	binary(t, filepath.Join(dir, build.Beta), "v0.2.0-beta.1")
+	if got, err := betaToInstall(stable); err != nil || got != "" {
+		t.Errorf("dsvs with a beta beside: %q, %v; want nothing to offer", got, err)
+	}
+
+	publish(t, "v0.2.0-beta.1", "v0.2.0")
+	os.Remove(filepath.Join(dir, build.Beta))
+	if got, err := betaToInstall(stable); err != nil || got != "" {
+		t.Errorf("a stable ahead of every beta: %q, %v; want nothing to offer", got, err)
+	}
+}
+
+// Installing the beta puts dsvs-beta beside the stable, at the beta's version, and has it write its
+// own unit — with no port shift taken from the stable's environment.
+func TestInstallBetaPutsItBesideTheStable(t *testing.T) {
+	runtimeDir(t)
+	dir := t.TempDir()
+	stable := filepath.Join(dir, build.Stable)
+	binary(t, stable, "v0.1.0")
+	publish(t, "v0.1.0", "v0.2.0-beta.1")
+
+	said, err := installBeta(stable, func(string) {})
+	if err != nil {
+		t.Fatalf("installBeta = %v", err)
+	}
+	beta := filepath.Join(dir, build.Beta)
+	if got := versionOf(t, beta); got != "v0.2.0-beta.1" {
+		t.Errorf("dsvs-beta says %q", got)
+	}
+	if !strings.Contains(said, "v0.2.0-beta.1") {
+		t.Errorf("installBeta said %q; want the version", said)
+	}
+	if got := versionOf(t, stable); got != "v0.1.0" {
+		t.Errorf("the stable says %q; want it untouched", got)
+	}
+}
+
+// Uninstalling the beta removes its unit through it, then the binary and what updates left beside it;
+// the stable stays. Any binary but the beta refuses: this path never removes the stable.
+func TestRemoveBetaLeavesTheStable(t *testing.T) {
+	runtimeDir(t)
+	dir := t.TempDir()
+	stable := filepath.Join(dir, build.Stable)
+	binary(t, stable, "v0.1.0")
+	beta := filepath.Join(dir, build.Beta)
+	asked := filepath.Join(dir, "asked")
+	if err := os.WriteFile(beta, []byte("#!/bin/sh\necho \"$@\" >"+asked+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binary(t, beta+".old", "v0.2.0-beta.1")
+
+	if err := removeBeta(stable, func(string) {}); err == nil {
+		t.Error("removeBeta took the stable")
+	}
+	if err := removeBeta(beta, func(string) {}); err != nil {
+		t.Fatalf("removeBeta = %v", err)
+	}
+	if said, _ := os.ReadFile(asked); strings.TrimSpace(string(said)) != "--remove-unit" {
+		t.Errorf("the beta was asked %q; want --remove-unit", said)
+	}
+	left, _ := filepath.Glob(filepath.Join(dir, build.Beta+"*"))
+	if len(left) > 0 {
+		t.Errorf("left behind: %v", left)
+	}
+	if got := versionOf(t, stable); got != "v0.1.0" {
+		t.Errorf("the stable says %q; want it untouched", got)
 	}
 }
 

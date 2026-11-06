@@ -14,6 +14,14 @@ var Version = "dev"
 // disagree with what runs.
 var Origin = ""
 
+// Stable and Beta are the two published binaries. The name decides the channel a release binary
+// follows and the configuration file it reads, so that the beta runs beside the stable without either
+// reaching into the other.
+const (
+	Stable = "dsvs"
+	Beta   = "dsvs-beta"
+)
+
 // Name is the name of the running executable. os.Executable resolves links: two links to the same
 // binary therefore share everything derived from that name.
 func Name() string {

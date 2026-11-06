@@ -21,6 +21,13 @@
 // original repository. Those adapters live with whoever consumes them, so there is nothing here to
 // evolve when a workspace changes shape.
 //
+// # The beta's own file
+//
+// dsvs-beta looks for config.beta.dsvs.ts, or dsvs.beta.json, and never for the stable's: a file
+// written for the stable runs on the beta only once someone has decided so, by copying it or by
+// naming it with --config. The beta and the stable can then serve the same project on two ports
+// without a shift to set. Without its file, the beta says so instead of falling back.
+//
 // # Ruled out, and why
 //
 // An embedded scripting language (Lua, Starlark, a JS in Go) instead of node: measured on go1.26,

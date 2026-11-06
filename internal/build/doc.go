@@ -20,6 +20,9 @@
 // paints them amber. Hovering gives the full name and the version, and the panel repeats it in its
 // header. That is what Label is for.
 //
+// The name also decides what a published binary follows and reads: dsvs the stable releases and
+// config.dsvs.ts, dsvs-beta the pre-releases too and its own config.beta.dsvs.ts.
+//
 // # Provenance
 //
 // It is carried by the binary, not by a state file: build.sh injects the path of the clone, the CI

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -102,6 +104,32 @@ func installUnit(shift int) error {
 	default:
 		fmt.Printf("%s; the service starts at session start\n", installed)
 	}
+	return nil
+}
+
+// removeUnit takes this binary's unit away: disabled, its file removed, systemd told. The service
+// it started keeps running: whoever asks may live in it, and stopping it here would cut the removal
+// short — it leaves on its own word, once nothing else is left to do.
+func removeUnit() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	file, err := unitFileOf(exe)
+	if err != nil {
+		return err
+	}
+	unit := filepath.Base(file)
+	// Disabling is good will, as enabling is: outside a systemd session there is nobody to ask, and
+	// the file is what makes the unit.
+	if out, err := exec.Command("systemctl", "--user", "disable", unit).CombinedOutput(); err != nil {
+		fmt.Fprintf(os.Stderr, "note: %s could not be disabled (%v: %s)\n", unit, err, firstLine(string(out)))
+	}
+	if err := os.Remove(file); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	_ = exec.Command("systemctl", "--user", "daemon-reload").Run()
+	fmt.Println(unit + " removed")
 	return nil
 }
 

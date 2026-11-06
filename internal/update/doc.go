@@ -63,7 +63,7 @@
 // off without a word, and a word is precisely what kept it from leaving. A dropped connection is not
 // taken at its word either — someone answering behind the icon's socket is checked again.
 //
-// # Releases
+// # Releases, and the two channels
 //
 // A binary without a clone downloads from the public releases over HTTPS, with neither account nor
 // token. DSVS_RELEASES points at a mirror laid out the same way: <base>/latest redirects to the latest
@@ -74,4 +74,15 @@
 //
 // Every release carries a checksums.txt in sha256sum format, and the binary is checked against it
 // before it takes any place. A wrong checksum, or none, is a refusal, and the binary that runs stays.
+//
+// The channel is the binary's name, like everything else it derives. dsvs follows the stable
+// releases. dsvs-beta follows the highest version published, pre-releases included, which is also a
+// stable that overtook the last beta. Any other name — a binary built from a branch — follows the
+// stable releases when it has no clone.
+//
+// dsvs-beta lives beside dsvs, in the same directory, and the stable stays its way back. dsvs installs
+// it from its panel when a beta is out and none is there: the binary lands beside it, then writes its
+// own unit, named after itself. The beta uninstalls itself from its own panel: its sessions close, its
+// unit and binary go, and its service leaves last since the panel lives in it. Neither path touches
+// anything that carries the other name.
 package update
