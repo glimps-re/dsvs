@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
@@ -149,11 +150,11 @@ func TestHubRefusesAHostAlreadyServedOnThePort(t *testing.T) {
 	port := freePort(t)
 	serve(t, port, "/one/config.dsvs.ts", []string{"one.test", "shared.test"}, "session one")
 
-	front := New("/two/config.dsvs.ts", false)
+	front := New("/two/config.dsvs.ts", port, false)
 	if err := front.Hosts([]string{"shared.test"}); err != nil {
 		t.Fatal(err)
 	}
-	_, err := front.Listen(port)
+	_, err := front.Listen()
 	if err == nil {
 		t.Fatal("the second session was registered, want a refusal")
 	}
@@ -172,11 +173,11 @@ func TestHubRefusesASecondSessionOfTheSameConfig(t *testing.T) {
 	port := freePort(t)
 	serve(t, port, "/one/config.dsvs.ts", []string{"one.test"}, "session one")
 
-	front := New("/one/config.dsvs.ts", false)
+	front := New("/one/config.dsvs.ts", freePort(t), false)
 	if err := front.Hosts([]string{"other.test"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := front.Listen(freePort(t)); err == nil {
+	if _, err := front.Listen(); err == nil {
 		t.Fatal("the second session of the same file was registered, want a refusal")
 	} else if !strings.Contains(err.Error(), "/one/config.dsvs.ts") {
 		t.Errorf("refusal = %q, want it to name the configuration", err)
@@ -203,6 +204,69 @@ func TestHubKeepsAContestedHostWithItsOwnerOnReload(t *testing.T) {
 	}
 	if body, code := get(t, port, "two.test"); body != "session two" || code != 200 {
 		t.Errorf("the session's own host answers %d %q, want it still served", code, body)
+	}
+}
+
+// A session changes port without registering again: its hosts are served there, the old port closes
+// with it if it served only that session, the connection a tab kept there closes, and the list of
+// sessions tells the new one.
+func TestASessionMovesToAnotherPort(t *testing.T) {
+	startHub(t)
+	left, port := freePort(t), freePort(t)
+	front := serveFront(t, left, "/one/config.dsvs.ts", []string{"one.test"}, "session one")
+	kept := dial(t, left)
+	fmt.Fprint(kept, "GET / HTTP/1.1\r\nHost: one.test\r\n\r\n")
+	reader := bufio.NewReader(kept)
+	if res, err := http.ReadResponse(reader, nil); err != nil || res.StatusCode != 200 {
+		t.Fatalf("the connection kept on the old port: %v %v", res, err)
+	}
+
+	if err := front.Move(port); err != nil {
+		t.Fatal(err)
+	}
+	if body, code := get(t, port, "one.test"); body != "session one" || code != 200 {
+		t.Errorf("the new port answers %d %q", code, body)
+	}
+	if _, _, err := ask(left, "one.test"); err == nil {
+		t.Error("the old port still answers, want it to close with its last session")
+	}
+	kept.SetReadDeadline(time.Now().Add(2 * time.Second))
+	fmt.Fprint(kept, "GET / HTTP/1.1\r\nHost: one.test\r\n\r\n")
+	if res, err := http.ReadResponse(reader, nil); err == nil {
+		t.Errorf("the connection kept on the old port is still served: %d", res.StatusCode)
+	}
+	if living, _ := Sessions(); len(living) != 1 || living[0].Port != port {
+		t.Errorf("sessions = %+v, want port %d", living, port)
+	}
+}
+
+// A port another program holds, or where another session serves one of the hosts, is refused, and
+// says why: the session stays where it is, served as before. The old port stays open for whoever
+// still serves there.
+func TestAMoveThatCannotHappenLeavesTheSessionWhereItIs(t *testing.T) {
+	startHub(t)
+	here, contested := freePort(t), freePort(t)
+	front := serveFront(t, here, "/one/config.dsvs.ts", []string{"one.test"}, "session one")
+	serve(t, contested, "/two/config.dsvs.ts", []string{"one.test"}, "session two")
+	taken, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { taken.Close() })
+
+	for port, want := range map[int]string{
+		taken.Addr().(*net.TCPAddr).Port: "taken by another program",
+		contested:                        "one.test already belongs to /two/config.dsvs.ts",
+	} {
+		if err := front.Move(port); err == nil || err.Error() != want {
+			t.Errorf("Move(%d) = %v, want %q", port, err, want)
+		}
+	}
+	if body, code := get(t, here, "one.test"); body != "session one" || code != 200 {
+		t.Errorf("the session answers %d %q on its port, want it to have stayed there", code, body)
+	}
+	if body, _ := get(t, contested, "one.test"); body != "session two" {
+		t.Errorf("the contested host answers %q, want it to stay with its owner", body)
 	}
 }
 
@@ -322,8 +386,8 @@ func TestSessionSaysTheDispatcherStoppedWithoutAnswering(t *testing.T) {
 		}
 	}()
 
-	if _, err := New("/one/config.dsvs.ts", false).Listen(port); err == nil {
-		t.Fatal("the session believed itself registered")
+	if _, err := New("/one/config.dsvs.ts", port, false).Listen(); err == nil {
+		t.Fatal("the session believed it was registered")
 	} else if !strings.Contains(err.Error(), "without answering") {
 		t.Errorf("error = %q, want it to tell the hub's stop", err)
 	}
@@ -409,11 +473,11 @@ func TestSessionIsNotFrozenByADispatcherThatStopsReading(t *testing.T) {
 	port := freePort(t)
 	deaf(t)
 
-	front := New("/one/config.dsvs.ts", false)
+	front := New("/one/config.dsvs.ts", port, false)
 	if err := front.Hosts([]string{"one.test"}); err != nil {
 		t.Fatal(err)
 	}
-	listener, err := front.Listen(port)
+	listener, err := front.Listen()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -445,11 +509,11 @@ func TestSessionDoesNotSpinOnADispatcherThatDiesAtOnce(t *testing.T) {
 	port := freePort(t)
 	greetings := fleeting(t)
 
-	front := New("/one/config.dsvs.ts", false)
+	front := New("/one/config.dsvs.ts", port, false)
 	if err := front.Hosts([]string{"one.test"}); err != nil {
 		t.Fatal(err)
 	}
-	listener, err := front.Listen(port)
+	listener, err := front.Listen()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -647,13 +711,13 @@ type testFront struct {
 
 func serveFront(t *testing.T, port int, config string, hosts []string, answer string) *testFront {
 	t.Helper()
-	front := New(config, false)
+	front := New(config, port, false)
 	news := make(chan string, 8)
 	front.Say(func(line string) { news <- line })
 	if err := front.Hosts(hosts); err != nil {
 		t.Fatal(err)
 	}
-	listener, err := front.Listen(port)
+	listener, err := front.Listen()
 	if err != nil {
 		t.Fatalf("the session did not join the hub: %v", err)
 	}

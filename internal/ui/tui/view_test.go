@@ -1015,14 +1015,15 @@ func (h heldNet) Dial(ctx context.Context, ep core.Endpoint) (net.Conn, error) {
 	return core.Loopback{}.Dial(ctx, ep)
 }
 
-// ownPort takes the port itself: the view shows nothing of the hub.
+// ownPort holds the port in place of the hub, without opening anything: the view shows nothing of
+// it.
 type ownPort struct{}
 
-func (ownPort) Listen(port int) (net.Listener, error) {
-	return net.Listen("tcp", fmt.Sprintf(":%d", port))
-}
+func (ownPort) Listen() (net.Listener, error) { return nil, net.ErrClosed }
 
 func (ownPort) Hosts([]string) error { return nil }
+
+func (ownPort) Move(int) error { return nil }
 
 func (h heldNet) Mode() core.Mode {
 	if h.isolated {

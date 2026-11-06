@@ -1077,5 +1077,6 @@ func (idleGateway) Stats(string) (int, int)     { return 0, 0 }
 
 type noFront struct{}
 
-func (noFront) Listen(int) (net.Listener, error) { return nil, errors.New("no port in this test") }
-func (noFront) Hosts([]string) error             { return nil }
+func (noFront) Listen() (net.Listener, error) { return nil, errors.New("no port in this test") }
+func (noFront) Hosts([]string) error          { return nil }
+func (noFront) Move(int) error                { return errors.New("no port in this test") }

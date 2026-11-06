@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -143,10 +144,11 @@ type hub struct {
 	born time.Time
 }
 
-// client is a registered session: its control connection, the port it asks for, the configuration
-// it comes from — its identity — and the hosts it serves. The hosts are replaced in one block, so a
-// routing reads them without locking anything; the writes to the session are serialized for it
-// alone, never under the table's lock, which a slow session would freeze.
+// client is a registered session: its control connection, the port it asks for — which changes
+// under the table's lock —, the configuration it comes from — its identity — and the hosts it
+// serves. The hosts are replaced in one block, so a routing reads them without locking anything;
+// the writes to the session are serialized for it alone, never under the table's lock, which a slow
+// session would freeze.
 type client struct {
 	conn   *net.UnixConn
 	port   int
@@ -225,8 +227,11 @@ func (h *hub) attend(conn *net.UnixConn) {
 		if err != nil {
 			return
 		}
-		if verb, rest, _ := strings.Cut(line, " "); verb == "hosts" {
+		switch verb, rest, _ := strings.Cut(line, " "); verb {
+		case "hosts":
 			h.reassign(c, split(rest))
+		case "port":
+			c.answer(h.move(c, rest))
 		}
 	}
 }
@@ -272,14 +277,43 @@ func (h *hub) join(conn *net.UnixConn, port int, config string, hosts []string) 
 func (h *hub) leave(gone *client) {
 	h.mu.Lock()
 	h.clients = slices.DeleteFunc(h.clients, func(c *client) bool { return c == gone })
-	// The port goes away with the last session that claimed it: it belongs to nobody in between.
-	if tcp := h.ports[gone.port]; tcp != nil && !h.wanted(gone.port) {
-		tcp.Close()
-		delete(h.ports, gone.port)
-	}
+	h.release(gone.port)
 	count := len(h.clients)
 	h.mu.Unlock()
 	h.changed <- count
+}
+
+// move switches a session to another port, under the table's lock like a registration: none of its
+// hosts must be served there by another one, and the port must open. Otherwise it stays where it
+// is. Its in-flight connections are not ours: it is the session that closes those of the old one.
+func (h *hub) move(c *client, asked string) error {
+	port, err := strconv.Atoi(asked)
+	if err != nil {
+		return fmt.Errorf("unreadable port: %q", asked)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, host := range c.declared() {
+		if owner := h.serving(port, host); owner != nil && owner != c {
+			return fmt.Errorf("%s already belongs to %s", show(host), owner.config)
+		}
+	}
+	if err := h.open(port); err != nil {
+		return err
+	}
+	left := c.port
+	c.port = port
+	h.release(left)
+	return nil
+}
+
+// release closes the port when no session claims it anymore: it belongs to nobody in between.
+// Called while holding the table's lock.
+func (h *hub) release(port int) {
+	if tcp := h.ports[port]; tcp != nil && !h.wanted(port) {
+		tcp.Close()
+		delete(h.ports, port)
+	}
 }
 
 // reassign replaces a session's hosts after a reload. A host already served by another one stays
@@ -312,6 +346,9 @@ func (h *hub) open(port int) error {
 		return nil
 	}
 	tcp, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if errors.Is(err, syscall.EADDRINUSE) {
+		return errors.New("taken by another program")
+	}
 	if err != nil {
 		return err
 	}
@@ -375,6 +412,18 @@ func (c *client) declared() []string { return *c.hosts.Load() }
 // pass hands a connection to the session.
 func (c *client) pass(conn *net.TCPConn) error {
 	return c.write(func(to *net.UnixConn) error { return fdpass.SendConn(to, "conn", conn) })
+}
+
+// answer tells the session what became of its port request: ok, or why it stays where it is.
+func (c *client) answer(err error) {
+	said := "ok"
+	if err != nil {
+		said = err.Error()
+	}
+	c.write(func(to *net.UnixConn) error {
+		_, err := fmt.Fprintf(to, "port %s\n", said)
+		return err
+	})
 }
 
 // tell makes a line be said in the session's log: it is the only path through which the hub talks

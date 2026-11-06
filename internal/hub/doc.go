@@ -22,7 +22,12 @@
 // facade" and "take everything" are two different lines instead of the same silence.
 //
 // The port is not an identity, it is a resource: opened for the first session that claims it,
-// closed with the last, and belonging to nobody in between. A concurrent birth produces only one
+// closed with the last, and belonging to nobody in between. A registered session changes it without
+// unregistering — unregistering to register again would let a hub it was the last of die, and
+// someone else take its name during the trip: the hub checks the new port like a registration,
+// under the same lock, and releases the old one if it serves nobody anymore; refused, the session
+// stays where it is. The connections already passed are the session's, and it closes those of the
+// old port: a tab that kept its own there is no longer served. A concurrent birth produces only one
 // hub, the file lock that grants the right to hold the socket breaking the tie between the
 // contenders.
 //

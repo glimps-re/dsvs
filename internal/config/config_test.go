@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"maps"
 	"os"
@@ -17,7 +18,7 @@ import (
 func TestAnAppKeepsItsColorWhenAnotherLeaves(t *testing.T) {
 	t.Parallel()
 	colors := func(names string) map[string]string {
-		_, cfg, err := Load(write(t, `export default { port: 4200, ingress: [{ host: "localhost", routes: [{ path: "/", redirect: "/shop/" }] }], apps: [`+names+`].map((name) => ({ name, command: ["serve", name] })) };`), nil, Input{})
+		_, cfg, err := Load(write(t, `export default { port: 4200, ingress: [{ host: "localhost", routes: [{ path: "/", proxy: { target: "http://shop.test" } }] }], apps: [`+names+`].map((name) => ({ name, command: ["serve", name] })) };`), nil, Input{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -327,6 +328,39 @@ func TestAnAppWithoutAPortAndItsReadyLine(t *testing.T) {
 	}
 }
 
+// reload says, app by app, what an applied configuration does: reload its pages, type a text as is, or
+// nothing; and dsvs config writes it back as it was written.
+func TestReloadIsDeclaredAppByApp(t *testing.T) {
+	t.Parallel()
+	_, cfg, err := Load(write(t, `export default { port: 1, ingress: [{ host: "x", routes: [{ path: "/", app: "front" }, { path: "/docs", app: "docs" }] }],
+  apps: [
+    { name: "front", command: ["ng", "serve", "{port}"], reload: { stdin: "r\n" } },
+    { name: "docs", command: ["srv", "{port}"], reload: "page" },
+    { name: "api", command: ["node", "server.js"] },
+  ] };`), nil, Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]Reload{"front": {Stdin: "r\n"}, "docs": {Page: true}, "api": {}}
+	for _, app := range cfg.Apps {
+		if app.Reload != want[app.Name] {
+			t.Errorf("%s: reload = %+v, want %+v", app.Name, app.Reload, want[app.Name])
+		}
+	}
+	written, err := json.Marshal(cfg.Apps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, part := range []string{`"reload":{"stdin":"r\n"}`, `"reload":"page"`} {
+		if !strings.Contains(string(written), part) {
+			t.Errorf("dsvs config writes %s, want %s", written, part)
+		}
+	}
+	if strings.Count(string(written), "reload") != 2 {
+		t.Errorf("an app without reload has no reason to write it: %s", written)
+	}
+}
+
 func TestLoadRefusesWhatWouldBreakLater(t *testing.T) {
 	t.Parallel()
 	app := `{ name: "a", command: ["srv", "{port}"] }`
@@ -364,6 +398,16 @@ func TestLoadRefusesWhatWouldBreakLater(t *testing.T) {
 			{ path: "/a", app: "a" }, { path: "/a/", app: "a" }] }], apps: [` + app + `] }`,
 		"redirect without a leading slash": `{ port: 1, ingress: [{ host: "x",
 			routes: [{ path: "/a", redirect: "elsewhere" }] }], apps: [` + app + `] }`,
+		// The rest of the path is appended to the target: a redirect that matches its own target would
+		// send there endlessly, deeper each time.
+		"redirect to a path it takes itself": `{ port: 1, ingress: [{ host: "x",
+			routes: [{ path: "/", redirect: "/shop" }] }], apps: [` + app + `] }`,
+		"redirect under its own prefix": `{ port: 1, ingress: [{ host: "x",
+			routes: [{ path: "/a", app: "a" }, { path: "/b", redirect: "/b/v2" }] }], apps: [` + app + `] }`,
+		"reload page on an app no route serves": `{ port: 1, ingress: [` + front + `],
+			apps: [` + app + `, { name: "b", command: ["tsc"], reload: "page" }] }`,
+		"route under the reserved path": `{ port: 1, ingress: [{ host: "x",
+			routes: [{ path: "/a", app: "a" }, { path: "/__dsvs/events", app: "a" }] }], apps: [` + app + `] }`,
 		"proxy target without a scheme": `{ port: 1, ingress: [{ host: "x",
 			routes: [{ path: "/a", proxy: { target: "api.example.com" } }] }], apps: [` + app + `] }`,
 		"proxy target without a host": `{ port: 1, ingress: [{ host: "x",
@@ -426,6 +470,10 @@ func TestAKeyOrATypeTheConfigurationDoesNotReadIsRefusedInItsWords(t *testing.T)
 		"deep in a route": {
 			`{ port: 4380, ingress: [{ host: "shop.localhost", routes: [{ path: "/", proxy: { target: "http://x", secure: "no", changorigin: true } }] }], apps: [` + front + `] }`,
 			"config.dsvs.ts:\n  - ingress[0].routes[0].proxy: unknown key \"changorigin\" (did you mean \"changeOrigin\"?)\n  - ingress[0].routes[0].proxy.secure: true or false, not \"no\"",
+		},
+		"a reload that is neither page nor stdin": {
+			`{ port: 4380, ` + shop + `, apps: [{ name: "front", command: ["srv", "{port}"], reload: "pages" }, { name: "api", command: ["api"], reload: { stdn: "r\\n" } }] }`,
+			"config.dsvs.ts:\n  - apps[0].reload: \"page\" or { stdin: \"…\" }, not \"pages\"\n  - apps[1].reload: unknown key \"stdn\" (did you mean \"stdin\"?)",
 		},
 		"a whole number expected": {
 			`{ port: 4380.5, ` + shop + `, apps: [` + front + `] }`,

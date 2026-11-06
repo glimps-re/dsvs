@@ -500,15 +500,20 @@ func (h held) Dial(ctx context.Context, ep Endpoint) (net.Conn, error) {
 
 func (h held) Mode() Mode { return Mode{Name: "rigged"} }
 
-// ownPort takes the port itself: a test has no hub to launch, and what it checks does not depend on
-// who holds the port.
-type ownPort struct{}
+// ownPort holds the port in place of the hub: a test does not have to launch one, and nothing opens
+// there. The taken port is refused, like a port another program holds.
+type ownPort struct{ taken int }
 
-func (ownPort) Listen(port int) (net.Listener, error) {
-	return net.Listen("tcp", fmt.Sprintf(":%d", port))
-}
+func (ownPort) Listen() (net.Listener, error) { return nil, errors.New("no port in this test") }
 
 func (ownPort) Hosts([]string) error { return nil }
+
+func (o ownPort) Move(port int) error {
+	if port == o.taken {
+		return errors.New("taken by another program")
+	}
+	return nil
+}
 
 // reaches waits for the app to reach this state, woken up by the session rather than polling it: a
 // change that happened between two looks can no longer go unnoticed, and a state held open is
@@ -1003,8 +1008,8 @@ export default {
 		t.Errorf("port = %d, want the command line's", got)
 	}
 	journal := joinLines(session.Log.Lines())
-	if strings.Contains(journal, "is taken") {
-		t.Errorf("the file's port did not change: nothing to announce, yet the log says:\n%s", journal)
+	if strings.Contains(journal, "listening on port") {
+		t.Errorf("the port did not change: nothing to announce, yet the log says:\n%s", journal)
 	}
 	if strings.Count(journal, "targets recomputed") != 2 {
 		t.Errorf("the script's echo should accompany the reload:\n%s", journal)
@@ -1027,9 +1032,10 @@ export default {
 	}
 }
 
-// Without -port, a port changed in the file cannot be followed: the session keeps its own and says so
-// — once, when it changes, not at every save as long as the gap persists.
-func TestChangedPortIsKeptAndSaidOnce(t *testing.T) {
+// The file's port is followed as soon as the configuration applies: dsvs adapts to its
+// configuration. A port that cannot be taken makes the configuration refused, which says so, and
+// the session stays where it is. The command line's one wins: the file does not take it back.
+func TestTheSessionFollowsThePortOfTheFile(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	path := filepath.Join(dir, config.FileName)
@@ -1049,26 +1055,35 @@ func TestChangedPortIsKeptAndSaidOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	session := NewSession(form, *cfg, heldNet(t), ownPort{taken: 4500}, func(*Session) Gateway { return &spyGateway{} })
 
 	declare("4400")
 	if err := session.Reload(); err != nil {
 		t.Fatal(err)
 	}
-	if got := session.Config().Port; got != 4300 {
-		t.Errorf("port = %d, want the session's", got)
+	if got := session.Config().Port; got != 4400 {
+		t.Errorf("port = %d, want the file's", got)
 	}
-	journal := joinLines(session.Log.Lines())
-	if !strings.Contains(journal, "port 4300 is taken") {
-		t.Errorf("an ignored port must be said, yet the log carries:\n%s", journal)
+	if journal := joinLines(session.Log.Lines()); !strings.Contains(journal, "-- listening on port 4400 instead of 4300") {
+		t.Errorf("the port change must be said, yet the log carries:\n%s", journal)
 	}
 
-	before := len(session.Log.Lines())
-	if err := session.Reload(); err != nil {
-		t.Fatal(err)
+	declare("4500")
+	refused := "port 4500: taken by another program; the session stays on port 4400"
+	if err := session.Reload(); err == nil || err.Error() != refused {
+		t.Errorf("reload = %v, want %q", err, refused)
 	}
-	if after := len(session.Log.Lines()); after != before {
-		t.Errorf("the gap persists without changing: the log has no reason to say it again (%d more lines)", after-before)
+	if got, why := session.Config().Port, session.NotApplied(); got != 4400 || why != refused {
+		t.Errorf("port = %d, not applied: %q; want 4400 and %q", got, why, refused)
+	}
+
+	forced := NewSession(form, *cfg, heldNet(t), ownPort{taken: 4400}, func(*Session) Gateway { return &spyGateway{} })
+	forced.mu.Lock()
+	forced.cfg.Port, forced.cfg.ForcedPort = 4600, 4600
+	forced.mu.Unlock()
+	declare("4400")
+	if err := forced.Reload(); err != nil || forced.Config().Port != 4600 {
+		t.Errorf("forced port = %d (%v), want 4600 whatever the file says", forced.Config().Port, err)
 	}
 }
 
@@ -1592,11 +1607,57 @@ func TestAnObservationThatChangesNothingIsSilent(t *testing.T) {
 	if got := joinLines(session.Log.Lines()); !strings.Contains(got, "-- network: not observed → offline (tun0), configuration unchanged") {
 		t.Errorf("the log does not tell the change:\n%s", got)
 	}
-	if got := joinLines(session.Log.Lines()); strings.Contains(got, "reloading the browser") {
+	if got := joinLines(session.Log.Lines()); strings.Contains(got, "typed") || strings.Contains(got, "pages reload") {
 		t.Error("the browsers were reloaded")
 	}
 	if session.Observed() != seen || session.Config().Observed != seen {
 		t.Error("the session and its configuration must keep the last observation")
+	}
+}
+
+// An applied configuration types into the terminal of a ready app exactly what its reload key
+// declares, and nothing into that of an app that declares none.
+func TestAnAppliedConfigurationTypesWhatAnAppDeclares(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), config.FileName)
+	declare := func(target string) {
+		t.Helper()
+		body := `export default {
+    port: 4300,
+    ingress: [{ host: "localhost", routes: [{ path: "/api", proxy: { target: "` + target + `" } }] }],
+    apps: [
+        { name: "typist", command: ["sh", "-c", "read l; echo \"got [$l]\" | tr a-z A-Z; sleep 300"], reload: { stdin: "go\n" } },
+        { name: "quiet", command: ["sh", "-c", "read l; echo \"got [$l]\" | tr a-z A-Z; sleep 300"] },
+    ],
+}`
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	declare("https://first.example")
+	form, cfg, err := config.Load(path, nil, config.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	supervising(t, session)
+	for _, app := range session.Apps() {
+		app.Start()
+		waitFor(t, app.Name+" ready", app.IsReady)
+	}
+
+	declare("https://second.example")
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	typist, quiet := session.App("typist"), session.App("quiet")
+	waitFor(t, "what typist read", func() bool { return strings.Contains(joinLines(typist.Log.Lines()), "GOT [GO]") })
+	if got := joinLines(session.Log.Lines()); !strings.Contains(got, `-- typist: "go\n" typed`) || strings.Contains(got, "quiet:") {
+		t.Errorf("the log must say what was typed, and only for typist:\n%s", got)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := joinLines(quiet.Log.Lines()); strings.Contains(got, "GOT") {
+		t.Errorf("quiet declared nothing, and read: %s", got)
 	}
 }
 

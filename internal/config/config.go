@@ -353,6 +353,10 @@ func (r Route) Kind() Kind {
 	return ToApp
 }
 
+// Reserved is the path dsvs keeps for itself on every address, before any route: what it serves to
+// the pages it reloads.
+const Reserved = "/__dsvs"
+
 // Covers says whether the path falls under this route. "/" takes everything left: it is the
 // catch-all, and without it a path with no route is a 404.
 func (r Route) Covers(path string) bool {
@@ -360,6 +364,18 @@ func (r Route) Covers(path string) bool {
 		return true
 	}
 	return path == r.Path || strings.HasPrefix(path, r.Path+"/")
+}
+
+// Redirection returns where a redirect leads for this requested URL: the target, followed by what
+// comes after the route's prefix, then by the query. A deep link thus keeps its place under a front
+// moved under a prefix; what has nothing after it leads to the target as written.
+func (r Route) Redirection(asked *url.URL) string {
+	to, _ := url.Parse(r.Redirect) // parsed at load
+	if rest := strings.TrimPrefix(asked.EscapedPath(), r.Path); rest != "" {
+		to = to.JoinPath(rest)
+	}
+	to.RawQuery = strings.Trim(to.RawQuery+"&"+asked.RawQuery, "&")
+	return to.String()
 }
 
 // Match returns the route that takes this path — an already decoded path, without query, as
@@ -415,6 +431,7 @@ type App struct {
 	Dir     string            `json:"dir,omitzero"`
 	Color   string            `json:"color,omitzero"`
 	Ready   *Ready            `json:"ready,omitzero"`
+	Reload  Reload            `json:"reload,omitzero"`
 
 	// Ansi is the resolved color, from 1 to 6; the interfaces consume it without going back to the name.
 	Ansi int `json:"-"`
@@ -428,6 +445,39 @@ type App struct {
 type Ready struct {
 	HTTP string   `json:"http,omitzero"`
 	Log  *Pattern `json:"log,omitzero"`
+}
+
+// Reload says what an applied configuration does to an app, so that what it changes shows: Page
+// reloads the HTML pages it serves, through the proxy; Stdin is typed into its terminal when it is
+// ready, as is — nothing is added, not even a newline. Without it, nothing: a server typed a letter it
+// does not know may read something else into it, Vite a restart.
+type Reload struct {
+	Page  bool
+	Stdin string
+}
+
+// reloadJSON is the typing form: the page one is written "page".
+type reloadJSON struct {
+	Stdin string `json:"stdin"`
+}
+
+// UnmarshalJSON reads a shape that shaped has checked: the only text allowed is "page".
+func (r *Reload) UnmarshalJSON(data []byte) error {
+	if json.Unmarshal(data, new(string)) == nil {
+		r.Page = true
+		return nil
+	}
+	var typed reloadJSON
+	err := json.Unmarshal(data, &typed)
+	r.Stdin = typed.Stdin
+	return err
+}
+
+func (r Reload) MarshalJSON() ([]byte, error) {
+	if r.Page {
+		return json.Marshal("page")
+	}
+	return json.Marshal(reloadJSON{Stdin: r.Stdin})
 }
 
 // Pattern is what an output line must contain: a literal text, or a RegExp from the configuration,
@@ -499,9 +549,11 @@ func (s App) Resolved() App {
 
 // SameRun says whether two declarations launch the same process. The color is not part of it: the
 // interfaces read it from the current declaration, and an app need not restart when it changes. Nor is
-// Ready: it only says what is expected of the process, and the next launch will take it.
+// Ready: it only says what is expected of the process, and the next launch will take it. Nor is Reload:
+// the current declaration says what to do when a configuration applies.
 func (s App) SameRun(other App) bool {
 	s.Color, s.Ansi, s.Ready, other.Color, other.Ansi, other.Ready = "", 0, nil, "", 0, nil
+	s.Reload, other.Reload = Reload{}, Reload{}
 	return reflect.DeepEqual(s, other)
 }
 
@@ -983,6 +1035,9 @@ func (c Config) validate(path string) error {
 			fail("%s: a facade routes to it, so the command must say where to listen, with %s", s.Name, TokenPort)
 		}
 		s.Ready.validate(s, fail)
+		if s.Reload.Page && len(c.IngressesOf(s.Name)) == 0 {
+			fail("%s: reload \"page\" reloads the pages a facade serves from it, and no route leads to it", s.Name)
+		}
 		if _, known := ansiByName[s.Color]; !known {
 			fail("%s: unknown color %q (%s)", s.Name, s.Color, strings.Join(palette, ", "))
 		}
@@ -1012,8 +1067,11 @@ func (c Config) validate(path string) error {
 		}
 		paths := map[string]bool{}
 		for _, route := range in.Routes {
-			if !strings.HasPrefix(route.Path, "/") {
+			switch {
+			case !strings.HasPrefix(route.Path, "/"):
 				fail("%s: route %q must start with /", in.Name, route.Path)
+			case route.Path == Reserved || strings.HasPrefix(route.Path, Reserved+"/"):
+				fail("%s: route %q: %s is reserved by dsvs on every address", in.Name, route.Path, Reserved)
 			}
 			if paths[route.Path] {
 				fail("%s: two routes for %q", in.Name, route.Path)
@@ -1123,8 +1181,18 @@ func (i Ingress) validateTarget(route Route, apps map[string]bool, fail func(str
 			fail("%s: route %q leads to app %q, which does not exist", i.Name, route.Path, route.App)
 		}
 	case ToRedirect:
-		if !strings.HasPrefix(route.Redirect, "/") {
+		// The rest of the path is appended to the target: a target the redirect itself takes again would
+		// send it back under itself, deeper and deeper.
+		target, err := url.Parse(route.Redirect)
+		switch {
+		case !strings.HasPrefix(route.Redirect, "/"):
 			fail("%s: the redirect of %q must start with /", i.Name, route.Path)
+		case err != nil:
+			fail("%s: the redirect of %q is unreadable (%q): %v", i.Name, route.Path, route.Redirect, err)
+		default:
+			if back, _ := i.Match(target.Path); back == route {
+				fail("%s: the redirect of %q leads back to itself: no other route takes %s", i.Name, route.Path, target.Path)
+			}
 		}
 	case ToProxy:
 		parsed, err := url.Parse(route.Proxy.URL)
@@ -1165,6 +1233,15 @@ func shaped(at string, value any, t reflect.Type) []string {
 			return nil
 		}
 		t = reflect.TypeFor[patternJSON]()
+	}
+	if _, text := value.(string); t == reflect.TypeFor[Reload]() {
+		if value == "page" {
+			return nil
+		}
+		if text {
+			return []string{mistyped(at, `"page" or { stdin: "…" }`, value)}
+		}
+		t = reflect.TypeFor[reloadJSON]()
 	}
 	switch t.Kind() {
 	case reflect.Struct:
