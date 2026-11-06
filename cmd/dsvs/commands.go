@@ -143,11 +143,14 @@ exists; it is not evaluated.`,
 		name:    "forget",
 		summary: "forget the project here, which the panel stops listing",
 		long: `forget makes this binary forget the project of the configuration found here, or the one named by
---config: the panel stops listing it cold, and dsvs status no longer writes it. A session running
-for it keeps running — forget drops an address, it stops nothing — and the project is remembered
-again the next time a session opens for it, an update included. The file need not exist any more:
-dsvs forget --config <path> takes a path as dsvs status writes it. Forgetting a project that was
-not remembered succeeds, since the result asked for holds.`,
+--config: the panel stops listing it cold, dsvs status no longer writes it, and the values kept for
+it, for the project and on each network, are forgotten. It is refused while an app of the project
+runs: dsvs stop --all stops them, dsvs quit closes the session. A session open without a running app
+stays open: it replays its configuration without what the project kept, and keeps the values chosen
+in it, which were never kept. The project is remembered again the next time a session opens for it,
+an update included, or a value is kept for it. The file need not exist any more: dsvs forget
+--config <path> takes a path as dsvs status writes it. Forgetting a project that was not remembered
+succeeds, since the result asked for holds.`,
 		declare: direct(func(names []string) error { return forgetting(os.Stdout, s, names) }),
 	}, {
 		name:    "config",

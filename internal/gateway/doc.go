@@ -10,6 +10,8 @@
 // facades at once.
 //
 // A proxy is kept per target, and rebuilt when the target changes run: an app that restarts
-// elsewhere would otherwise leave warm connections to nowhere. These proxies are never swept —
-// bounded by the number of targets ever seen, and accepted.
+// elsewhere would otherwise leave warm connections to nowhere. A remote target also rebuilds it
+// when the machine changes network: the connection kept on the old one is dead without knowing it,
+// and the first request on it waited tens of seconds for a response. These proxies are never swept
+// — bounded by the number of targets ever seen, and accepted.
 package gateway

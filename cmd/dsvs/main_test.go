@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -199,6 +200,22 @@ func TestARefusedSessionDoesNotRememberItsProject(t *testing.T) {
 	}
 	if got := projects.List(); len(got) != 0 {
 		t.Errorf("remembered projects = %v, want none", got)
+	}
+}
+
+// An unreachable gatekeeper does not hold the session back: it starts without an observation, and the
+// log says why.
+func TestTheSessionStartsWhenTheNetworkCannotBeObserved(t *testing.T) {
+	var said []string
+	observed, _ := observe(context.Background(), filepath.Join(t.TempDir(), "absent"), func(line string) {
+		said = append(said, line)
+	})
+
+	if observed != nil {
+		t.Errorf("observation = %+v, want none", observed)
+	}
+	if len(said) != 1 || !strings.HasPrefix(said[0], "-- network not observed: ") {
+		t.Errorf("log = %q, want a \"network not observed\" line", said)
 	}
 }
 

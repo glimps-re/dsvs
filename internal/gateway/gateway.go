@@ -21,12 +21,14 @@ import (
 )
 
 // Net is what the proxy expects of the session: the facade that answers for a host, how to reach an
-// app, and how to open the public port — which, depending on the network, is not opened in the same
-// place. The proxy targets live in the facade: the configuration decides them.
+// app, how to open the public port — which, depending on the network, is not opened in the same place
+// —, and what the machine shows, which says on which network a remote target is reached. The proxy
+// targets, for their part, are in the facade: the configuration decides them.
 type Net interface {
 	Facade(host string) (config.Ingress, bool)
 	Backend(app string) core.Backend
 	Listen(port int) (net.Listener, error)
+	Observed() *config.Observed
 }
 
 // Proxy implements core.Gateway by proxying in Go, without an external process.
@@ -46,11 +48,25 @@ type Proxy struct {
 // holds nothing forever.
 const idleTimeout = 90 * time.Second
 
+// reaching bounds the opening of a connection to a remote target. A network that does not reach it
+// often drops the packets without answering, and the kernel only gives up after two minutes: the
+// request would stay silent all that time, whereas a 502 that names the target reads at once. A
+// reachable target, even through a tunnel, answers in far less.
+const reaching = 5 * time.Second
+
 // relay is the path to a target: the proxy and its transport. via recognizes the next target.
 type relay struct {
 	proxy *httputil.ReverseProxy
 	tr    *http.Transport
-	via   string
+	via   any
+}
+
+// reached tells a remote target apart from one time to the next: its address, and the observation
+// under which it is reached. A connection opened on another network died with it, and reusing it
+// would leave the request waiting for a response that will not come.
+type reached struct {
+	url string
+	on  *config.Observed
 }
 
 type counters struct {
@@ -180,8 +196,9 @@ func (p *Proxy) upstream(in config.Ingress, target config.Target) *httputil.Reve
 		base = &url.URL{Scheme: "http", Host: target.URL}
 	}
 	prefix := strings.TrimSuffix(base.Path, "/")
-	return p.reuse(in, "proxy "+target.URL, target.URL, func() (*http.Transport, func(*httputil.ProxyRequest)) {
+	return p.reuse(in, "proxy "+target.URL, reached{target.URL, p.net.Observed()}, func() (*http.Transport, func(*httputil.ProxyRequest)) {
 		tr := &http.Transport{
+			DialContext:     (&net.Dialer{Timeout: reaching}).DialContext,
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: !target.Verify()}, //nolint:gosec // secure: false, like the proxy.conf it replaces
 			IdleConnTimeout: idleTimeout,
 		}
@@ -200,8 +217,8 @@ func (p *Proxy) upstream(in config.Ingress, target config.Target) *httputil.Reve
 }
 
 // reuse keeps one proxy per target, named by key, and rebuilds it when via — what tells it apart
-// from one run to the next — changes.
-func (p *Proxy) reuse(in config.Ingress, key, via string, build func() (*http.Transport, func(*httputil.ProxyRequest))) *httputil.ReverseProxy {
+// from one run or one network to the next — changes.
+func (p *Proxy) reuse(in config.Ingress, key string, via any, build func() (*http.Transport, func(*httputil.ProxyRequest))) *httputil.ReverseProxy {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if kept, known := p.relays[key]; known {

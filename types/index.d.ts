@@ -222,6 +222,13 @@ export declare function readonly<V>(path: Path<V>, options?: { when?: Logic<V, b
  * on remembered, as by `dsvs remember`.
  */
 export declare function keep<V>(path: Path<V>, options?: { when?: Logic<V, boolean> }): void;
+/**
+ * The chosen value is kept for the observed network — the preferred exit, `eth0 via 198.51.100.1` —
+ * and comes back with it, a new session included. On a network that kept nothing, the value in force
+ * stays; a session opening there has none, and takes what `keep` keeps, otherwise the default. With
+ * `keep`, a known network answers first. As with `keep`, the project is from then on remembered.
+ */
+export declare function network<V>(path: Path<V>, options?: { when?: Logic<V, boolean> }): void;
 
 /**
  * The current choices, in display order. On a text or a number, they restrict it. An option can be
@@ -261,8 +268,20 @@ export declare function validateTree<V>(
  * session's log says why.
  */
 export interface Observed {
-  /** The interfaces that are up and have at least one global address, sorted by name. */
+  /** The interfaces that are up, with carrier, and have at least one global address, sorted by name. */
   links: Link[];
+  /**
+   * Where the traffic leaves the machine: its default routes, the preferred first (the lowest
+   * metric), IPv4 before IPv6. Empty when nothing goes out.
+   */
+  exits: Exit[];
+}
+
+export interface Exit {
+  /** The gateway: `"192.0.2.1"`. Empty for a route without a gateway, a tun's. */
+  via: string;
+  /** The interface traffic leaves through: `"eth0"`, `"tun0"`. */
+  dev: string;
 }
 
 export interface Link {

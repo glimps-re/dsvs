@@ -6,9 +6,11 @@
 // do not lose each other, where re-reading and rewriting would. Duplicates are settled on reading,
 // the order of arrival is the panel's.
 //
-// A project also keeps the values chosen for its parameters, where its form says so (keep), a new
-// session included. One file per project, rewritten whole through a rename: only one session holds a
-// project under a given binary, so there is only one writer per file. Keeping a value remembers the project, and forgetting the project forgets its values: what
+// A project also keeps the values chosen for its parameters, where its form says so: for the
+// project (keep), and network by network (network) — coming back to a network brings back what was
+// chosen there, a new session included. One file per project, two tables, rewritten whole through a
+// rename: only one session holds a project under a given binary, so there is only one writer per
+// file. Keeping a value remembers the project, and forgetting the project forgets its values: what
 // is kept for a project is always seen and forgotten through the list.
 package projects
 
@@ -109,15 +111,17 @@ func Forget(config string) (listed, valued bool, err error) {
 	return true, valued, os.WriteFile(file, []byte(strings.Join(kept, "\n")+"\n"), 0o600)
 }
 
-// Recall returns the values kept for this project, in a table always ready to receive other values.
-// No file, or an unreadable file: nothing is kept, and it is not an error.
-func Recall(config string) (kept map[string]string) {
+// Recall returns the values kept for this project, and those kept for it on this network, in tables
+// always ready to receive other values. No file, no network, or an unreadable file: nothing is
+// kept, and it is not an error.
+func Recall(config, network string) (kept, onNetwork map[string]string) {
 	_, memory, err := memoryOf(config)
-	kept = map[string]string{}
+	kept, onNetwork = map[string]string{}, map[string]string{}
 	if err == nil {
 		maps.Copy(kept, memory.Kept)
+		maps.Copy(onNetwork, memory.Networks[network])
 	}
-	return kept
+	return kept, onNetwork
 }
 
 // Keep keeps these values for this project, over those that were there.
@@ -130,9 +134,28 @@ func Keep(config string, values map[string]string) error {
 	})
 }
 
-// memory is what a project keeps of its parameters.
+// Retain keeps these values for this project on this network, over those that were there. Without a
+// network, nothing is kept, and the error says so.
+func Retain(config, network string, values map[string]string) error {
+	if network == "" {
+		return errors.New("offline")
+	}
+	return rewrite(config, func(memory *memory) {
+		if memory.Networks == nil {
+			memory.Networks = map[string]map[string]string{}
+		}
+		if memory.Networks[network] == nil {
+			memory.Networks[network] = map[string]string{}
+		}
+		maps.Copy(memory.Networks[network], values)
+	})
+}
+
+// memory is what a project keeps of its parameters: for itself, and for each network, designated as
+// config.Observed.Network writes it.
 type memory struct {
-	Kept map[string]string `json:"kept,omitzero"`
+	Kept     map[string]string            `json:"kept,omitzero"`
+	Networks map[string]map[string]string `json:"networks,omitzero"`
 }
 
 // rewrite is the sole guardian of the values file: it remembers the project, re-reads the file,

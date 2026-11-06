@@ -29,12 +29,17 @@
 // type: an app's drift is not stored, it is derived from the declaration its last run was launched
 // with and from the current one. A removed app survives as long as its process, restarts with what
 // it had, and its supervisor withdraws itself as soon as it stops — "no longer declared and
-// stopped" is therefore not a representable state. The session owns the intents chosen since it
+// stopped" is therefore not a representable state. A network observation is a replay like any other
+// (Observe, behind the same method as Reload). The session owns the intents chosen since it
 // started, which the handover carries, and the last evaluated form; each replay hands it those
-// intents and what the project keeps, and the configuration engine derives the values from them. An
-// evaluation that fails, or that yields an invalid form, keeps the configuration in force, and the
-// session says why (NotApplied) — it is the only one to say it — until the evaluation that applies
-// the file again, and which the log tells.
+// intents and what the project keeps for itself and for the observed network, and the configuration
+// engine derives the values from them. Coming back to a network therefore brings back its values
+// without an extra replay. A value the network brings back becomes, once applied, the session's
+// intent: on a network that kept nothing for its field, the value in force stays, not a choice made
+// elsewhere before it. An evaluation that fails, or that yields an invalid form, keeps the
+// configuration in force, and the session says why (NotApplied) — it is the only one to say it —
+// until the evaluation that applies the file again, whether it is a save or a network, and which
+// the log tells.
 //
 // # The handover, and what Pdeathsig costs it
 //

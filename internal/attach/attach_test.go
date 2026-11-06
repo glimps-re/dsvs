@@ -314,7 +314,7 @@ export default config(form({ env: ["local", "staging"] }, (p) => { keep(p.env); 
 	if err := projects.Keep(path, map[string]string{"env": "staging"}); err != nil {
 		t.Fatal(err)
 	}
-	form, cfg, err := config.Load(path, nil, core.InputFor(path, nil, nil))
+	form, cfg, err := config.Load(path, nil, core.InputFor(path, nil, nil, nil))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +339,7 @@ export default config(form({ env: ["local", "staging"] }, (p) => { keep(p.env); 
 	if _, _, err := Forget(path); err == nil || !strings.Contains(err.Error(), "sleeper still running") || !strings.Contains(err.Error(), build.Name()+" stop --all") {
 		t.Errorf("forget while sleeper runs = %v, want a refusal that says what to do", err)
 	}
-	if kept := projects.Recall(path); kept["env"] != "staging" {
+	if kept, _ := projects.Recall(path, ""); kept["env"] != "staging" {
 		t.Errorf("the refusal forgot the values: %v", kept)
 	}
 
@@ -350,7 +350,7 @@ export default config(form({ env: ["local", "staging"] }, (p) => { keep(p.env); 
 	if _, valued, err := Forget(path); err != nil || !valued {
 		t.Fatalf("forget once sleeper stopped = %v, %v", valued, err)
 	}
-	if kept := projects.Recall(path); len(kept) > 0 {
+	if kept, _ := projects.Recall(path, ""); len(kept) > 0 {
 		t.Errorf("kept values after forget = %v", kept)
 	}
 	if field, _ := session.Form().Field("env"); field.Value != "local" || field.From != "default" {
