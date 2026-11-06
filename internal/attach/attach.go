@@ -41,7 +41,7 @@ const reloading = "reloading"
 // requested apps have already been requested.
 func Attach(config, ui string, names []string, start func() error) error {
 	for {
-		err := attach(config, ui, names, start)
+		err := attach(config, ui, names, start, nil)
 		if !errors.Is(err, errReloading) {
 			return err
 		}
@@ -52,7 +52,18 @@ func Attach(config, ui string, names []string, start func() error) error {
 // errReloading says the session is replacing itself with the binary on disk.
 var errReloading = errors.New("the session is taking the binary on disk")
 
-func attach(config, ui string, names []string, start func() error) error {
+// Run lends this terminal to the session of this configuration, which start launches, and holds it: its
+// logs scroll by there, ctrl+c asks it to stop everything and watches it do so, and it also stops when
+// this process goes away without asking — the terminal closed, a kill. ctrl+c is caught even before it
+// is launched: it never leaves it running without a terminal.
+func Run(config string, start func() error) error {
+	interrupted := make(chan os.Signal, 1)
+	signal.Notify(interrupted, os.Interrupt)
+	defer signal.Stop(interrupted)
+	return attach(config, "run", nil, start, interrupted)
+}
+
+func attach(config, ui string, names []string, start func() error, interrupted <-chan os.Signal) error {
 	conn, err := dial(socket(config), start)
 	if err != nil {
 		return err
@@ -74,7 +85,7 @@ func attach(config, ui string, names []string, start func() error) error {
 	if len(names) > 0 {
 		fmt.Fprintf(conn, "start %s\n", strings.Join(names, " "))
 	}
-	go resizes(conn)
+	go relay(conn, interrupted)
 
 	// Nothing is left but to wait: the interface writes to our terminal from the session. "bye" says it
 	// handed it back itself; anything else says it left while holding it.
@@ -306,6 +317,27 @@ func Order(config, verb string, names ...string) (said string, err error) {
 	return "", link.Order(verb, names...)
 }
 
+// Renew asks the session of this configuration to move to the binary on disk without letting go of its
+// apps, and returns its refusal, reason included. A session that hands over does not answer: its
+// connection closes in the exec, and only the version of the session that comes back confirms it. A
+// session from before the question receives the order on a driver's stream, without an answer, as
+// before.
+func Renew(config string) error {
+	_, err := ask(config, "renew")
+	switch {
+	case errors.Is(err, errInterrupted):
+		return nil
+	case errors.Is(err, errUnread):
+		link, err := Watch(config)
+		if err != nil {
+			return err
+		}
+		defer link.Close()
+		return link.Order("renew")
+	}
+	return err
+}
+
 // ask asks the session of this configuration a question, on its own connection, and returns its
 // answer: "ok" and what follows it, its reason otherwise. It is not launched if it is not there.
 func ask(config, question string) (said string, err error) {
@@ -319,7 +351,7 @@ func ask(config, question string) (said string, err error) {
 	}
 	lines := bufio.NewScanner(conn)
 	if !lines.Scan() {
-		return "", errors.Join(errors.New("session interrupted"), lines.Err())
+		return "", errors.Join(errInterrupted, lines.Err())
 	}
 	reply := lines.Text()
 	if said, ok := strings.CutPrefix(reply, "ok"); ok {
@@ -330,6 +362,9 @@ func ask(config, question string) (said string, err error) {
 	}
 	return "", errors.New(strings.TrimPrefix(reply, "err "))
 }
+
+// errInterrupted says the session closed the connection without answering.
+var errInterrupted = errors.New("session interrupted")
 
 // errUnread is a session's answer to a question it does not read: it predates the verb.
 var errUnread = errors.New("the session does not read this question")
@@ -421,15 +456,21 @@ func dial(addr string, start func() error) (*net.UnixConn, error) {
 	}
 }
 
-// resizes tells the session that the window changed. The signal arrives here, not there: the terminal
-// is not its own.
-func resizes(conn *net.UnixConn) {
+// relay tells the session what happens to this terminal: the window changing, and a ctrl+c asking it
+// to stop everything. Signals arrive here, not there: the terminal is not its own.
+func relay(conn *net.UnixConn, interrupted <-chan os.Signal) {
 	winch := make(chan os.Signal, 1)
 	signal.Notify(winch, syscall.SIGWINCH)
 	defer signal.Stop(winch)
-	for range winch {
-		cols, rows := size()
-		if _, err := fmt.Fprintf(conn, "size %d %d\n", cols, rows); err != nil {
+	for {
+		said := "quit"
+		select {
+		case <-winch:
+			cols, rows := size()
+			said = fmt.Sprintf("size %d %d", cols, rows)
+		case <-interrupted:
+		}
+		if _, err := fmt.Fprintln(conn, said); err != nil {
 			return
 		}
 	}

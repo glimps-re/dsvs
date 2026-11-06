@@ -112,6 +112,14 @@ func (s *Server) Reloading() {
 	}
 }
 
+// Held says whether a dsvs run terminal holds the session: it stops with it, and does not move to the
+// binary on disk while that terminal watches.
+func (s *Server) Held() bool {
+	s.seen.Lock()
+	defer s.seen.Unlock()
+	return slices.ContainsFunc(s.watching, func(seen *watched) bool { return seen.Kind == "run" })
+}
+
 // Ready hands over the session to serve: those who were waiting see their interface open. ctx is the
 // process's, not the apps' — an interface must be able to watch the apps stop.
 func (s *Server) Ready(ctx context.Context, session *core.Session, stop func()) {
@@ -215,6 +223,11 @@ func (s *Server) host(conn *net.UnixConn) {
 	case len(fields) == 1 && fields[0] == "reload":
 		shut(fds)
 		s.answer(conn, func() (string, error) { return "", s.session.Reload() })
+	case len(fields) == 1 && fields[0] == "renew":
+		// A successful handover does not answer: the connection closes in the exec, and that is the
+		// acknowledgement. Only a refusal has something to say.
+		shut(fds)
+		s.answer(conn, func() (string, error) { return "", s.session.Renew() })
 	default:
 		shut(fds)
 		fmt.Fprintf(conn, "err unreadable greeting: %q\n", greeting)
@@ -238,6 +251,11 @@ func (s *Server) render(conn *net.UnixConn, fields []string, fds []int) {
 		fmt.Fprintf(conn, "err %v\n", s.because)
 		return
 	}
+	if ui == "run" {
+		// The session of dsvs run belongs to its terminal: it stops when the terminal goes away, whatever
+		// the reason — ctrl+c, the terminal closed, the client killed before it even read "ok".
+		defer s.stop()
+	}
 	if _, err := fmt.Fprintln(conn, "ok"); err != nil {
 		return
 	}
@@ -245,11 +263,11 @@ func (s *Server) render(conn *net.UnixConn, fields []string, fds []int) {
 	watching, leave := context.WithCancel(s.ctx)
 	defer leave()
 
-	// The TUI is driven — a size that changes, and it returns on its own; streamed logs have nothing
-	// to receive and stop with the client.
+	// The TUI is driven — a size that changes, and it returns on its own; streamed logs, those of dsvs
+	// logs -f as well as those of dsvs run, have nothing to receive and stop with the client.
 	var resize func(cols, rows int)
 	render := func() error { plain.Run(watching, s.session, out); return nil }
-	if ui != "plain" {
+	if ui == "tui" {
 		program := tui.New(watching, s.session, s.stop,
 			tui.Terminal{In: in, Out: out, Cols: cols, Rows: rows, Env: fields[6:]})
 		resize, render = program.Resize, program.Run

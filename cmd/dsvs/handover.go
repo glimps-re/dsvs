@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"dsvs/internal/attach"
+	"dsvs/internal/build"
 	"dsvs/internal/core"
 	"dsvs/internal/fdpass"
 	"dsvs/internal/update"
@@ -22,14 +23,20 @@ import (
 const handoverEnv = "DSVS_HANDOVER"
 
 // renewal returns the move that replaces the session with the binary on disk, or nothing when it is out
-// of reach — and a session without this move refuses the verb and says so. Two reasons to do without
-// it: outside the systemd box, the apps carry Pdeathsig and the exec would kill them (measured: 2
-// survivors out of 20); without an attach socket — dsvs run — nobody has a way to ask for it.
+// of reach: outside the systemd box, the apps carry Pdeathsig and the exec would kill them (measured: 2
+// survivors out of 20), and a session without this move refuses the verb and says so. One held by a
+// terminal of dsvs run refuses it too: it belongs to that terminal, which would see it go away before
+// its eyes.
 func renewal(session *core.Session, attachers *attach.Server, network core.Network) func() error {
-	if attachers == nil || os.Getenv(boxEnv) != inBox {
+	if os.Getenv(boxEnv) != inBox {
 		return nil
 	}
-	return func() error { return handOver(session, attachers, network) }
+	return func() error {
+		if attachers.Held() {
+			return fmt.Errorf("this session belongs to the terminal of %s run: it keeps its binary until it stops", build.Name())
+		}
+		return handOver(session, attachers, network)
+	}
 }
 
 // handOver replaces the session with the binary on disk without letting go of its apps: it execs

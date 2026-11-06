@@ -207,19 +207,9 @@ func handed(config, version string) (string, error) {
 }
 
 func handover(config, version string) (string, error) {
-	link, err := attach.Watch(config)
-	if err != nil {
+	if err := attach.Renew(config); err != nil {
 		return "", err
 	}
-	if err := link.Order("renew"); err != nil {
-		link.Close()
-		return "", err
-	}
-	// The link drops with the session's exec, and that is the acknowledgement. If it holds, the session
-	// refused to hand over, and said so in its log.
-	for range link.States() {
-	}
-	link.Close()
 	return back(config, version)
 }
 

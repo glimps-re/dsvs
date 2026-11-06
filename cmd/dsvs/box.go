@@ -28,8 +28,9 @@ const (
 // main process dies, kill -9 included (measured, systemd 257). That is the guarantee that a brutal
 // stop leaves no orphan apps; Pdeathsig only covers the processes we start ourselves, not those nx
 // detaches. When the box is out of reach, box returns and leaves the reason in boxEnv: the session
-// runs without it, as before.
-func box(detached bool) {
+// runs without it, as before. A session has no terminal to hold: the unit returns as soon as it is
+// started, and the session talks through its socket.
+func box() {
 	if os.Getenv(boxEnv) != "" {
 		return
 	}
@@ -50,16 +51,9 @@ func box(detached bool) {
 	}
 
 	cwd, _ := os.Getwd()
-	args := []string{"systemd-run", "--user", "--quiet", "--collect"}
-	if !detached {
-		// Both at once: systemd takes the pty when facing a terminal, the pipe otherwise. The window
-		// size and its changes go through the pty. A session without an interface has no terminal to
-		// hold: it returns as soon as it is started, and talks through its socket.
-		args = append(args, "--wait", "--pty", "--pipe")
-	}
-	args = append(args,
+	args := []string{"systemd-run", "--user", "--quiet", "--collect",
 		"--same-dir",
-		"--description="+filepath.Base(exe)+" — "+cwd,
+		"--description=" + filepath.Base(exe) + " — " + cwd,
 		// Stopping belongs to the session: SIGTERM to the main process alone, which stops its apps in
 		// order and releases the port. systemd's default sends it to the whole cgroup at once, and the
 		// dev servers would die under the feet of whoever supervises them. The group's SIGKILL remains,
@@ -68,9 +62,9 @@ func box(detached bool) {
 		"--property=TimeoutStopSec=30",
 		// The unit would fall back to systemd's low limit (1024, measured): keep the shell's, a dev
 		// server watching a whole project needs it.
-		"--property=LimitNOFILE="+nofile(),
-		"--setenv="+boxEnv+"="+inBox,
-	)
+		"--property=LimitNOFILE=" + nofile(),
+		"--setenv=" + boxEnv + "=" + inBox,
+	}
 	// The unit is born with the manager's environment, not the shell's: everything must be carried
 	// over explicitly. Values go through argv, never through a shell, so nothing needs escaping.
 	for _, kv := range os.Environ() {
