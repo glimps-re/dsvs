@@ -9,6 +9,11 @@ import (
 // hand does not pretend to be a published version.
 var Version = "dev"
 
+// Origin is the clone this binary was built from, empty when it comes from a release. It decides
+// where a newer version is fetched from, and there is no hybrid mode: carried by the binary, it cannot
+// disagree with what runs.
+var Origin = ""
+
 // Name is the name of the running executable. os.Executable resolves links: two links to the same
 // binary therefore share everything derived from that name.
 func Name() string {

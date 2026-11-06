@@ -31,6 +31,7 @@ import (
 	"dsvs/internal/ui/panel"
 	"dsvs/internal/ui/plain"
 	"dsvs/internal/ui/tray"
+	"dsvs/internal/update"
 )
 
 func main() {
@@ -38,7 +39,8 @@ func main() {
 	fs := newFlagSet("dsvs")
 	s.declare(fs)
 	// The plumbing the binary addresses to itself stays as flags, and is not a command: the installed
-	// unit, the hub, spawn and build.sh type them.
+	// unit, the hub, spawn, build.sh and update.VersionOf type them — including an old binary during an
+	// update, which will never know the commands of this one.
 	ports := fs.Bool("hub", false, "hold the ports for the sessions, without serving anything")
 	headless := fs.Bool("session", false, "hold the session without an interface, for the clients that attach to it")
 	icon := fs.Bool("tray", false, "hold the status bar icon, which opens the panel on a click")
@@ -168,6 +170,24 @@ func relaunch() error {
 		return err
 	}
 	return syscall.Exec(exe, []string{exe, "--tray"}, os.Environ())
+}
+
+// upgrade takes a newer version if there is one. Look first: the update rebuilds or downloads, and
+// none of that is needed when the right one is already there.
+func upgrade() error {
+	newer, err := update.Newer()
+	if err != nil {
+		return err
+	}
+	if newer == "" {
+		fmt.Println("already up to date: " + build.Label())
+		return nil
+	}
+	fmt.Println(build.Name() + " " + build.Version + " → " + newer)
+	if err := update.Apply(func(step string) { fmt.Println("-- " + step) }); err != nil {
+		return err
+	}
+	return nil
 }
 
 // machine is what runs here: this binary, its service, the sessions whose port it holds, and the other

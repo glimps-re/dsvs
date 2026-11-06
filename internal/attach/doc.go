@@ -12,6 +12,20 @@
 // A session's identity is the absolute path of its configuration: whoever knows which configuration
 // they want knows where to knock, with no directory to look up.
 //
+// # The socket carries no version
+//
+// The hub carries one, this socket none, and that is deliberate: an update moves the service to the
+// new binary before the sessions move themselves, so a new client talks for a while to old sessions —
+// and to those that, outside a systemd box, keep their binary. That is workable because what crosses
+// fits in a few verbs — start, stop, restart, reload, renew, quit, logs — written by the clients
+// exactly as the session understands them. Renaming them would get them silently ignored, and that is
+// the one thing not to do without thinking: reload used to mean "take the binary on disk", which the
+// command line now calls renew, because a reload that replaces the binary instead of rereading the
+// configuration could not be exposed as such. A session from before the rename ignores renew: the
+// update bounds each handover and then says that this session keeps its binary. The state a session
+// renders, for its part, gives the version it carries: that is what lets a handover be checked
+// instead of trusted.
+//
 // # A handover is not a departure
 //
 // renew asks the session to move to the binary on disk. Its socket crosses the exec — it never stopped

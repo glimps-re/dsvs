@@ -19,4 +19,9 @@
 // The name also decides what is shown: only dsvs paints the bars of its icon white, any other binary
 // paints them amber. Hovering gives the full name and the version, and the panel repeats it in its
 // header. That is what Label is for.
+//
+// # Provenance
+//
+// It is carried by the binary, not by a state file: build.sh injects the path of the clone, the CI
+// injects nothing. It therefore cannot disagree with what runs, and there is nothing to migrate.
 package build

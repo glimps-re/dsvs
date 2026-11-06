@@ -28,6 +28,7 @@ import (
 	"dsvs/internal/build"
 	"dsvs/internal/hub"
 	"dsvs/internal/projects"
+	"dsvs/internal/update"
 )
 
 // escape is the keycode of the key that closes the panel — it does not depend on the keyboard layout,
@@ -88,6 +89,10 @@ func Open(anchor image.Rectangle, until <-chan struct{}, gone func()) error {
 	if err := p.show(anchor); err != nil {
 		return err
 	}
+	// The question is asked on opening, not when the service starts: this is where its answer can be
+	// shown, and a black-and-white icon could not announce it.
+	p.news = looking
+	go p.look()
 	return p.live(until)
 }
 
@@ -494,6 +499,15 @@ func (p *panel) act(z zone) bool {
 		// give back — waiting for it would block the loop on a browser starting up.
 		p.reported(z.config, exec.Command("xdg-open", z.name).Start())
 		return true
+	case look:
+		// This is where we know it leaves, so this is where the button goes away: the painter only
+		// shows the state, it does not have to keep the two-click rule.
+		p.news = looking
+		go p.look()
+		return true
+	case renew:
+		p.work("starting the update", p.renew)
+		return true
 	case openTUI:
 		// The panel only goes away if the interface really opens: on a machine with no known
 		// terminal, it stays in place rather than saying nothing at all.
@@ -529,8 +543,57 @@ func (p *panel) through(config string, do deed, name string) error {
 	return link.Order(string(do), name)
 }
 
+// look searches for a new version. The clone answers for free, the remote repository takes the time
+// it takes: hence the background, and the step shown meanwhile.
+func (p *panel) look() {
+	newer, err := update.Newer()
+	news := renewal{stage: idle}
+	switch {
+	case err != nil:
+		news.said = err.Error()
+	case newer == "":
+		news.said = "up to date"
+	default:
+		news.stage, news.to = found, newer
+	}
+	p.tell(news)
+}
+
 // looking is what a search that just started shows: its step, and nothing to click.
 var looking = doing("looking for a newer version")
+
+// work runs a long gesture in the background, showing its steps as it goes. The panel closes when
+// asked, but Open only returns once the gesture is over.
+func (p *panel) work(first string, gesture func()) {
+	p.news = doing(first)
+	p.working.Add(1)
+	go func() {
+		defer p.working.Done()
+		gesture()
+	}()
+}
+
+// renew takes the version found, showing the current step. The panel goes away with the service it
+// has restarted: the last steps have no one to tell, and that is fine — the icon coming back is the
+// sign that was needed.
+func (p *panel) renew() {
+	if err := update.Apply(p.step); err != nil {
+		p.over("update", "", err)
+	}
+}
+
+func (p *panel) step(said string) { p.tell(doing(said)) }
+
+// over says how a long gesture ended. A failure also goes to stderr: the panel may have closed while
+// it worked, and that is then the service's journal, or the terminal of dsvs panel — a failure read
+// nowhere is the one thing not allowed.
+func (p *panel) over(gesture, said string, err error) {
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s failed: %v\n", gesture, err)
+		said = err.Error()
+	}
+	p.tell(renewal{stage: idle, said: said})
+}
 
 // tell carries news to the panel's loop. It waits until the loop has taken it, or until the panel has
 // gone: a step dropped for lack of room would be the missing one, and a closed panel holds nobody

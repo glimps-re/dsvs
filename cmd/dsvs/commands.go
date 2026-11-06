@@ -115,6 +115,15 @@ installed systemd unit does at session start, and any command needing it does it
 sends it away, icon included, and restart makes it take the binary on disk.`,
 		declare: direct(service),
 	}, {
+		name:    "update",
+		summary: "take a newer version of this binary, and restart the service",
+		long: `update takes a newer version of this binary if there is one, hands the running sessions over to
+it and restarts the service. Where it looks was decided when this binary was built: the clone it
+came out of, or the published releases. A released binary is downloaded over HTTPS and checked
+against the checksums of its release before it replaces anything. DSVS_RELEASES points at a mirror
+of the releases.`,
+		declare: direct(func([]string) error { return upgrade() }),
+	}, {
 		name:    "panel",
 		summary: "open the panel of the running sessions",
 		long: `panel opens the panel of the projects and their sessions, without going through the status bar
