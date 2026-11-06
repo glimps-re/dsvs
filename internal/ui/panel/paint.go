@@ -858,6 +858,9 @@ func (p *painter) app(one project, app attach.App) {
 	// the width, they do not overlap.
 	p.write(nameX, top+19, p.fitting(app.Name, statusX-8-nameX, p.with.text), p.with.text, ink)
 	p.write(statusX, top+19, p.fitting(said, first.Min.X-8-statusX, p.with.text), p.with.text, saidTint)
+	// Where an app listens when it starts without listening at its address does not fit in the state
+	// column: it is a message, read in full under its row.
+	p.note(nameX, app.Astray, faint)
 }
 
 // starting is what the row of a project whose session is coming up says: there is no button anymore,
@@ -1190,7 +1193,7 @@ func form(app attach.App) (glyph, color.Color) {
 		return filled, ready
 	case app.Status != "idle":
 		return half, waking
-	case app.Last != "" && app.Last != "stopped":
+	case app.Fell:
 		return cross, broken
 	}
 	return ring, asleep

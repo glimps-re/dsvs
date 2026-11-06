@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"math"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -104,27 +106,44 @@ func (d Drift) String() string {
 	return ""
 }
 
-// Outcome describes how the last run ended.
+// Outcome describes how the last run ended: on its own, by its code or a signal, or on a gesture.
+// Signal is the name of the signal as one types it, SIGKILL.
 type Outcome struct {
 	Code   int
 	Signal string
-	ByUser bool
+	Ending Ending
 	At     time.Time
 }
 
+// Ending says what ended a run: itself, or someone's gesture — a stop, a restart.
+type Ending int
+
+const (
+	ByItself Ending = iota
+	Stopped
+	Restarted
+)
+
+// Fell says whether the run fell: a non-zero code or a signal nobody asked for. Exiting on its own
+// with code 0 is a stop, not a fall — it is the only rule, and every interface reads it here.
+func (o Outcome) Fell() bool { return o.Ending == ByItself && (o.Code != 0 || o.Signal != "") }
+
 func (o Outcome) String() string {
 	switch {
-	case o.ByUser:
+	case o.Ending == Stopped:
 		return "stopped"
+	case o.Ending == Restarted:
+		return "restarted"
 	case o.Signal != "":
-		return "killed (" + o.Signal + ")"
+		return "killed by " + o.Signal
 	default:
 		return fmt.Sprintf("exited (%d)", o.Code)
 	}
 }
 
 // Snapshot is the state of an app at a given moment. PID, Since and ReadyAt only hold in the
-// statuses that carry them; Last describes the previous run when the app is Idle.
+// statuses that carry them; Last describes the previous run when the app is Idle, and Astray says
+// where a starting app listens when it does not listen at its address.
 type Snapshot struct {
 	Status   Status
 	PID      int
@@ -132,6 +151,7 @@ type Snapshot struct {
 	ReadyAt  time.Time
 	Last     *Outcome
 	Restarts int
+	Astray   *Astray
 }
 
 type EventKind int
@@ -266,9 +286,8 @@ type App struct {
 	// gone. Returns false if it still has its place, and the supervisor carries on.
 	dismiss func() bool
 
-	// serves returns the path through which the app is asked whether it is ready, empty when none is
-	// known: an open port is then all that can be checked. It is a question, not a value — the routes
-	// that answer it may have been reloaded since the previous run.
+	// serves returns the path through which a facade serves the app, empty when none serves it. It
+	// is a question, not a value — the routes may have been reloaded since the previous run.
 	serves func() string
 
 	net    Network
@@ -305,6 +324,9 @@ type run struct {
 	proc *os.Process
 	tty  *os.File
 	ep   Endpoint
+	// from is the log position where this run's output starts: what it says to declare itself ready
+	// is searched from there, never in a previous run.
+	from int
 }
 
 type command int
@@ -344,7 +366,7 @@ func (s *App) Drift() Drift {
 	switch {
 	case !live:
 		return Dropped
-	case !reflect.DeepEqual(run, cfg):
+	case !run.SameRun(cfg):
 		return Stale
 	}
 	return Settled
@@ -476,6 +498,9 @@ type Session struct {
 	awaiting  map[string]string
 	ingresses []*Ingress
 	apps      []*App
+	// gone are the logs of the departed apps, by name: what an app wrote can be read until the end
+	// of the session, and an app of the same name that comes back takes it over.
+	gone map[string]*Journal
 	// viewports are the windows of the watching interfaces, and cols/rows the size lent to the
 	// apps: the smallest of them. It is remembered so it is also given to the apps a reload brings
 	// in.
@@ -499,6 +524,7 @@ func NewSession(form config.Form, cfg config.Config, network Network, front Fron
 		observed: cfg.Observed,
 		form:     form,
 		intents:  map[string]string{},
+		gone:     map[string]*Journal{},
 		awaiting: map[string]string{},
 		cols:     defaultCols,
 		rows:     defaultRows,
@@ -574,14 +600,15 @@ func (s *Session) Facades() []*Ingress {
 // nothing: the session carries on with the running one. Neither does an invalid form, but it is the
 // one the session shows from then on, with its errors. In every case it says why (NotApplied), until
 // the evaluation that applies the file again — a save, a gesture, a network — and which the log tells.
-func (s *Session) Reload() error { return s.replay(nil, config.Form.Accept) }
+func (s *Session) Reload() error { return s.replay(nil, "", config.Form.Accept) }
 
 // Set replays the configuration with these requested values, on top of everything chosen or kept.
 // It is a submission: values the form refuses, or that would make it invalid, change nothing, and
 // the error says so (config.Form.Accept); the session's log says so too. A value taken becomes an
-// intent of the session, and the form says where to keep it.
-func (s *Session) Set(values map[string]string) error {
-	return s.replay(values, config.Form.Accept)
+// intent of the session, and the form says where to keep it. by is the interface the gesture comes
+// from — cli, panel, tui —, which the log tells along with the values taken.
+func (s *Session) Set(values map[string]string, by string) error {
+	return s.replay(values, by, config.Form.Accept)
 }
 
 // Draft is the gesture of an interface filling in the form, field by field: values its fields take
@@ -589,8 +616,9 @@ func (s *Session) Set(values map[string]string) error {
 // field —, and the form they make is the one the session shows, errors included. Nothing applies as
 // long as it is invalid; the gesture that completes it applies everything together, and only then
 // is what they chose kept. A value a field does not take is refused as by Set (config.Form.Takes).
-func (s *Session) Draft(values map[string]string) error {
-	return s.replay(values, config.Form.Takes)
+// by is the interface the gesture comes from, as for Set.
+func (s *Session) Draft(values map[string]string, by string) error {
+	return s.replay(values, by, config.Form.Takes)
 }
 
 // Observe records what the machine shows, and replays the configuration if it differs from what the
@@ -608,7 +636,7 @@ func (s *Session) Observe(seen *config.Observed) error {
 	// As long as the file does not apply, the session replays even on the network the configuration
 	// in force comes from: that may be where it applies again.
 	if !reflect.DeepEqual(seen, s.Config().Observed) || s.NotApplied() != "" {
-		err = s.replay(nil, config.Form.Accept)
+		err = s.replay(nil, "", config.Form.Accept)
 	}
 	if !reflect.DeepEqual(seen, before) {
 		outcome := "configuration unchanged"
@@ -669,10 +697,10 @@ func (s *Session) Observed() *config.Observed {
 }
 
 // replay is the only path of a re-read: asked, when not empty, are values the form must have taken
-// according to takes — Accept for a submission, Takes for a draft —, otherwise nothing changes. The
-// evaluated form is kept as soon as the evaluation succeeded; the configuration, only if the form is
-// valid, and what a gesture chose is then kept.
-func (s *Session) replay(asked map[string]string, takes func(config.Form, map[string]string) error) error {
+// according to takes — Accept for a submission, Takes for a draft —, otherwise nothing changes, and
+// by is the interface asking for them. The evaluated form is kept as soon as the evaluation
+// succeeded; the configuration, only if the form is valid, and what a gesture chose is then kept.
+func (s *Session) replay(asked map[string]string, by string, takes func(config.Form, map[string]string) error) error {
 	s.reloading.Lock()
 	defer s.reloading.Unlock()
 
@@ -700,6 +728,7 @@ func (s *Session) replay(asked map[string]string, takes func(config.Form, map[st
 		if err := takes(form, asked); err != nil {
 			return s.refused(err)
 		}
+		s.LogSink(s.Log)("-- set " + config.Pairs(asked) + " (" + by + ")")
 		s.take(asked)
 	}
 	s.mu.Lock()
@@ -1090,7 +1119,8 @@ func (s *Session) Mode() Mode { return s.net.Mode() }
 func (s *Session) Listen(port int) (net.Listener, error) { return s.front.Listen(port) }
 
 // Apps returns the session's supervisors: the declared apps, in configuration order, then those it
-// no longer declares and that still run.
+// no longer declares and that still run. The returned list no longer changes: a reload or a removal
+// sets a new one, and whoever walks it without a lock never sees a slot empty under them.
 func (s *Session) Apps() []*App {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1106,13 +1136,71 @@ func (s *Session) App(name string) *App {
 	return nil
 }
 
+// Journals returns the logs of the apps these names pull in, and of all of them without a name,
+// departed ones included: a departed app no longer starts by its name, but what it wrote can still
+// be read there.
+func (s *Session) Journals(names []string) ([]*Journal, error) {
+	s.mu.RLock()
+	gone := maps.Clone(s.gone)
+	s.mu.RUnlock()
+	var out, apps []*Journal
+	for _, app := range s.Apps() {
+		apps = append(apps, app.Log)
+	}
+	if len(names) == 0 {
+		return append(apps, slices.Collect(maps.Values(gone))...), nil
+	}
+	var living []string
+	for _, name := range names {
+		if journal, left := gone[name]; left {
+			out = append(out, journal)
+		} else {
+			living = append(living, name)
+		}
+	}
+	wanted, err := s.Wanted(living)
+	if err != nil {
+		return nil, err
+	}
+	for _, journal := range apps {
+		if slices.Contains(wanted, journal.Name()) {
+			out = append(out, journal)
+		}
+	}
+	return out, nil
+}
+
+// Wanted resolves names into the session's apps, like config.Config.Wanted, except that an app the
+// configuration no longer declares and that still runs still answers to its own: that is how it is
+// stopped, and how its log is read.
+func (s *Session) Wanted(names []string) ([]string, error) {
+	cfg := s.Config()
+	var wanted []string
+	for _, name := range names {
+		apps, known := cfg.AppsOf(name)
+		if !known && s.App(name) != nil {
+			apps, known = []string{name}, true
+		}
+		if !known {
+			return nil, fmt.Errorf("no app, facade or group named %q", name)
+		}
+		for _, app := range apps {
+			if !slices.Contains(wanted, app) {
+				wanted = append(wanted, app)
+			}
+		}
+	}
+	return wanted, nil
+}
+
 // enlist aligns the list with what the configuration declares: known apps keep their supervisor,
 // their log and their process, those that appear get one, and those that left the declaration move
-// to the back — they stay there as long as their process lives. To be called with the configuration
-// already replaced: it is the one the supervisors query.
+// to the back — they stay there as long as their process lives, and dropped names only them. To be
+// called with the configuration already replaced: it is the one the supervisors query.
 func (s *Session) enlist(declared []config.App) (born, dropped []string) {
 	s.mu.Lock()
 	kept := make([]*App, 0, len(declared))
+	var idle []*App
 	for _, sc := range declared {
 		known := false
 		for _, app := range s.apps {
@@ -1131,22 +1219,36 @@ func (s *Session) enlist(declared []config.App) (born, dropped []string) {
 		if slices.ContainsFunc(kept, func(other *App) bool { return other == app }) {
 			continue
 		}
-		// Its process still runs: there is nothing to pull out from under whoever uses it. The
-		// supervisor will withdraw itself when the app stops.
+		// The supervisor withdraws itself when the app stops. For one that still runs, there is
+		// nothing to cut from under whoever uses it; for a stopped one, its supervisor waits for a
+		// command, and a stop — which changes nothing — sends it back through the removal.
 		kept = append(kept, app)
-		dropped = append(dropped, app.Name)
+		if app.Snapshot().Status == Idle {
+			idle = append(idle, app)
+		} else {
+			dropped = append(dropped, app.Name)
+		}
 	}
 	s.apps = kept
 	s.mu.Unlock()
+	for _, app := range idle {
+		app.Stop()
+	}
 	return born, dropped
 }
 
-// recruit builds an app's supervisor and puts it to work if the session is running. To be called with
-// mu held.
+// recruit builds an app's supervisor and puts it to work if the session is running. A departed app
+// that comes back takes its log over. To be called with mu held.
 func (s *Session) recruit(name string) *App {
+	log, back := s.gone[name]
+	if back {
+		delete(s.gone, name)
+	} else {
+		log = NewJournal(name, logSize, defaultRows)
+	}
 	app := &App{
 		Name:      name,
-		Log:       NewJournal(name, logSize, defaultRows),
+		Log:       log,
 		declared:  func() (config.App, bool) { return s.Config().App(name) },
 		serves:    func() string { return served(s.Config(), name) },
 		net:       s.net,
@@ -1170,9 +1272,9 @@ func (s *Session) recruit(name string) *App {
 }
 
 // retire removes from the session a stopped app the configuration no longer declares: it only
-// survived its removal as long as its process. Returns false if it got its place back in the
-// declaration, or if a command is waiting for it — one does not dismiss someone one has just spoken
-// to.
+// survived its removal as long as its process, and its log stays. Returns false if it got its place
+// back in the declaration, or if a command is waiting for it — one does not dismiss someone one has
+// just spoken to.
 func (s *Session) retire(app *App) bool {
 	s.mu.Lock()
 	_, live := s.cfg.App(app.Name)
@@ -1180,7 +1282,8 @@ func (s *Session) retire(app *App) bool {
 		s.mu.Unlock()
 		return false
 	}
-	s.apps = slices.DeleteFunc(s.apps, func(other *App) bool { return other == app })
+	s.apps = slices.DeleteFunc(slices.Clone(s.apps), func(other *App) bool { return other == app })
+	s.gone[app.Name] = app.Log
 	s.mu.Unlock()
 
 	s.gen.Add(1)
@@ -1413,11 +1516,12 @@ func (s *App) launch(cfg config.App) (*run, error) {
 	s.mu.RLock()
 	size := &pty.Winsize{Cols: uint16(s.cols), Rows: uint16(s.rows)}
 	s.mu.RUnlock()
+	_, from, _ := s.Log.Since(math.MaxInt)
 	tty, err := pty.StartWithAttrs(cmd, size, attrs)
 	if err != nil {
 		return nil, err
 	}
-	return &run{proc: cmd.Process, tty: tty, ep: ep}, nil
+	return &run{proc: cmd.Process, tty: tty, ep: ep, from: from}, nil
 }
 
 // follow holds a run until its end and says whether another must come. It does not know whether the
@@ -1442,9 +1546,13 @@ func (s *App) follow(ctx context.Context, r *run, snap Snapshot) (again bool) {
 
 	probeCtx, stopProbe := context.WithCancel(ctx)
 	defer stopProbe()
-	var ready <-chan struct{}
+	var (
+		ready  <-chan struct{}
+		astray <-chan *Astray
+	)
 	if s.live.Load() == nil {
-		ready = probe(probeCtx, r.ep.String(), s.serves())
+		isReady, strays := s.awaiting(r)
+		ready, astray = probe(probeCtx, isReady, strays)
 	}
 	s.publish(r, snap)
 
@@ -1463,7 +1571,7 @@ func (s *App) follow(ctx context.Context, r *run, snap Snapshot) (again bool) {
 		select {
 		case <-done:
 			done = nil
-			snap.Status, kill = Stopping, s.terminate(r.proc)
+			snap.Status, snap.Astray, kill = Stopping, nil, s.terminate(r.proc)
 			s.publish(r, snap)
 
 		case c := <-s.cmds:
@@ -1481,7 +1589,7 @@ func (s *App) follow(ctx context.Context, r *run, snap Snapshot) (again bool) {
 			}
 			// The last command received decides what comes next: a stop during a restart cancels
 			// it.
-			snap.Status = Stopping
+			snap.Status, snap.Astray = Stopping, nil
 			if c == cmdRestart {
 				snap.Status = Restarting
 			}
@@ -1490,7 +1598,13 @@ func (s *App) follow(ctx context.Context, r *run, snap Snapshot) (again bool) {
 		case <-ready:
 			if snap.Status == Starting {
 				s.live.Store(&backend{name: s.Name, ep: r.ep, net: s.net})
-				snap.Status, snap.ReadyAt = Ready, time.Now()
+				snap.Status, snap.ReadyAt, snap.Astray = Ready, time.Now(), nil
+				s.publish(r, snap)
+			}
+
+		case seen := <-astray:
+			if snap.Status == Starting {
+				snap.Astray = seen
 				s.publish(r, snap)
 			}
 
@@ -1515,7 +1629,7 @@ func (s *App) follow(ctx context.Context, r *run, snap Snapshot) (again bool) {
 			}
 			s.live.Store(nil)
 			again = snap.Status == Restarting
-			out := outcome(state, snap.Status == Stopping)
+			out := outcome(state, ending(snap.Status))
 			s.Log.Addf("-- %s", out)
 			if again {
 				snap.Restarts++
@@ -1596,15 +1710,54 @@ func served(cfg config.Config, app string) string {
 	return ""
 }
 
-// probe announces only once that the app answers. It sends instead of closing: a closed channel
-// would stay ready forever and make the supervisor's select spin.
-func probe(ctx context.Context, addr, path string) <-chan struct{} {
-	ready := make(chan struct{}, 1)
+// awaiting returns the two questions asked of a starting run: is it ready, according to the
+// declaration it was launched with, and where does it listen if not at its address. Its ready key
+// decides when present; otherwise its command and the current routes do: an app a facade serves is
+// ready when a real request gets a response, an app that receives a port without a route when the
+// port opens, an app that receives none as soon as it is launched — it has neither an address to
+// get wrong, nor anything to wait for.
+func (s *App) awaiting(r *run) (ready func(context.Context) bool, astray func() *Astray) {
+	s.mu.RLock()
+	cfg := s.run
+	s.mu.RUnlock()
+	addr := r.ep.String()
+	astray = func() *Astray { return strayed(r.proc.Pid, r.ep) }
+	if !cfg.Listens() {
+		astray = func() *Astray { return nil }
+	}
+	switch path := s.serves(); {
+	case cfg.Ready != nil && cfg.Ready.Log != nil:
+		return printed(s.Log, r.from, *cfg.Ready.Log), astray
+	case cfg.Ready != nil:
+		return func(ctx context.Context) bool { return asked(ctx, addr, cfg.Ready.HTTP)/100 == 2 }, astray
+	case path != "":
+		// A 404 already says the server serves: only server errors mark an app as not ready.
+		return func(ctx context.Context) bool { code := asked(ctx, addr, path); return code != 0 && code < 500 }, astray
+	case !cfg.Listens():
+		return func(context.Context) bool { return true }, astray
+	}
+	return func(context.Context) bool { return opens(addr) }, astray
+}
+
+// probe announces only once that the run is ready. It sends instead of closing: a closed channel
+// would stay ready forever and make the supervisor's select spin. Until then, it says where the run
+// listens when it is not at its address, each time that changes.
+func probe(ctx context.Context, isReady func(context.Context) bool, strays func() *Astray) (<-chan struct{}, <-chan *Astray) {
+	ready, astray := make(chan struct{}, 1), make(chan *Astray)
 	go func() {
+		var said *Astray
 		for {
-			if answers(ctx, addr, path) {
+			if isReady(ctx) {
 				ready <- struct{}{}
 				return
+			}
+			if seen := strays(); !reflect.DeepEqual(seen, said) {
+				said = seen
+				select {
+				case astray <- seen:
+				case <-ctx.Done():
+					return
+				}
 			}
 			select {
 			case <-ctx.Done():
@@ -1613,52 +1766,78 @@ func probe(ctx context.Context, addr, path string) <-chan struct{} {
 			}
 		}
 	}()
-	return ready
+	return ready, astray
 }
 
-// answers says whether the app is ready to serve. An open port does not prove it: a dev-server listens
-// before it has compiled, and the ingress would send it requests it cannot honor yet. Where the path
-// through which the app is served is known, it is therefore asked for a real response.
-func answers(ctx context.Context, addr, path string) bool {
-	if path == "" {
-		conn, err := net.DialTimeout("tcp", addr, probeEvery)
-		if err != nil {
-			return false
-		}
-		conn.Close()
-		return true
-	}
-
+// asked returns the code a real request gets on this path, 0 without a response. An open port does
+// not prove that an app serves: a dev-server listens before it has compiled, and the ingress would
+// send it requests it cannot honor yet.
+func asked(ctx context.Context, addr, path string) int {
 	ask, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ask, http.MethodGet, "http://"+addr+path, nil)
 	if err != nil {
-		return false
+		return 0
 	}
 	res, err := prober.Do(req)
 	if err != nil {
-		return false
+		return 0
 	}
 	defer res.Body.Close()
 	_, _ = io.Copy(io.Discard, res.Body)
-	// A 404 already says the server serves: only server errors mark an app as not ready.
-	return res.StatusCode < 500
+	return res.StatusCode
 }
+
+// opens says whether the port opens: it is all that can be asked of an app no facade serves.
+func opens(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, probeEvery)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// printed returns the question "does a line of its output say it is ready?", asked of the lines the
+// log completes from from on, styles stripped. The pattern was validated with the configuration.
+func printed(journal *Journal, from int, pattern config.Pattern) func(context.Context) bool {
+	expected, _ := pattern.Compile()
+	return func(context.Context) bool {
+		lines, next, _ := journal.Since(from)
+		from = next
+		return slices.ContainsFunc(lines, func(line Line) bool { return expected.MatchString(styles.ReplaceAllString(line.Text, "")) })
+	}
+}
+
+// styles are the style sequences a log returns in its lines.
+var styles = regexp.MustCompile("\x1b\\[[0-9;:]*m")
 
 // prober keeps no connection: the app can restart between two questions.
 var prober = &http.Client{Transport: &http.Transport{DisableKeepAlives: true}}
 
 // outcome says how a run ended. A missing state is a run that could not be waited for: there is no
 // code to get from it.
-func outcome(state *os.ProcessState, byUser bool) Outcome {
-	out := Outcome{ByUser: byUser, At: time.Now()}
+func outcome(state *os.ProcessState, ending Ending) Outcome {
+	out := Outcome{Ending: ending, At: time.Now()}
 	if state == nil {
 		out.Code = -1
 		return out
 	}
 	out.Code = state.ExitCode()
 	if status, ok := state.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-		out.Signal = status.Signal().String()
+		out.Signal = unix.SignalName(status.Signal())
 	}
 	return out
+}
+
+// ending says what ends a run that exits in this status: a requested stop or restart, or nothing
+// but itself.
+func ending(status Status) Ending {
+	switch status {
+	case Stopping:
+		return Stopped
+	case Restarting:
+		return Restarted
+	}
+	return ByItself
 }

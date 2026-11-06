@@ -222,9 +222,15 @@ func read(config, question, verb string, limit int) ([]byte, error) {
 }
 
 // Set gives values to the parameters of the session of this configuration, and returns once it has
-// replayed: nil if it took them, its reason otherwise. It is not launched if it is not there.
-func Set(config string, values map[string]string) error {
-	_, err := ask(config, "set "+pairs(values))
+// replayed: nil if it took them, its reason otherwise. by is the interface the gesture comes from — cli,
+// panel —, which the session writes to its log. It is not launched if it is not there.
+func Set(config, by string, values map[string]string) error {
+	_, err := ask(config, "set "+by+" "+pairs(values))
+	// An older session reads the word saying where the gesture comes from as a value, and refuses it: it
+	// then receives the values alone, as before.
+	if err != nil && err.Error() == "set takes name=value, not "+strconv.Quote(by) {
+		_, err = ask(config, "set "+pairs(values))
+	}
 	if errors.Is(err, errUnread) {
 		return predating(config, "parameters")
 	}
@@ -261,11 +267,12 @@ func Forget(config string) (listed, valued bool, err error) {
 
 // Draft fills in parameters of the session of this configuration, the way an interface fills in a
 // form: values its fields take are kept even when they leave it invalid, and it waits for the gesture
-// that completes it (core.Session.Draft). A session from before this verb receives them as set.
-func Draft(config string, values map[string]string) error {
-	_, err := ask(config, "draft "+pairs(values))
+// that completes it (core.Session.Draft). by is the interface the gesture comes from, as for Set. A
+// session from before this verb receives them as set.
+func Draft(config, by string, values map[string]string) error {
+	_, err := ask(config, "draft "+by+" "+pairs(values))
 	if errors.Is(err, errUnread) {
-		return Set(config, values)
+		return Set(config, by, values)
 	}
 	return err
 }

@@ -226,6 +226,9 @@ func (m Model) appCard(app *core.App) []string {
 	if snap.Restarts > 0 {
 		state = append(state, plural(snap.Restarts, "restart"))
 	}
+	if snap.Astray != nil {
+		state = append(state, snap.Astray.String())
+	}
 	if mark := drift(app); mark != "" {
 		state = append(state, mark)
 	}
@@ -965,10 +968,7 @@ func statusOfApp(snap core.Snapshot) (glyph string, ansi int) {
 	return "○", grey
 }
 
-func crashed(snap core.Snapshot) bool {
-	last := snap.Last
-	return last != nil && !last.ByUser && (last.Code != 0 || last.Signal != "")
-}
+func crashed(snap core.Snapshot) bool { return snap.Last != nil && snap.Last.Fell() }
 
 // aggregate returns the state of a set of apps: the one they share, the transition as soon as one
 // moves, and the failure if one remains. An empty set is running — a facade that only proxies waits

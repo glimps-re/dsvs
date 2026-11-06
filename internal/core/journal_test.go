@@ -1,8 +1,10 @@
 package core
 
 import (
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestJournalWritesLikeATerminal(t *testing.T) {
@@ -297,4 +299,25 @@ func lines(log *Journal) []string {
 		out = append(out, line.Text)
 	}
 	return out
+}
+
+// Merged logs come out in the order their lines were written: a session line written after an app's
+// lines comes after them, even if its slot had been waiting since the previous line.
+func TestMergedJournalsFollowTheOrderOfWriting(t *testing.T) {
+	session, worker := NewJournal("session", 100, 10), NewJournal("worker", 100, 10)
+	session.Add("-- worker started")
+	time.Sleep(5 * time.Millisecond)
+	worker.Write([]byte("connecting…\r\nready\r\n"))
+	time.Sleep(5 * time.Millisecond)
+	session.Add("-- configuration reloaded")
+
+	var got []string
+	for _, line := range Merge(session.Lines(), worker.Lines()) {
+		if line.Text != "" {
+			got = append(got, line.Text)
+		}
+	}
+	if want := []string{"-- worker started", "connecting…", "ready", "-- configuration reloaded"}; !slices.Equal(got, want) {
+		t.Errorf("merge = %q, want %q", got, want)
+	}
 }

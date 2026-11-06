@@ -105,8 +105,9 @@ the form, hidden ones included.`,
 		args:    "[-n <lines>] [name...]",
 		summary: "write the end of the logs, or follow them with -f",
 		long: `logs writes the end of the logs of the session and of the apps these names pull in — all of
-them when no name is given — and returns. -f follows them instead, until ctrl+c; it shows every
-log, names or not. A session must be running.`,
+them when no name is given — and returns. An app gone from the configuration keeps its log until
+the session ends, under its name. -f follows them instead, until ctrl+c; it shows every log,
+names or not. A session must be running.`,
 		declare: func(fs *flag.FlagSet) func([]string) error {
 			n := fs.Int("n", 50, "how many `lines` to write")
 			follow := fs.Bool("f", false, "follow the logs as they are written, until ctrl+c")

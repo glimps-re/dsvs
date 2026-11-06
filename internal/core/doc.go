@@ -10,8 +10,17 @@
 // response at forty. A listening port would therefore have declared ready, for thirty-eight
 // seconds, an app to which the ingress was sending requests it could not honor.
 //
-// Detecting "ready" by reading the logs was ruled out for that reason: the HTTP probe works for any
-// app, whereas each runner announces its readiness its own way.
+// Detecting "ready" by reading the logs was ruled out for that reason, as a default rule: the
+// HTTP probe works for any served app, whereas each runner announces its readiness its own way. The
+// rest follows from the command — an app without a route is ready when its port opens, an app
+// without a port as soon as it is launched —, and only an app whose signal cannot be guessed
+// declares it (config.Ready): a path that answers 2xx, or the line of its output that says so.
+//
+// As long as the app does not answer, the probe also looks at where it listens: the listening
+// sockets its process tree holds open, recognized by their inode in the TCP tables of its network.
+// An app that listens, but not at its address — a dev-server left on 127.0.0.1 in the private
+// network — says so (Astray) instead of silently staying "starting". Nothing is guessed, private
+// network or loopback: an address counts only if a process of the tree holds the socket.
 //
 // # Logs are virtual terminals
 //
@@ -29,22 +38,23 @@
 // type: an app's drift is not stored, it is derived from the declaration its last run was launched
 // with and from the current one. A removed app survives as long as its process, restarts with what
 // it had, and its supervisor withdraws itself as soon as it stops — "no longer declared and
-// stopped" is therefore not a representable state. A parameter value and a network observation are
-// replays like any other (Set, Observe, behind the same method as Reload). The session owns the
-// intents chosen since it started, which the handover carries, and the last evaluated form; each
-// replay hands it those intents, what the project keeps for itself and for the observed network,
-// and what a gesture asks for, and the configuration engine derives the values from them. Coming
-// back to a network therefore brings back its values without an extra replay. Only a gesture
-// writes: the session's intents, as soon as the form accepts them — a Set requires it to be valid,
-// a Draft lets it wait for the field that completes it —, then, once the configuration is applied,
-// what the form that built it keeps, for the project and for the network that evaluated it. A draft
-// therefore keeps nothing as long as it does not apply. A value the network brings back becomes,
-// once applied, the session's intent: on a network that kept nothing for its field, the value in
-// force stays, not a choice made elsewhere before it. An evaluation that fails, or that yields an
-// invalid form, keeps the configuration in force, and the session says why (NotApplied) — it is the
-// only one to say it, and the panel, the TUI and the status read it there — until the evaluation
-// that applies the file again, whether it is a save, a gesture or a network, and which the log
-// tells.
+// stopped" is therefore not a representable state. Its log stays with the session until the end,
+// under its name, and an app of the same name that comes back takes it over. A parameter value and
+// a network observation are replays like any other (Set, Observe, behind the same method as
+// Reload). The session owns the intents chosen since it started, which the handover carries, and
+// the last evaluated form; each replay hands it those intents, what the project keeps for itself
+// and for the observed network, and what a gesture asks for, and the configuration engine derives
+// the values from them. Coming back to a network therefore brings back its values without an extra
+// replay. Only a gesture writes: the session's intents, as soon as the form accepts them — a Set
+// requires it to be valid, a Draft lets it wait for the field that completes it —, then, once the
+// configuration is applied, what the form that built it keeps, for the project and for the network
+// that evaluated it. A draft therefore keeps nothing as long as it does not apply. A value the
+// network brings back becomes, once applied, the session's intent: on a network that kept nothing
+// for its field, the value in force stays, not a choice made elsewhere before it. An evaluation
+// that fails, or that yields an invalid form, keeps the configuration in force, and the session
+// says why (NotApplied) — it is the only one to say it, and the panel, the TUI and the status read
+// it there — until the evaluation that applies the file again, whether it is a save, a gesture or a
+// network, and which the log tells.
 //
 // # The handover, and what Pdeathsig costs it
 //
