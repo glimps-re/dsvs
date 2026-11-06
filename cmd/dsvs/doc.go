@@ -8,7 +8,7 @@
 // gets run all come from it, and rendering is a pure function to an io.Writer so that the README and
 // the skill use it without running the binary.
 //
-// Global flags shape the session here (--config, --port, --net, --watch) and are
+// Global flags shape the session here (--config, --port, --net, --watch, --tui) and are
 // accepted before as well as after the command: a flag typed before is the default of the one after,
 // which makes both places equivalent without anything having to choose between them.
 //
@@ -20,8 +20,8 @@
 // both. The client does not load the configuration: the session resolves "all", and --all adds nothing
 // to the socket protocol, where an order without a name already covers everything.
 //
-// Bare dsvs ensures the session of the project here, writes the state of the session and returns. App
-// names are no longer first-rank arguments: they
+// Bare dsvs ensures the session of the project here, writes the state of the session
+// and returns; --tui opens the interface on it. App names are no longer first-rank arguments: they
 // follow a command, and an unknown first argument is an error that points to dsvs start.
 //
 // # The plumbing, which stays as flags

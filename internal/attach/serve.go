@@ -18,6 +18,7 @@ import (
 	"dsvs/internal/fdpass"
 	"dsvs/internal/hub"
 	"dsvs/internal/ui/plain"
+	"dsvs/internal/ui/tui"
 )
 
 // grace is the longest a session that did not start stays listening to say why. Without it, it would
@@ -173,7 +174,7 @@ func (s *Server) render(conn *net.UnixConn, fields []string, fds []int) {
 	defer in.Close()
 	defer out.Close()
 
-	ui := fields[1]
+	ui, cols, rows := fields[1], number(fields[2], 80), number(fields[3], 24)
 
 	<-s.settled
 	if s.because != nil {
@@ -191,6 +192,11 @@ func (s *Server) render(conn *net.UnixConn, fields []string, fds []int) {
 	// to receive and stop with the client.
 	var resize func(cols, rows int)
 	render := func() error { plain.Run(watching, s.session, out); return nil }
+	if ui != "plain" {
+		program := tui.New(watching, s.session, s.stop,
+			tui.Terminal{In: in, Out: out, Cols: cols, Rows: rows, Env: fields[6:]})
+		resize, render = program.Resize, program.Run
+	}
 	go s.orders(conn, resize, leave)
 
 	seen := s.saw(Interface{Kind: ui, Window: fields[5]}, conn)

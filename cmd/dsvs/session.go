@@ -27,8 +27,12 @@ const settling = 300 * time.Millisecond
 const stopping = 30 * time.Second
 
 // bare is dsvs with no command: the session of the configuration here is there, or it is born, and
-// its state is written. Nothing is ordered.
+// its state is written. Nothing is ordered; --tui opens the interface on it
+// instead of returning.
 func bare(s *shape) error {
+	if s.tui {
+		return lend(s, nil)
+	}
 	link, err := ensure(s)
 	if err != nil {
 		return err
@@ -42,6 +46,9 @@ func bare(s *shape) error {
 // or reload in a session that is not there. An empty list of names means "every app": the session
 // resolves it, and it is what --all sends.
 func order(s *shape, verb string, names []string) error {
+	if s.tui && verb == "start" {
+		return lend(s, names)
+	}
 	// start ensures the session, the others require it alive.
 	open := watching
 	if verb == "start" {

@@ -35,7 +35,8 @@ func commands(s *shape) []command {
 		summary: "start the apps these names pull in",
 		long: `start starts the apps these names pull in, in the session of the configuration found here. That
 session is started if it is not running yet. The state of the session is written as soon as the order is placed and the prompt returns: the session lives
-without a terminal, and keeps running. --all takes every app of the configuration instead of names.`,
+without a terminal, and keeps running. --all takes every app of the configuration instead of names.
+--tui opens the interface on it instead of returning.`,
 		declare: ordering(s, "start"),
 	}, {
 		name:    "stop",
@@ -198,8 +199,8 @@ current directory. Everything it needs around it starts on demand and says so �
 without a terminal and survives the commands and interfaces that watch it.
 
 dsvs with no command starts what the configuration found here needs, writes the state of its session
-and returns. A configuration runs only once, and two sessions never fight over a host: the second
-one is refused, and says so.
+and returns; --tui opens the interface on that session instead. A configuration runs only once, and
+two sessions never fight over a host: the second one is refused, and says so.
 
 A few flags are the binary talking to itself — --hub, --session, --version — and are not commands.
 `
@@ -263,6 +264,7 @@ type shape struct {
 	config string
 	port   int
 	net    string
+	tui    bool
 	watch  paths
 }
 
@@ -272,6 +274,7 @@ func (s *shape) declare(fs *flag.FlagSet) {
 		"path of the configuration `file` (default: the first "+config.FileName+" found searching up)")
 	fs.IntVar(&s.port, "port", s.port, "session `port`, instead of the one in the configuration")
 	fs.StringVar(&s.net, "net", s.net, "apps `network`: \"auto\", \"netns\" to require it, \"loopback\" to do without")
+	fs.BoolVar(&s.tui, "tui", s.tui, "open the interface on the session, instead of returning")
 	fs.Var(&s.watch, "watch",
 		"`path` whose save makes the configuration reload, on top of those it declares; repeatable")
 }

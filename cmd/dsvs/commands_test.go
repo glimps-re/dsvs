@@ -81,7 +81,7 @@ func TestTheGeneralHelpComesFromTheTable(t *testing.T) {
 		}
 	}
 	// Global options apply to every command: the general help is the only place that carries them.
-	for _, option := range []string{"--config", "--port", "--net", "--watch"} {
+	for _, option := range []string{"--config", "--port", "--net", "--tui", "--watch"} {
 		if !strings.Contains(text, option) {
 			t.Errorf("the help does not show %s", option)
 		}

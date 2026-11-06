@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/charmbracelet/x/term"
+
 	"dsvs/internal/attach"
 	"dsvs/internal/build"
 	"dsvs/internal/config"
@@ -159,6 +161,25 @@ func held(port int) string {
 		return ""
 	}
 	return fmt.Sprintf("; %s%s holds it for %s", peer.Name, since(peer), session.Config)
+}
+
+// lend lends the terminal of this process to the session of the configuration here, starting it if it
+// is not there yet. names are the apps to start, ordered after attaching.
+func lend(s *shape, names []string) error {
+	config, err := resolve(s.config)
+	if err != nil {
+		return err
+	}
+	return attach.Attach(config, ui(), names, func() error { return spawn(config, s.args()) })
+}
+
+// ui is the interface this terminal can render: the TUI needs a real one, the log stream makes do with
+// a pipe.
+func ui() string {
+	if term.IsTerminal(os.Stdout.Fd()) {
+		return "tui"
+	}
+	return "plain"
 }
 
 // spawn starts the session without an interface. It puts itself in its box and its network and returns
