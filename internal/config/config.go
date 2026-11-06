@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/fnv"
 	"maps"
 	"net"
 	"net/netip"
@@ -412,17 +414,95 @@ type App struct {
 	Env     map[string]string `json:"env,omitzero"`
 	Dir     string            `json:"dir,omitzero"`
 	Color   string            `json:"color,omitzero"`
+	Ready   *Ready            `json:"ready,omitzero"`
 
 	// Ansi is the resolved color, from 1 to 6; the interfaces consume it without going back to the name.
 	Ansi int `json:"-"`
 }
 
+// Ready is what says an app is ready when its command does not give it away: a 2xx response on a
+// path, or a line of its output. Only one of the two, and nothing else: no port, no check command.
+// Without it, the command decides — an app a facade serves is ready when a real request gets an
+// answer, an app that receives {port} without a route when its port opens, and an app that receives
+// none as soon as it is launched.
+type Ready struct {
+	HTTP string   `json:"http,omitzero"`
+	Log  *Pattern `json:"log,omitzero"`
+}
+
+// Pattern is what an output line must contain: a literal text, or a RegExp from the configuration,
+// which the engine passes along as its source and flags, and which Go reads back as RE2.
+type Pattern struct {
+	Text   string
+	RegExp string
+	Flags  string
+}
+
+// patternJSON is the shape of a RegExp on the wire: JSON has none, the engine writes it this way.
+type patternJSON struct {
+	RegExp string `json:"regexp"`
+	Flags  string `json:"flags,omitzero"`
+}
+
+func (p *Pattern) UnmarshalJSON(data []byte) error {
+	if err := json.Unmarshal(data, &p.Text); err == nil {
+		return nil
+	}
+	var re patternJSON
+	if err := json.Unmarshal(data, &re); err != nil {
+		return err
+	}
+	p.RegExp, p.Flags = re.RegExp, re.Flags
+	return nil
+}
+
+func (p Pattern) MarshalJSON() ([]byte, error) {
+	if p.RegExp == "" {
+		return json.Marshal(p.Text)
+	}
+	return json.Marshal(patternJSON{RegExp: p.RegExp, Flags: p.Flags})
+}
+
+// Compile returns the expression a line must satisfy. The flags i, m and s keep their meaning, those
+// that change nothing on a single line (g, y, d, u, v) stay silent; what RE2 cannot read — a
+// lookbehind, a backreference — is an error, which validation refuses along with the configuration.
+func (p Pattern) Compile() (*regexp.Regexp, error) {
+	if p.RegExp == "" {
+		if p.Text == "" {
+			return nil, errors.New("the text is empty")
+		}
+		return regexp.Compile(regexp.QuoteMeta(p.Text))
+	}
+	modes := ""
+	for _, flag := range p.Flags {
+		switch flag {
+		case 'i', 'm', 's':
+			modes += string(flag)
+		case 'g', 'y', 'd', 'u', 'v':
+		default:
+			return nil, fmt.Errorf("unknown flag %q", flag)
+		}
+	}
+	if modes != "" {
+		modes = "(?" + modes + ")"
+	}
+	return regexp.Compile(modes + p.RegExp)
+}
+
 // Resolved restores what JSON does not carry: the resolved color is derived again from the color's
-// name, which does travel. A declaration that went through a handover passes here, otherwise it would
-// no longer equal the file's and the app would think it has to restart.
+// name, which does travel. A declaration that went through a handover passes here, otherwise an app
+// that nothing declares any more, and that lives only on it, would lose its color.
 func (s App) Resolved() App {
 	s.Ansi = ansiByName[s.Color]
 	return s
+}
+
+// SameRun says whether two declarations launch the same process. The color is not part of it: the
+// interfaces read it from the current declaration, and an app need not restart when it changes. Nor is
+// Ready: it only says what is expected of the process, and the next launch will take it.
+func (s App) SameRun(other App) bool {
+	s.Color, s.Ansi, s.Ready, other.Color, other.Ansi, other.Ready = "", 0, nil, "", 0, nil
+	return reflect.DeepEqual(s, other)
 }
 
 // Tokens replaced in the command and the environment at start: through them an app learns where to
@@ -447,9 +527,9 @@ func (s App) Launch(ip string, port int) ([]string, map[string]string) {
 	return command, env
 }
 
-// saysWhereToListen says whether the app has a place for its port: without one, the tool would not
-// know where to reach it.
-func (s App) saysWhereToListen() bool {
+// Listens says whether the app receives a port, in its command or its environment: without one,
+// nothing reaches it, and nothing waits for it to listen.
+func (s App) Listens() bool {
 	for _, arg := range s.Command {
 		if strings.Contains(arg, TokenPort) {
 			return true
@@ -464,6 +544,15 @@ func (s App) saysWhereToListen() bool {
 }
 
 var palette = []string{"cyan", "magenta", "green", "yellow", "blue", "red"}
+
+// colorOf derives from its name the color of an app that declares none: it stays the app's own when
+// another app enters or leaves the configuration, and from one project to the next. Two apps may land
+// on the same one; color tells them apart.
+func colorOf(name string) string {
+	hash := fnv.New32a()
+	hash.Write([]byte(name))
+	return palette[hash.Sum32()%uint32(len(palette))]
+}
 
 var ansiByName = map[string]int{"red": 1, "green": 2, "yellow": 3, "blue": 4, "magenta": 5, "cyan": 6}
 
@@ -799,7 +888,8 @@ if (!resolve && "params" in mod) {
 const answer = resolve
   ? await resolve(input)
   : { form: { fields: [] }, config: (typeof mod.default === "function" ? await mod.default({}, input.observed) : mod.default) ?? null };
-process.stdout.write(JSON.stringify(answer));
+// JSON has no RegExp: its source and flags go across, and Go reads it back.
+process.stdout.write(JSON.stringify(answer, (_, value) => (value instanceof RegExp ? { regexp: value.source, flags: value.flags } : value)));
 `
 
 func (c *Config) resolve(path string) {
@@ -812,7 +902,7 @@ func (c *Config) resolve(path string) {
 			c.Apps[i].Dir = filepath.Join(root, c.Apps[i].Dir)
 		}
 		if c.Apps[i].Color == "" {
-			c.Apps[i].Color = palette[i%len(palette)]
+			c.Apps[i].Color = colorOf(c.Apps[i].Name)
 		}
 		c.Apps[i].Ansi = ansiByName[c.Apps[i].Color]
 	}
@@ -889,9 +979,10 @@ func (c Config) validate(path string) error {
 		switch {
 		case len(s.Command) == 0:
 			fail("%s: command is empty", s.Name)
-		case !s.saysWhereToListen():
-			fail("%s: the command must say where to listen, with %s", s.Name, TokenPort)
+		case !s.Listens() && len(c.IngressesOf(s.Name)) > 0:
+			fail("%s: a facade routes to it, so the command must say where to listen, with %s", s.Name, TokenPort)
 		}
+		s.Ready.validate(s, fail)
 		if _, known := ansiByName[s.Color]; !known {
 			fail("%s: unknown color %q (%s)", s.Name, s.Color, strings.Join(palette, ", "))
 		}
@@ -995,6 +1086,24 @@ func block(text string) string {
 	return "\n" + strings.TrimRight(text, "\n")
 }
 
+// validate refuses what would never say an app is ready: an empty or double key, a path that does not
+// start with /, a path on an app that receives no port, an expression Go cannot read.
+func (r *Ready) validate(app App, fail func(string, ...any)) {
+	switch {
+	case r == nil:
+	case (r.HTTP == "") == (r.Log == nil):
+		fail("%s: ready takes http or log, and only one", app.Name)
+	case r.Log != nil:
+		if _, err := r.Log.Compile(); err != nil {
+			fail("%s: ready.log: %v", app.Name, err)
+		}
+	case !strings.HasPrefix(r.HTTP, "/"):
+		fail("%s: ready.http %q must start with /", app.Name, r.HTTP)
+	case !app.Listens():
+		fail("%s: ready.http asks %s, so the command must say where to listen, with %s", app.Name, r.HTTP, TokenPort)
+	}
+}
+
 // validateTarget checks that a route leads to a single thing, and that this thing exists.
 func (i Ingress) validateTarget(route Route, apps map[string]bool, fail func(string, ...any)) {
 	declared := 0
@@ -1050,6 +1159,12 @@ func shaped(at string, value any, t reflect.Type) []string {
 	}
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+	if _, text := value.(string); t == reflect.TypeFor[Pattern]() {
+		if text {
+			return nil
+		}
+		t = reflect.TypeFor[patternJSON]()
 	}
 	switch t.Kind() {
 	case reflect.Struct:

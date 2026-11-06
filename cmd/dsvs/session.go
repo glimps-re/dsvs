@@ -110,7 +110,7 @@ func setting(s *shape, pairs []string) error {
 	if err != nil {
 		return err
 	}
-	if err := attach.Set(config, values); err != nil {
+	if err := attach.Set(config, "cli", values); err != nil {
 		return err
 	}
 	return replayed(config)
@@ -243,6 +243,11 @@ func writeState(out io.Writer, state attach.State) error {
 		// line does not end on blanks.
 		for _, line := range strings.Split(strings.TrimRight(block.String(), "\n"), "\n") {
 			fmt.Fprintln(w, strings.TrimRight(line, " "))
+		}
+		for _, app := range state.Apps {
+			if app.Astray != "" {
+				fmt.Fprintf(w, "%s %s\n", app.Name, app.Astray)
+			}
 		}
 	}
 	facades := make([]string, 0, len(state.Facades))

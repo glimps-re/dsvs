@@ -53,6 +53,11 @@ type App struct {
 	PID    int       `json:"pid,omitempty"`
 	Since  time.Time `json:"since,omitzero"`
 	Last   string    `json:"last,omitempty"`
+	// Fell says whether that last run fell, according to core: Last's text tells the story, it is not
+	// parsed back.
+	Fell bool `json:"fell,omitempty"`
+	// Astray says where an app that is starting listens when it does not listen at its address.
+	Astray string `json:"astray,omitempty"`
 }
 
 // Facade is a facade and the host it is opened by.
@@ -92,7 +97,10 @@ func (s *Server) state() State {
 			Since:  snap.Since,
 		}
 		if snap.Last != nil {
-			one.Last = snap.Last.String()
+			one.Last, one.Fell = snap.Last.String(), snap.Last.Fell()
+		}
+		if snap.Astray != nil {
+			one.Astray = snap.Astray.String()
 		}
 		out.Apps = append(out.Apps, one)
 	}

@@ -33,7 +33,10 @@
 // question on its own connection, like logs, not an order on a driver's stream: the orders on that
 // stream return nothing, and a refusal is read where the gesture happened. A session from before this
 // verb answers that it does not read the greeting, and the client translates that into saying it must
-// be updated.
+// be updated. The first word of set says where the gesture comes from — cli, panel —, which the
+// session's log writes along with the values taken; a word without "=" cannot be a value. A session
+// from before this word refuses it as a value, quoting it, and the client then sends it the values
+// alone.
 //
 // draft is the same gesture coming from an interface that fills in the form, with the same words: the
 // session keeps values its fields take even when they leave it invalid (core.Session.Draft). A session

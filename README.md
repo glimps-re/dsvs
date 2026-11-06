@@ -230,10 +230,13 @@ The specifier is a `git+ssh` URL on this repository, so it needs an SSH key that
 | Key | Type | |
 |---|---|---|
 | `name` | string | |
-| `command` | string[] | Argv, run without a shell, in a terminal dsvs lends it. An app does not choose its address: dsvs reserves one and replaces `{port}` and `{ip}`, here as in `env`. `{port}` is required: without it, nothing would know where to reach the app. |
+| `command` | string[] | Argv, run without a shell, in a terminal dsvs lends it. An app does not choose its address: dsvs reserves one and replaces `{port}` and `{ip}`, here as in `env`. An app a facade serves must take `{port}`; one that no route leads to — a `tsc --watch`, a worker — does not need it. |
 | `env` | `Record<string, string \| undefined>` | Variables set on top of the session's environment. An `undefined` value sets nothing. |
 | `dir` | string | Working directory, absolute or relative to the configuration. Default: its folder. |
-| `color` | string | Its color in the logs: `red`, `green`, `yellow`, `blue`, `magenta` or `cyan`. Default: taken from a palette, in order. |
+| `color` | string | Its color in the logs: `red`, `green`, `yellow`, `blue`, `magenta` or `cyan`. Default: drawn from its name. |
+| `ready` | `{ http } \| { log }` | What says the app is ready, when the default signal says nothing. See below. |
+
+An app is **ready** when a real request through its route gets an answer; when its port opens if no route serves it; as soon as it is launched if it takes no port. When that signal means nothing for it, `ready` replaces it: `{ "http": "/health" }` is ready at the first 2xx on that path, `{ "log": "Watching for file changes" }` when a line of its output contains that text — in TypeScript, a RegExp too (`log: /compiled successfully/i`), read by Go's RE2.
 
 ### Parameters: a form
 
@@ -351,7 +354,7 @@ Node is one implementation of a contract that any executable can fulfil, passed 
 
 Facades, routes, proxy targets and groups are read again without restarting anything. What is alive — the port, the subnet, the processes — stays as it is, and the log says so. dsvs watches the configuration file itself, whatever its name, the paths it declares (`watch`), those of the command line (`--watch`), and otherwise its folder: an import that lives elsewhere must be declared, or saving it reloads nothing.
 
-The apps follow the declaration, and no process is cut from under whoever uses it. An app declared during a session appears, ready to start. An app whose command changed is marked `↻ restart pending`: it runs with the previous one, and its restart takes the new one. An app removed from the configuration is marked `⊘ gone from the configuration`: it runs as long as you let it, restarts with what it had, and leaves the list once stopped. Putting it back makes it an ordinary app again, to restart.
+The apps follow the declaration, and no process is cut from under whoever uses it. An app declared during a session appears, ready to start. An app whose command changed is marked `↻ restart pending`: it runs with the previous one, and its restart takes the new one. An app removed from the configuration is marked `⊘ gone from the configuration`: it runs as long as you let it, restarts with what it had, and leaves the list once stopped. Its log can be read until the session ends: `dsvs logs worker` shows it, ending with its departure. Putting it back makes it an ordinary app again, to restart, which takes up that log.
 
 ## What runs during a session
 

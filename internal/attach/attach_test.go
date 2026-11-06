@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -177,6 +179,129 @@ func TestWatchReadsTheStateAndGivesOrders(t *testing.T) {
 		t.Fatal(err)
 	}
 	until(t, link, func(s State) bool { return s.Apps[0].Status == "idle" && s.Apps[0].Last != "" })
+}
+
+// An app falls when its run ends on a non-zero code or a signal nobody asked for. One that exits on its
+// own with code 0 has stopped, like one that is stopped: the panel and the icon read this rule in the
+// state, without parsing the text of its last run.
+func TestAnAppThatExitsWithZeroHasNotFallen(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	dir := t.TempDir()
+	cfg := config.Config{Dir: dir, Path: filepath.Join(dir, "config.dsvs.json"), Port: 4399, Apps: []config.App{
+		{Name: "clean", Command: []string{"sh", "-c", "exit 0"}, Dir: dir},
+		{Name: "failing", Command: []string{"sh", "-c", "exit 3"}, Dir: dir},
+		{Name: "killed", Command: []string{"sh", "-c", "kill -9 $$"}, Dir: dir},
+		{Name: "sleeper", Command: []string{"sh", "-c", "sleep 30"}, Dir: dir},
+	}}
+	session := supervised(t, config.Form{}, cfg)
+	server := bind(t, cfg.Path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+	link, err := Watch(cfg.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+
+	if err := link.Order("start"); err != nil {
+		t.Fatal(err)
+	}
+	until(t, link, func(s State) bool { return s.Apps[3].PID > 0 })
+	if err := link.Order("stop", "sleeper"); err != nil {
+		t.Fatal(err)
+	}
+	ended := until(t, link, func(s State) bool {
+		return !slices.ContainsFunc(s.Apps, func(app App) bool { return app.Last == "" })
+	})
+	fell := map[string]bool{}
+	for _, app := range ended.Apps {
+		fell[app.Name] = app.Fell
+	}
+	if want := map[string]bool{"clean": false, "failing": true, "killed": true, "sleeper": false}; !maps.Equal(fell, want) {
+		t.Errorf("fell = %v, want %v (%+v)", fell, want, ended.Apps)
+	}
+}
+
+// An app the configuration no longer declares runs until it is stopped: its name therefore still
+// reaches it, to stop it as well as to read its log, and once stopped it leaves the state.
+func TestAnAppGoneFromTheConfigurationAnswersToItsName(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.dsvs.ts")
+	write := func(apps string) {
+		body := `export default {
+  port: 4399,
+  ingress: [{ host: "shop.localhost", routes: [{ path: "/", app: "sleeper" }] }],
+  apps: [` + apps + `],
+};`
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sleeper := `{ name: "sleeper", command: ["sh", "-c", "sleep 30", "{port}"] }`
+	write(sleeper + `, { name: "watcher", command: ["sh", "-c", "sleep 30", "{port}"] }`)
+	form, cfg, err := config.Load(path, nil, config.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := supervised(t, form, *cfg)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+	link, err := Watch(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+
+	if err := link.Order("start", "watcher"); err != nil {
+		t.Fatal(err)
+	}
+	until(t, link, func(s State) bool { return len(s.Apps) == 2 && s.Apps[1].PID > 0 })
+	write(sleeper)
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	until(t, link, func(s State) bool { return len(s.Apps) == 2 && s.Apps[1].Drift == "gone from the configuration" })
+
+	session.App("watcher").Log.Add("the watcher speaks")
+	logs, err := Tail(path, 50, []string{"watcher"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !said(logs, "the watcher speaks") {
+		t.Errorf("the log of an app nothing declares any more should be readable; read %v", logs)
+	}
+
+	if err := link.Order("stop", "watcher"); err != nil {
+		t.Fatal(err)
+	}
+	until(t, link, func(s State) bool { return len(s.Apps) == 1 && s.Apps[0].Name == "sleeper" })
+
+	// Once gone, the app no longer starts by its name, but its log reads until the session ends, alone
+	// or in its place among the others, and the last word is its departure.
+	if _, err := Order(path, "start", "watcher"); err == nil {
+		t.Error("a gone app still starts by its name")
+	}
+	for _, names := range [][]string{{"watcher"}, nil} {
+		logs, err := Tail(path, 50, names)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !said(logs, "the watcher speaks") || logs[len(logs)-1].Text != "-- watcher leaves: nothing declares it any more" {
+			t.Errorf("logs %v after the watcher left = %v", names, logs)
+		}
+	}
+
+	// An app of the same name that comes back picks up that log.
+	write(sleeper + `, { name: "watcher", command: ["sh", "-c", "sleep 30", "{port}"] }`)
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if back := session.App("watcher"); back == nil || !strings.Contains(back.Log.Dump(), "the watcher speaks") {
+		t.Error("the returning watcher did not pick up its log")
+	}
 }
 
 // until waits for a state that satisfies this condition: the session sends a fresh one on every
@@ -359,11 +484,22 @@ func TestSetAnswersOnceTheSessionReplayed(t *testing.T) {
 		t.Fatalf("params = %+v, want %+v", first.Params, want)
 	}
 
-	if err := Set(path, map[string]string{"env": "staging"}); err != nil {
+	if err := Set(path, "cli", map[string]string{"env": "staging"}); err != nil {
 		t.Fatal(err)
 	}
 	if field, _ := session.Form().Field("env"); field.Value != "staging" {
 		t.Errorf("env = %q right after the answer, want staging", field.Value)
+	}
+	// The log gives the value and where the gesture comes from, before what the session did with it.
+	var journal []string
+	for _, line := range session.Log.Lines() {
+		journal = append(journal, line.Text)
+	}
+	set, reloaded := slices.Index(journal, "-- set env=staging (cli)"), slices.IndexFunc(journal, func(line string) bool {
+		return strings.HasPrefix(line, "-- configuration reloaded")
+	})
+	if set < 0 || reloaded < set {
+		t.Errorf("the log should say -- set env=staging (cli) before -- configuration reloaded: %q", journal)
 	}
 	state := until(t, link, func(s State) bool { return s.Params[0].Value == "staging" })
 	if state.Observed != nil {
@@ -389,7 +525,7 @@ func TestTheConfigurationInForceIsTheSessions(t *testing.T) {
 	t.Cleanup(stop)
 	server.Ready(ctx, session, stop)
 
-	if err := Set(path, map[string]string{"env": "staging"}); err != nil {
+	if err := Set(path, "cli", map[string]string{"env": "staging"}); err != nil {
 		t.Fatal(err)
 	}
 	text, err := Configuration(path)
@@ -425,7 +561,7 @@ export default config(form({ client: "" }), () => ({
 	t.Cleanup(stop)
 	server.Ready(ctx, session, stop)
 
-	if err := Set(path, map[string]string{"client": `Jane "the" Doe`}); err != nil {
+	if err := Set(path, "cli", map[string]string{"client": `Jane "the" Doe`}); err != nil {
 		t.Fatal(err)
 	}
 	if field, _ := session.Form().Field("client"); field.Value != `Jane "the" Doe` {
@@ -502,7 +638,7 @@ func TestSetRefusesWhatTheConfigurationDoesNotTake(t *testing.T) {
 	t.Cleanup(stop)
 	server.Ready(ctx, session, stop)
 
-	err := Set(path, map[string]string{"env": "nope"})
+	err := Set(path, "cli", map[string]string{"env": "nope"})
 	if err == nil || !strings.Contains(err.Error(), "local, staging") {
 		t.Fatalf("Set = %v, want a refusal that lists the choices", err)
 	}
@@ -538,16 +674,16 @@ export default config(form({ api: ["local", "staging"], client: "" }, (p) => {
 	t.Cleanup(stop)
 	server.Ready(ctx, session, stop)
 
-	if err := Set(path, map[string]string{"api": "staging"}); err == nil {
+	if err := Set(path, "cli", map[string]string{"api": "staging"}); err == nil {
 		t.Fatal("set api=staging should be refused: the account is missing")
 	}
-	if err := Draft(path, map[string]string{"api": "staging"}); err != nil {
+	if err := Draft(path, "panel", map[string]string{"api": "staging"}); err != nil {
 		t.Fatal(err)
 	}
 	if field, _ := session.Form().Field("api"); field.Value != "staging" || session.NotApplied() != "client: staging needs a test account" {
 		t.Errorf("api = %q, not applied = %q; want staging, waiting for the account", field.Value, session.NotApplied())
 	}
-	if err := Draft(path, map[string]string{"client": "jane"}); err != nil || session.NotApplied() != "" {
+	if err := Draft(path, "panel", map[string]string{"client": "jane"}); err != nil || session.NotApplied() != "" {
 		t.Errorf("draft client=jane = %v, not applied = %q; want everything applied", err, session.NotApplied())
 	}
 }
@@ -656,6 +792,38 @@ func TestAnOrderReachesASessionThatPredatesTheAnswer(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("the order never reached the old session")
+	}
+}
+
+// An older session reads the word saying where a set comes from as a value, and refuses it: the client
+// sends it the values alone, and the setting goes through.
+func TestASetReachesASessionThatPredatesItsOrigin(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := "/old/config.dsvs.ts"
+	listener, err := net.Listen("unix", socket(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	heard := make(chan string, 2)
+	go func() {
+		for _, reply := range []string{`err set takes name=value, not "cli"`, "ok"} {
+			question, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			greeting, _ := bufio.NewReader(question).ReadString('\n')
+			heard <- strings.TrimSpace(greeting)
+			fmt.Fprintln(question, reply)
+			question.Close()
+		}
+	}()
+
+	if err := Set(path, "cli", map[string]string{"env": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	if first, second := <-heard, <-heard; first != `set cli "env=staging"` || second != `set "env=staging"` {
+		t.Errorf("the old session heard %q then %q", first, second)
 	}
 }
 
