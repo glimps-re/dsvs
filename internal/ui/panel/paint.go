@@ -1196,6 +1196,40 @@ func form(app attach.App) (glyph, color.Color) {
 	return ring, asleep
 }
 
+// Mood is what all the sessions say together: what the status bar icon shows, from calmest to most
+// serious.
+type Mood int
+
+const (
+	// Idle: no app is running.
+	Idle Mood = iota
+	// Running: everything that should run is running.
+	Running
+	// Starting: at least one app is coming up, or stopping.
+	Starting
+	// Failed: at least one app fell.
+	Failed
+)
+
+// Overall is the single rule for what the sessions say together: the worst shape any app of any of
+// them has, the very one the panel draws in front of its name.
+func Overall(states []attach.State) Mood {
+	mood := Idle
+	for _, state := range states {
+		for _, app := range state.Apps {
+			switch shape, _ := form(app); shape {
+			case cross:
+				return Failed
+			case half:
+				mood = max(mood, Starting)
+			case filled:
+				mood = max(mood, Running)
+			}
+		}
+	}
+	return mood
+}
+
 // watching says whether an interface is already watching this session: there is no offer to open a
 // second one when bringing back the existing one is enough.
 func watching(state attach.State) bool {
