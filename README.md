@@ -39,7 +39,7 @@ The script downloads the binary of the latest release for this machine (amd64 or
 
 ### The beta
 
-The beta previews the next version. Its binary, `dsvs-beta`, installs **beside** `dsvs` and keeps to itself: its own sockets, unit, service, hub and remembered projects, and its own icon, with amber bars where the stable's are white. It reads its own configuration, `config.beta.dsvs.ts` or `dsvs.beta.json`, searched up from the current directory, and **never falls back** to `config.dsvs.ts`: a project runs on the beta once you copy its configuration, or name a file with `--config`. Give the copy another port and both binaries serve the project at once. The stable stays your fallback.
+The beta previews the next version. Its binary, `dsvs-beta`, installs **beside** `dsvs` and keeps to itself: its own sockets, unit, service, hub and remembered projects, and its own icon, with violet bars where the stable's are white. It reads its own configuration, `config.beta.dsvs.ts` or `dsvs.beta.json`, searched up from the current directory, and **never falls back** to `config.dsvs.ts`: a project runs on the beta once you copy its configuration, or name a file with `--config`. Give the copy another port and both binaries serve the project at once. The stable stays your fallback.
 
 - From the panel of `dsvs`: **install the beta** shows up once a beta is published and none is installed. A second icon appears.
 - From a terminal, even without a stable:
@@ -67,7 +67,7 @@ git clone https://github.com/glimps-re/dsvs.git
 cd dsvs && ./build.sh --install     # → ~/.local/bin/dsvs, version = git describe
 ```
 
-The binary is named after the branch — `main` builds `dsvs`, `feat/x` builds `dsvs-x` — and everything that isolates it derives from that name: sockets, icon, hub, systemd unit and remembered projects. A branch build therefore runs beside your everyday `dsvs` without touching it, and its icon has amber bars. The port, though, is global: the second binary asking for it is refused, with the name, version and session of the one holding it. To serve the same projects from a second binary, give it a port shift when installing it — `DSVS_PORT_SHIFT=100 ./build.sh --install`, or `dsvs-x --install-unit --port-shift 100` — which its unit keeps across reinstalls and updates: its facades then answer on the declared port plus 100.
+The binary is named after the branch — `main` builds `dsvs`, `feat/x` builds `dsvs-x` — and everything that isolates it derives from that name: sockets, icon, hub, systemd unit and remembered projects. A branch build therefore runs beside your everyday `dsvs` without touching it, and its icon has violet bars. The port, though, is global: the second binary asking for it is refused, with the name, version and session of the one holding it. To serve the same projects from a second binary, give it a port shift when installing it — `DSVS_PORT_SHIFT=100 ./build.sh --install`, or `dsvs-x --install-unit --port-shift 100` — which its unit keeps across reinstalls and updates: its facades then answer on the declared port plus 100.
 
 A binary built from a clone updates from that clone: `dsvs update` fetches, rebuilds, replaces and restarts, saying each step. A clone with uncommitted changes refuses, since what it would build has no version to tell it apart; so does a clone left on another branch, since `dsvs-next` does not install under the name `dsvs`. Updating from a clone builds and runs what upstream carries: **whoever can push to that branch runs code on your machine**. That is the design, and it is what `git pull && ./build.sh --install` does by hand.
 
@@ -140,7 +140,9 @@ Options, before or after the command:
 
 ### The icon and the panel
 
-The icon opens the panel; its tooltip gives the binary and its version. The projects you have opened stay listed from one login to the next, cold, each with three gestures: start or stop its apps, open its TUI or raise it, or forget it. Each app has a start/stop and a restart pictogram, each facade opens in the browser, and the parameters of a session are set right there. At the bottom, two distinct gestures: stop the apps of every project, or quit dsvs, icon included; and the update, and the beta row described above. `dsvs panel --png <file>` draws the panel into a PNG, without a display.
+The icon reads without opening anything: lit bars and a solid green dot when something runs and all is well, a spinning amber ring while an app starts, a red dot with a cross when an app fell. When nothing runs, the bars dim and the dot goes away. Its tooltip gives the binary and its version.
+
+A click opens the panel. The projects you have opened stay listed from one login to the next, cold, each with three gestures: start or stop its apps, open its TUI or raise it, or forget it. Each app has a start/stop and a restart pictogram, each facade opens in the browser, and the parameters of a session are set right there. At the bottom, two distinct gestures: stop the apps of every project, or quit dsvs, icon included; and the update, and the beta row described above. `dsvs panel --png <file>` draws the panel into a PNG, without a display.
 
 ## Configuration
 

@@ -1888,3 +1888,32 @@ func TestABranchBinaryMarksItsHeader(t *testing.T) {
 		t.Errorf("the header's square is %v, wanted %v", got, branch)
 	}
 }
+
+// The icon says what the sessions say together, with the same shape the panel draws in front of each
+// app: the worst wins, and a cross wins over a half disc.
+func TestTheSessionsSayTheWorstFormTogether(t *testing.T) {
+	ready := attach.App{Name: "front", Status: "ready", Ready: true}
+	booting := attach.App{Name: "api", Status: "starting"}
+	leaving := attach.App{Name: "admin", Status: "stopping", Ready: true}
+	fallen := attach.App{Name: "docs", Status: "idle", Last: "exited (1)"}
+	stopped := attach.App{Name: "old", Status: "idle", Last: "stopped"}
+	of := func(apps ...attach.App) attach.State { return attach.State{Apps: apps} }
+
+	for _, c := range []struct {
+		what   string
+		states []attach.State
+		want   Mood
+	}{
+		{"no session", nil, Idle},
+		{"a session without an app", []attach.State{of()}, Idle},
+		{"nothing running", []attach.State{of(stopped)}, Idle},
+		{"everything is ready", []attach.State{of(ready), of(ready, stopped)}, Running},
+		{"an app starts", []attach.State{of(ready), of(booting)}, Starting},
+		{"an app stops, still answering", []attach.State{of(ready, leaving)}, Starting},
+		{"an app falls and one starts", []attach.State{of(booting, ready), of(fallen)}, Failed},
+	} {
+		if got := Overall(c.states); got != c.want {
+			t.Errorf("%s: %d, wanted %d", c.what, got, c.want)
+		}
+	}
+}

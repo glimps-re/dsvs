@@ -13,6 +13,22 @@
 // icon's window, is the only place that holds the full name and the version; the bar tint tells the
 // binaries apart at a glance.
 //
+// # What the icon says
+//
+// Three bars on a dark tile, drawn as an image at the size the bar imposes. The bar tint says which
+// binary placed the icon — white for dsvs, violet for any other —, their luminance whether something
+// runs, and a badge in the corner says how, as soon as an app runs: a full, still disc when all is well,
+// a half-full ring that spins while an app starts, a crossed disc when an app has fallen. When nothing
+// runs, no badge. We first wanted calm to have no badge, so that it would only mean "come and look"; in
+// use, knowing without opening the panel that something runs proved more useful. Every state differs by
+// its shape and luminance, never by tint alone, because dom0 tints the icon with the qube's color.
+//
+// The sessions are followed through what they push, and the hub is listed again every three seconds
+// for new ones, which it does not announce. The icon repaints only when what they say together changes;
+// the only timer is the quarter turn every 500 ms, and it exists only during "starting". The window's
+// name stays the binary's label: dom0 was never seen relaying a live name change, so the state is not
+// written there.
+//
 // # Ruled out by measurement, not to retry
 //
 // The D-Bus/SNI tray, for lack of a watcher. Fyne and gio, which need cgo and GL under llvmpipe. A web
