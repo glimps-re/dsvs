@@ -587,10 +587,11 @@ func (m Model) enterParam() Model {
 	return m
 }
 
-// set gives a parameter a value, and keeps the refusal if there is one.
+// set gives a parameter a value, as one fills in a form: a choice that requires another one waits
+// for the field that completes it (core.Session.Draft). It keeps the refusal if there is one.
 func (m Model) set(name, value string) Model {
 	m.refusal = refusal{}
-	if err := m.session.Set(map[string]string{name: value}); err != nil {
+	if err := m.session.Draft(map[string]string{name: value}); err != nil {
 		m.refusal = refusal{name, err.Error()}
 	}
 	return m

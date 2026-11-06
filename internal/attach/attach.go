@@ -224,11 +224,7 @@ func read(config, question, verb string, limit int) ([]byte, error) {
 // Set gives values to the parameters of the session of this configuration, and returns once it has
 // replayed: nil if it took them, its reason otherwise. It is not launched if it is not there.
 func Set(config string, values map[string]string) error {
-	pairs := make([]string, 0, len(values))
-	for _, name := range slices.Sorted(maps.Keys(values)) {
-		pairs = append(pairs, strconv.Quote(name+"="+values[name]))
-	}
-	_, err := ask(config, "set "+strings.Join(pairs, " "))
+	_, err := ask(config, "set "+pairs(values))
 	if errors.Is(err, errUnread) {
 		return predating(config, "parameters")
 	}
@@ -261,6 +257,26 @@ func Forget(config string) (listed, valued bool, err error) {
 	}
 	_, _ = Order(config, "reload") // a file the session does not apply is reported in its log and its state
 	return listed, valued, nil
+}
+
+// Draft fills in parameters of the session of this configuration, the way an interface fills in a
+// form: values its fields take are kept even when they leave it invalid, and it waits for the gesture
+// that completes it (core.Session.Draft). A session from before this verb receives them as set.
+func Draft(config string, values map[string]string) error {
+	_, err := ask(config, "draft "+pairs(values))
+	if errors.Is(err, errUnread) {
+		return Set(config, values)
+	}
+	return err
+}
+
+// pairs writes values the way set and draft carry them: each name=value Go-quoted.
+func pairs(values map[string]string) string {
+	quoted := make([]string, 0, len(values))
+	for _, name := range slices.Sorted(maps.Keys(values)) {
+		quoted = append(quoted, strconv.Quote(name+"="+values[name]))
+	}
+	return strings.Join(quoted, " ")
 }
 
 // Order gives an order to the session of this configuration — start, stop or restart of what these

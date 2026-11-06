@@ -1579,17 +1579,28 @@ func TestTheLogOpensOnWhatTheParameterSays(t *testing.T) {
 		t.Errorf("a parameter with nothing to say writes:\n%s", said)
 	}
 
-	m.cursor = index(t, m, "branch")
-	m = press(m, "enter", "backspace", "backspace", "backspace", "backspace", "w", "i", "p", "enter")
-	if said := head(); !strings.Contains(said, "✗ the form refuses it: wip is not a branch") {
+	m.cursor = index(t, m, "products")
+	m = press(m, "enter", "home", "9", "9", "enter")
+	if said := head(); !strings.Contains(said, "✗ products: at most 5000") {
 		t.Errorf("the input's refusal does not read:\n%s", said)
 	}
-	if field, _ := m.session.Form().Field("branch"); field.Value != "main" {
-		t.Errorf("a refused gesture changed branch to %q", field.Value)
+	if field, _ := m.session.Form().Field("products"); field.Value != "20" {
+		t.Errorf("a refused gesture changed products to %q", field.Value)
 	}
 	m = press(m, "enter", "enter")
 	if said := head(); strings.Contains(said, "✗") {
 		t.Errorf("the refusal survives the next gesture:\n%s", said)
+	}
+
+	// A value its field takes but the form refuses is kept, as in a form being filled in: its error
+	// reads, and nothing applies while it lasts.
+	m.cursor = index(t, m, "branch")
+	m = press(m, "enter", "backspace", "backspace", "backspace", "backspace", "w", "i", "p", "enter")
+	if said := head(); !strings.Contains(said, "✗ wip is not a branch") {
+		t.Errorf("the form's error does not read:\n%s", said)
+	}
+	if field, _ := m.session.Form().Field("branch"); field.Value != "wip" || m.session.NotApplied() != "wip is not a branch" {
+		t.Errorf("branch = %q, not applied = %q; want wip, pending", field.Value, m.session.NotApplied())
 	}
 }
 

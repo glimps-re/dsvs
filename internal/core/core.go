@@ -468,9 +468,12 @@ type Session struct {
 	// evaluation failed, or its form is invalid. Empty when it is. It is the only thing that says
 	// so, and only the evaluation writes it.
 	notApplied string
-	// intents are the values chosen since the session started: an accepted gesture writes them, and
-	// they cross a handover. A default is never one.
+	// intents are the values chosen since the session started: a gesture writes them as soon as the
+	// form accepts them, a network as soon as what it keeps applies, and they cross a handover. A
+	// default is never one. awaiting are those of a draft the configuration does not apply yet:
+	// they are only kept, for the project or the network, once applied.
 	intents   map[string]string
+	awaiting  map[string]string
 	ingresses []*Ingress
 	apps      []*App
 	// viewports are the windows of the watching interfaces, and cols/rows the size lent to the
@@ -496,6 +499,7 @@ func NewSession(form config.Form, cfg config.Config, network Network, front Fron
 		observed: cfg.Observed,
 		form:     form,
 		intents:  map[string]string{},
+		awaiting: map[string]string{},
 		cols:     defaultCols,
 		rows:     defaultRows,
 		net:      network,
@@ -570,13 +574,24 @@ func (s *Session) Facades() []*Ingress {
 // nothing: the session carries on with the running one. Neither does an invalid form, but it is the
 // one the session shows from then on, with its errors. In every case it says why (NotApplied), until
 // the evaluation that applies the file again — a save, a gesture, a network — and which the log tells.
-func (s *Session) Reload() error { return s.replay(nil) }
+func (s *Session) Reload() error { return s.replay(nil, config.Form.Accept) }
 
 // Set replays the configuration with these requested values, on top of everything chosen or kept.
 // It is a submission: values the form refuses, or that would make it invalid, change nothing, and
 // the error says so (config.Form.Accept); the session's log says so too. A value taken becomes an
 // intent of the session, and the form says where to keep it.
-func (s *Session) Set(values map[string]string) error { return s.replay(values) }
+func (s *Session) Set(values map[string]string) error {
+	return s.replay(values, config.Form.Accept)
+}
+
+// Draft is the gesture of an interface filling in the form, field by field: values its fields take
+// become intents of the session even when they leave it invalid — a choice that requires another
+// field —, and the form they make is the one the session shows, errors included. Nothing applies as
+// long as it is invalid; the gesture that completes it applies everything together, and only then
+// is what they chose kept. A value a field does not take is refused as by Set (config.Form.Takes).
+func (s *Session) Draft(values map[string]string) error {
+	return s.replay(values, config.Form.Takes)
+}
 
 // Observe records what the machine shows, and replays the configuration if it differs from what the
 // configuration was built with. The observation is kept even when the replay fails: it is a fact,
@@ -593,7 +608,7 @@ func (s *Session) Observe(seen *config.Observed) error {
 	// As long as the file does not apply, the session replays even on the network the configuration
 	// in force comes from: that may be where it applies again.
 	if !reflect.DeepEqual(seen, s.Config().Observed) || s.NotApplied() != "" {
-		err = s.replay(nil)
+		err = s.replay(nil, config.Form.Accept)
 	}
 	if !reflect.DeepEqual(seen, before) {
 		outcome := "configuration unchanged"
@@ -622,16 +637,25 @@ func (s *Session) Form() config.Form {
 	return s.form
 }
 
+// NotApplied says, in one line, why the configuration in force is not the one the file builds for
+// what the session shows: the last evaluation failed — on a save, on the last network — or its form
+// is invalid, and the targets are the previous ones. Empty when it is; the log carries the details.
+func (s *Session) NotApplied() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.notApplied
+}
+
 // Chose records the values a gesture asked for at the first load, which this form accepted: what an
 // accepted Set writes, for the session and for the network it observes.
 func (s *Session) Chose(asked map[string]string) {
 	s.take(asked)
-	s.remember(s.Form(), s.Config().Path, s.Observed().Network(), asked)
+	s.remember(s.Form(), s.Config().Path, s.Observed().Network())
 }
 
 // InputFor returns the input of an evaluation of this configuration on this network: what a gesture
-// asks, what the session chose, and what the project keeps, for itself and for this network. It is the
-// rule of every replay, and that of a session's first load.
+// asks, what the session chose, and what the project keeps, for itself and for this network. It is
+// the rule of every replay, and that of a session's first load.
 func InputFor(path string, observed *config.Observed, session, asked map[string]string) config.Input {
 	kept, onNetwork := projects.Recall(path, observed.Network())
 	return config.Input{Asked: asked, Network: onNetwork, Session: session, Kept: kept, Observed: observed}
@@ -644,19 +668,11 @@ func (s *Session) Observed() *config.Observed {
 	return s.observed
 }
 
-// NotApplied says, in one line, why the configuration in force is not the one the file builds for
-// what the session shows: the last evaluation failed, or its form is invalid, and the targets are the
-// previous ones. Empty when it is; the log carries the details.
-func (s *Session) NotApplied() string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.notApplied
-}
-
-// replay is the only path of a re-read: asked, when not empty, are values the form must have taken,
-// otherwise nothing changes. The evaluated form is kept as soon as the evaluation succeeded; the
-// configuration, only if the form is valid, and what a gesture chose is then kept.
-func (s *Session) replay(asked map[string]string) error {
+// replay is the only path of a re-read: asked, when not empty, are values the form must have taken
+// according to takes — Accept for a submission, Takes for a draft —, otherwise nothing changes. The
+// evaluated form is kept as soon as the evaluation succeeded; the configuration, only if the form is
+// valid, and what a gesture chose is then kept.
+func (s *Session) replay(asked map[string]string, takes func(config.Form, map[string]string) error) error {
 	s.reloading.Lock()
 	defer s.reloading.Unlock()
 
@@ -681,7 +697,7 @@ func (s *Session) replay(asked map[string]string) error {
 		return errors.New(why)
 	}
 	if len(asked) > 0 {
-		if err := form.Accept(asked); err != nil {
+		if err := takes(form, asked); err != nil {
 			return s.refused(err)
 		}
 		s.take(asked)
@@ -701,10 +717,14 @@ func (s *Session) replay(asked map[string]string) error {
 		s.lags(problems)
 		err := errors.New("configuration not applied: " + problems)
 		s.LogSink(s.Log)("-- " + err.Error())
+		if len(asked) > 0 {
+			// Only a draft takes a gesture that leaves the form invalid: it waits for the next one.
+			return nil
+		}
 		return err
 	}
 	// Keeping is told after the replay being told, but for the network that evaluated it.
-	defer s.remember(form, current.Path, observed.Network(), asked)
+	defer s.remember(form, current.Path, observed.Network())
 	s.hold(form)
 	if s.lags("") != "" {
 		s.LogSink(s.Log)("-- configuration applied again")
@@ -792,6 +812,14 @@ func headline(path string, err error) string {
 	return first
 }
 
+// take turns values a form took into intents of the session, which wait to be applied to be kept.
+func (s *Session) take(asked map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	maps.Copy(s.intents, asked)
+	maps.Copy(s.awaiting, asked)
+}
+
 // hold turns a value the network brought back, once applied, into the session's intent: on a
 // network that kept nothing for its field, it is the one that stays, not a choice made elsewhere
 // before it, what the project keeps, or the default.
@@ -805,17 +833,19 @@ func (s *Session) hold(form config.Form) {
 	}
 }
 
-// take turns values a form took into intents of the session.
-func (s *Session) take(asked map[string]string) {
+// remember keeps what gestures chose, once the configuration is applied, on the form that built it:
+// what it keeps for the project and for the network that evaluated it, among the values it took — a
+// draft whose choice is no longer possible keeps nothing. Failing to keep takes nothing away from
+// the choice, which is in force: it is logged, that is all.
+func (s *Session) remember(form config.Form, path, network string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	maps.Copy(s.intents, asked)
-}
-
-// remember keeps what a gesture chose, once the configuration is applied, on the form that built it:
-// what it keeps for the project and for the network that evaluated it. Failing to keep takes nothing
-// away from the choice, which is in force: it is logged, that is all.
-func (s *Session) remember(form config.Form, path, network string, asked map[string]string) {
+	asked := s.awaiting
+	s.awaiting = map[string]string{}
+	s.mu.Unlock()
+	maps.DeleteFunc(asked, func(name, value string) bool {
+		field, _ := form.Field(name)
+		return field.Value != value
+	})
 	if kept := form.Keeping(asked); len(kept) > 0 {
 		s.said(kept, "kept", projects.Keep(path, kept))
 	}

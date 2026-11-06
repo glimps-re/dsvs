@@ -206,9 +206,9 @@ func (s *Server) host(conn *net.UnixConn) {
 	case len(fields) == 1 && fields[0] == "config":
 		shut(fds)
 		s.configuration(conn)
-	case len(fields) >= 2 && fields[0] == "set":
+	case len(fields) >= 2 && (fields[0] == "set" || fields[0] == "draft"):
 		shut(fds)
-		s.answer(conn, func() (string, error) { return "", s.set(strings.TrimPrefix(greeting, "set")) })
+		s.answer(conn, func() (string, error) { return "", s.set(fields[0], strings.TrimPrefix(greeting, fields[0])) })
 	case len(fields) >= 1 && steering[fields[0]] != nil:
 		shut(fds)
 		s.answer(conn, func() (string, error) { return s.apply(fields[0], fields[1:]) })
@@ -374,10 +374,10 @@ func (s *Server) answer(conn *net.UnixConn, ask func() (string, error)) {
 	fmt.Fprintln(conn, strings.TrimSpace("ok "+said))
 }
 
-// set gives values to the session's parameters, and returns once it has replayed. Each name=value
-// is a word, quoted the Go way when its value holds spaces; a client from before the quotes writes
-// bare words, which read the same.
-func (s *Server) set(words string) error {
+// set gives values to the session's parameters, and returns once it has replayed: a submission for
+// set, a draft for draft. Each name=value is one word, Go-quoted when its value contains spaces; a
+// client from before quoting writes bare words, which read the same.
+func (s *Server) set(verb, words string) error {
 	pairs, err := split(words)
 	if err != nil {
 		return err
@@ -386,9 +386,12 @@ func (s *Server) set(words string) error {
 	for _, pair := range pairs {
 		name, value, found := strings.Cut(pair, "=")
 		if !found {
-			return fmt.Errorf("set takes name=value, not %q", pair)
+			return fmt.Errorf("%s takes name=value, not %q", verb, pair)
 		}
 		values[name] = value
+	}
+	if verb == "draft" {
+		return s.session.Draft(values)
 	}
 	return s.session.Set(values)
 }

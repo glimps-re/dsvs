@@ -24,9 +24,9 @@
 // # The visual grammar
 //
 // A rule never carries text. A background says one thing only: this is interactive — hover in the
-// panel, where the keyboard never comes, the cursor in the TUI. A glyph says a state, never a type
-// — and the shape carries it, the color only repeats it, because a font can miss a glyph and a
-// theme can swallow a hue.
+// panel, where the keyboard only comes in for an entry, the cursor in the TUI. A glyph says a state,
+// never a type — and the shape carries it, the color only repeats it, because a font can miss a glyph
+// and a theme can swallow a hue.
 //
 // The header says which binary the panel comes from; a branch binary adds the amber square of its
 // icon, and the working dsvs carries none.
@@ -48,17 +48,43 @@
 // next state, or a few seconds if the order causes none: the first slot changes meaning with the
 // state, and a second click would do the opposite of what one expects.
 //
+// # The parameters
+//
+// Those a session's form shows are set from here, in the model's order, each group under its title: a
+// flag is a switch, a select of at most four values that fit as segments shows all of them and a click
+// on a segment sends that value, not the next one; beyond that, the list unfolds in the panel. A text or
+// a number shows its value in a box, and a click opens it for entry on the line itself: keys are written
+// at the cursor according to the server's keyboard layout, Enter sends the value, Escape or a click
+// elsewhere abandon it, and nothing leaves before. It is the only moment the panel takes the keyboard
+// focus — taken on opening, it stole the keystrokes of whoever was typing elsewhere, or closed the panel
+// at random — and it gives back the previous one as soon as the entry ends. The entry only exists with
+// it: a server that does not grant it leaves the box as it is, and a line says to set the field from the
+// TUI or with dsvs set; focus lost along the way ends the entry. A box that looks like it is writing
+// while the keys go to the window next door is the state the panel does not allow itself. A hidden
+// field is not drawn, and a group whose fields are all hidden goes with its title; a disabled field has
+// its control inert and its reasons below, like a disabled option of a select, greyed out with nothing
+// to click; an imposed value reads without offering anything to click. What the machine observes is
+// written with "detected" and offers nothing to click either. A change is a question to the session,
+// asked outside the panel's loop: while it replays, none of its parameters offers anything, and its
+// answer comes to say "ok" or the reason for the refusal, written under the parameters until the next
+// change. The form is filled in any order: a choice that requires another field stays chosen, the
+// missing field says what it expects, and nothing applies before the gesture that completes it, which
+// applies everything together. A field's errors are written under it, the form's under the block; a
+// kept value that no longer holds, in amber under the one replacing it, while it yields.
+//
 // Nothing is started when the panel opens: opening a session does not hand back control with four dev
 // servers and their ports.
 //
 // A configuration the session does not apply — a save broke it, or it fails on today's network — is
-// said on one line under the project's title, until the file applies again.
+// said under the project's title, until the file applies again.
 //
-// What the panel gives to read is never elided, except a configuration the session does not apply:
-// a gesture's failure comes from elsewhere, has no promised length, and takes the lines it needs.
-// Cut to the width, a message only says its beginning, and it is the end that explains; a tooltip
-// would come too late from the X server of a VM. What names gets elided — a project, an app — and
-// so does that one line, whose details are in the log and in dsvs state.
+// What the panel gives to read is never elided: a gesture's failure, a configuration the session does
+// not apply, a disabled field's reasons and its errors, and a value nothing sets from here — what the
+// machine observes, an imposed value — come from elsewhere, have no promised length, and take the lines
+// they need; a value that does not fit beside its label goes below it. Cut to the width, a message only
+// says its beginning, and it is the end that explains; a tooltip would come too late from the X server
+// of a VM. What names gets elided — a project, an app, a label — and so does a control's value, which
+// reads in full elsewhere: in a select's list, in a text's entry.
 //
 // A failure reads where the gesture took place, without exception. From the panel, the project stays
 // shown with its reason and is retried with a click; in a terminal, the error goes to standard error

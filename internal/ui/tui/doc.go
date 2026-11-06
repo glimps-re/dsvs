@@ -10,20 +10,22 @@
 //
 // # Parameters
 //
-// The ones the form shows are items of the list, under the session, in the model's order: the name
-// on the left, the value on the right, and each group under its dimmed title; a hidden field is not
-// there, and a group whose fields are all hidden goes with its title, even when the configuration
-// does not change. ⏎ or space moves to the next choice by replaying the configuration, skipping a
-// disabled choice, and the displayed log does not change — a parameter is set, it has no log. ⏎ on
-// a text or a number opens a one-line input in place of its value: ⏎ sends it, esc drops it, and
-// nothing goes out before. A disabled or read-only field is dimmed and does not move. Under the
-// cursor, a parameter states at the top of the log its reasons, its errors and the form's, and the
-// refusal of the last gesture made on it; these lines cover the oldest lines of the log rather than
-// reducing its height, which is the terminal size the apps receive. There is no menu: two or three
-// choices fit in one gesture.
+// The ones the form shows are items of the list, under the session, in the model's order: the name on
+// the left, the value on the right, and each group under its dimmed title; a hidden field is not there,
+// and a group whose fields are all hidden goes with its title, even when the configuration does not
+// change. ⏎ or space moves to the next choice by replaying the configuration, skipping a disabled
+// choice, and the displayed log does not change — a parameter is set, it has no log. ⏎ on a text or a
+// number opens a one-line input in place of its value: ⏎ sends it, esc drops it, and nothing goes out
+// before. A disabled or read-only field is dimmed and does not move. As in the panel, a choice that
+// requires another field stays chosen, without applying anything, until the gesture that completes the
+// form. Under the cursor, a parameter states at the top of the log its reasons, its errors and the
+// form's, and the refusal of the last gesture made on it; these lines cover the oldest lines of the log
+// rather than reducing its height, which is the terminal size the apps receive. There is no menu: two
+// or three choices fit in one gesture.
 //
 // A configuration the session does not apply — a save broke it, or it fails on today's network — puts
-// a cross before the session's port, and its card says why, until the file applies again.
+// a cross before the session's port, and its card says why, until the file applies again. A message,
+// there as at the top of the log, wraps over the lines it needs: cut, it would only say its beginning.
 //
 // # Ruled out of the interface, and why
 //

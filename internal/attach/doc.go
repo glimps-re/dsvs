@@ -15,16 +15,16 @@
 // # The socket carries no version
 //
 // The hub carries one, this socket none, and that is deliberate: an update moves the service to the
-// new binary before the sessions move themselves, so a new client talks for a while to old sessions
-// — and to those that, outside a systemd box, keep their binary. That is workable because what
-// crosses fits in a few verbs — start, stop, restart, reload, renew, quit, logs, set — written by
-// the clients exactly as the session understands them. Renaming them would get them silently
-// ignored, and that is the one thing not to do without thinking: reload used to mean "take the
-// binary on disk", which the command line now calls renew, because a reload that replaces the
-// binary instead of rereading the configuration could not be exposed as such. A session from before
-// the rename ignores renew: the update bounds each handover and then says that this session keeps
-// its binary. The state a session renders, for its part, gives the version it carries: that is what
-// lets a handover be checked instead of trusted.
+// new binary before the sessions move themselves, so a new client talks for a while to old sessions —
+// and to those that, outside a systemd box, keep their binary. That is workable because what crosses
+// fits in a few verbs — start, stop, restart, reload, renew, quit, logs, set, draft — written by the
+// clients exactly as the session understands them. Renaming them would get them silently ignored, and
+// that is the one thing not to do without thinking: reload used to mean "take the binary on disk",
+// which the command line now calls renew, because a reload that replaces the binary instead of
+// rereading the configuration could not be exposed as such. A session from before the rename ignores
+// renew: the update bounds each handover and then says that this session keeps its binary. The state
+// a session renders, for its part, gives the version it carries: that is what lets a handover be
+// checked instead of trusted.
 //
 // # Changing a parameter, or giving an order, is a question
 //
@@ -34,6 +34,11 @@
 // stream return nothing, and a refusal is read where the gesture happened. A session from before this
 // verb answers that it does not read the greeting, and the client translates that into saying it must
 // be updated.
+//
+// draft is the same gesture coming from an interface that fills in the form, with the same words: the
+// session keeps values its fields take even when they leave it invalid (core.Session.Draft). A session
+// from before draft receives it as set: the panel then refuses there, as before, what waits on another
+// field.
 //
 // start, stop and restart are likewise asked as questions, with the same words as on the stream: "ok"
 // when the order has gone out to its apps, the reason otherwise — an unknown name, an app whose order

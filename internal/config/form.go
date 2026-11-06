@@ -158,11 +158,23 @@ func (f Form) Field(name string) (Field, bool) {
 	return f.Fields[i], true
 }
 
-// Accept says whether these asked values were taken by this form, the one they produced: a declared
-// and interactive field, a value readable in its type, among its choices, taken, and a form without
-// error. It is the only guard of writes, and an invalid form builds nothing: with no asked value,
-// Accept therefore says whether the configuration was built.
+// Accept says whether these asked values were taken by this form, the one they produced, and whether
+// it is free of errors (Takes, then Problems). It is the only guard of writes, and an invalid form
+// builds nothing: with no asked value, Accept therefore says whether the configuration was built.
 func (f Form) Accept(asked map[string]string) error {
+	if err := f.Takes(asked); err != nil {
+		return err
+	}
+	if problems := f.Problems(); len(problems) > 0 {
+		return fmt.Errorf("the form refuses it: %s", strings.Join(problems, "; "))
+	}
+	return nil
+}
+
+// Takes says whether each of these asked values was taken by this form: a declared and interactive
+// field, a value readable in its type, among its choices, taken, and without error. The rest of the
+// form may be invalid: that is what a draft requires, where a submission requires Accept.
+func (f Form) Takes(asked map[string]string) error {
 	for _, name := range slices.Sorted(maps.Keys(asked)) {
 		field, declared := f.Field(name)
 		value := asked[name]
@@ -188,9 +200,6 @@ func (f Form) Accept(asked map[string]string) error {
 		case len(field.Errors) > 0:
 			return fmt.Errorf("%s: %s", name, strings.Join(field.Errors, "; "))
 		}
-	}
-	if problems := f.Problems(); len(problems) > 0 {
-		return fmt.Errorf("the form refuses it: %s", strings.Join(problems, "; "))
 	}
 	return nil
 }
