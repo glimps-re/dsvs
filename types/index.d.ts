@@ -113,8 +113,9 @@ export type Model = { readonly [name: string]: boolean | number | string | reado
 
 /**
  * The values the build receives: a boolean per flag, a number per number, a text per text, one of the
- * values of each choice. A hidden or disabled field has its own too: its effective value, the one it
- * takes back when it returns.
+ * values of each choice. A disabled field has its value too. A hidden field, though, is `undefined`
+ * there — a hidden group, each of its fields —, which these types do not say: the schema is fixed, and
+ * whoever reads a field a rule can hide guards it themselves.
  */
 export type Values<M> = {
   -readonly [K in keyof M]: M[K] extends readonly string[]
@@ -207,7 +208,9 @@ export declare function applyWhenValue<V>(path: Path<V>, predicate: (value: V) =
 
 /**
  * The field, or everything the group contains, exists for no interface: neither shown, nor validated,
- * nor settable. Its value is kept, and comes back with it.
+ * nor settable. Its value is kept, and comes back with it: the rules see it, the build does not, where
+ * it is `undefined` (see `Values`). A configuration that uses it anyway is told so, by the path of what
+ * depends on it: `discount is hidden, yet apps.api.env.DISCOUNT depends on it`.
  */
 export declare function hidden<V>(path: Path<V>, options?: { when?: Logic<V, boolean> }): void;
 /** Shown, inert, and not validated. A reason, if there is one, is written under the field and in the refusal. */
@@ -220,8 +223,16 @@ export declare function readonly<V>(path: Path<V>, options?: { when?: Logic<V, b
  */
 export declare function keep<V>(path: Path<V>, options?: { when?: Logic<V, boolean> }): void;
 
-/** The current choices, in display order. On a text or a number, they restrict it. */
-export declare function choices<V extends Leaf>(path: Path<V>, list: Logic<V, readonly NoInfer<V>[]>): void;
+/**
+ * The current choices, in display order. On a text or a number, they restrict it. An option can be
+ * disabled, with its reason: `{ value: "staging", disabled: !vpn && "staging needs the VPN" }`. It
+ * stays in the list, greyed out with its reason, and is never taken: a move that chooses it is refused,
+ * and a kept value it designates falls back to the default — or to the first enabled choice, when the
+ * default is itself disabled —, then comes back when the option is enabled again.
+ */
+export declare function choices<V extends Leaf>(path: Path<V>, list: Logic<V, readonly Choice<NoInfer<V>>[]>): void;
+/** An entry of `choices`: a value, or a value disabled when `disabled` is true or says why. */
+export type Choice<V> = V | { value: V; disabled?: boolean | string };
 /** The current default, as long as nobody has chosen; a choice made comes back as soon as it is possible. */
 export declare function defaultValue<V extends Leaf>(path: Path<V>, value: Logic<V, NoInfer<V>>): void;
 

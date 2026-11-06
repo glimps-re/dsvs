@@ -619,8 +619,8 @@ func (s *Session) replay() error {
 	s.form = form
 	s.mu.Unlock()
 	// What the form says is logged when it starts, not on every replay while it lasts.
-	for _, said := range form.Yields() {
-		if !slices.Contains(shown.Yields(), said) {
+	for _, said := range form.Said() {
+		if !slices.Contains(shown.Said(), said) {
 			s.LogSink(s.Log)("-- " + said)
 		}
 	}
