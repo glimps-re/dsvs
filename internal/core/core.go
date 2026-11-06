@@ -315,9 +315,9 @@ const (
 	cmdRestart
 )
 
-func (s *App) Start()   { s.send(cmdStart) }
-func (s *App) Stop()    { s.send(cmdStop) }
-func (s *App) Restart() { s.send(cmdRestart) }
+func (s *App) Start() error   { return s.send(cmdStart) }
+func (s *App) Stop() error    { return s.send(cmdStop) }
+func (s *App) Restart() error { return s.send(cmdRestart) }
 
 // Cfg returns the declaration that holds for the next start: that of the configuration in force, or
 // that of the last run when the configuration no longer declares this app.
@@ -569,8 +569,14 @@ func (s *Session) Facades() []*Ingress {
 // its restart, a removed app runs until it is stopped. An unreadable or invalid configuration changes
 // nothing: the session carries on with the running one. Neither does an invalid form, but it is the
 // one the session shows from then on, with its errors. In every case it says why (NotApplied), until
-// the evaluation that applies the file again — a save, a network — and which the log tells.
-func (s *Session) Reload() error { return s.replay() }
+// the evaluation that applies the file again — a save, a gesture, a network — and which the log tells.
+func (s *Session) Reload() error { return s.replay(nil) }
+
+// Set replays the configuration with these requested values, on top of everything chosen or kept.
+// It is a submission: values the form refuses, or that would make it invalid, change nothing, and
+// the error says so (config.Form.Accept); the session's log says so too. A value taken becomes an
+// intent of the session, and the form says where to keep it.
+func (s *Session) Set(values map[string]string) error { return s.replay(values) }
 
 // Observe records what the machine shows, and replays the configuration if it differs from what the
 // configuration was built with. The observation is kept even when the replay fails: it is a fact,
@@ -587,7 +593,7 @@ func (s *Session) Observe(seen *config.Observed) error {
 	// As long as the file does not apply, the session replays even on the network the configuration
 	// in force comes from: that may be where it applies again.
 	if !reflect.DeepEqual(seen, s.Config().Observed) || s.NotApplied() != "" {
-		err = s.replay()
+		err = s.replay(nil)
 	}
 	if !reflect.DeepEqual(seen, before) {
 		outcome := "configuration unchanged"
@@ -616,6 +622,13 @@ func (s *Session) Form() config.Form {
 	return s.form
 }
 
+// Chose records the values a gesture asked for at the first load, which this form accepted: what an
+// accepted Set writes, for the session and for the network it observes.
+func (s *Session) Chose(asked map[string]string) {
+	s.take(asked)
+	s.remember(s.Form(), s.Config().Path, s.Observed().Network(), asked)
+}
+
 // InputFor returns the input of an evaluation of this configuration on this network: what a gesture
 // asks, what the session chose, and what the project keeps, for itself and for this network. It is the
 // rule of every replay, and that of a session's first load.
@@ -640,9 +653,10 @@ func (s *Session) NotApplied() string {
 	return s.notApplied
 }
 
-// replay is the only path of a re-read. The evaluated form is kept as soon as the evaluation
-// succeeded; the configuration, only if the form is valid.
-func (s *Session) replay() error {
+// replay is the only path of a re-read: asked, when not empty, are values the form must have taken,
+// otherwise nothing changes. The evaluated form is kept as soon as the evaluation succeeded; the
+// configuration, only if the form is valid, and what a gesture chose is then kept.
+func (s *Session) replay(asked map[string]string) error {
 	s.reloading.Lock()
 	defer s.reloading.Unlock()
 
@@ -653,13 +667,24 @@ func (s *Session) replay() error {
 	s.mu.Unlock()
 
 	observed := s.Observed()
-	form, built, err := config.Load(current.Path, current.ForcedWatch, InputFor(current.Path, observed, intents, nil))
+	form, built, err := config.Load(current.Path, current.ForcedWatch, InputFor(current.Path, observed, intents, asked))
 	if err != nil {
-		// The log keeps the whole failure, including what the program said; the status reads its head.
+		// The log keeps the whole failure, including what the program said; whoever made the
+		// gesture reads its head, like the status.
 		why := headline(current.Path, err)
-		s.lags(why)
+		if len(asked) == 0 {
+			// A gesture that builds no configuration is refused, and nothing says the file itself
+			// no longer applies: only an evaluation without a gesture says so.
+			s.lags(why)
+		}
 		s.LogSink(s.Log)("!! " + err.Error())
 		return errors.New(why)
+	}
+	if len(asked) > 0 {
+		if err := form.Accept(asked); err != nil {
+			return s.refused(err)
+		}
+		s.take(asked)
 	}
 	s.mu.Lock()
 	shown := s.form
@@ -678,6 +703,8 @@ func (s *Session) replay() error {
 		s.LogSink(s.Log)("-- " + err.Error())
 		return err
 	}
+	// Keeping is told after the replay being told, but for the network that evaluated it.
+	defer s.remember(form, current.Path, observed.Network(), asked)
 	s.hold(form)
 	if s.lags("") != "" {
 		s.LogSink(s.Log)("-- configuration applied again")
@@ -776,6 +803,33 @@ func (s *Session) hold(form config.Form) {
 			s.intents[field.Name] = field.Value
 		}
 	}
+}
+
+// take turns values a form took into intents of the session.
+func (s *Session) take(asked map[string]string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	maps.Copy(s.intents, asked)
+}
+
+// remember keeps what a gesture chose, once the configuration is applied, on the form that built it:
+// what it keeps for the project and for the network that evaluated it. Failing to keep takes nothing
+// away from the choice, which is in force: it is logged, that is all.
+func (s *Session) remember(form config.Form, path, network string, asked map[string]string) {
+	if kept := form.Keeping(asked); len(kept) > 0 {
+		s.said(kept, "kept", projects.Keep(path, kept))
+	}
+	if carried := form.Following(asked); len(carried) > 0 {
+		s.said(carried, "kept for "+network, projects.Retain(path, network, carried))
+	}
+}
+
+// said logs what a store did with these values.
+func (s *Session) said(values map[string]string, kept string, err error) {
+	if err != nil {
+		kept = "not kept: " + err.Error()
+	}
+	s.LogSink(s.Log)("-- " + config.Pairs(values) + " " + kept)
 }
 
 // adopt brings the facades in line with the configuration. A facade never changes after it is
@@ -1242,10 +1296,14 @@ func (s *Session) emit(e Event) {
 	}
 }
 
-func (s *App) send(c command) {
+// send hands a command to the supervisor, without waiting for it. A full queue refuses it and says
+// so: it is a gesture someone made, and it is not lost silently.
+func (s *App) send(c command) error {
 	select {
 	case s.cmds <- c:
+		return nil
 	default:
+		return fmt.Errorf("%s already has %d orders waiting", s.Name, cap(s.cmds))
 	}
 }
 

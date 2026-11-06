@@ -84,24 +84,25 @@ dsvs — control panel for dev-servers
   dsvs [options] <command> [options] [arguments]
 
 Commands:
-  start [--all] <name...>      start the apps these names pull in
-  stop [--all] <name...>       stop the apps these names pull in
-  restart [--all] <name...>    restart the apps these names pull in
-  reload                       make the session read its configuration again
-  quit                         stop the apps of the session and close it
-  state [--json]               write what the session here is doing
-  logs [-n <lines>] [name...]  write the end of the logs, or follow them with -f
-  run [name...]                hold the session in this terminal, streaming the logs
-  status [--json]              write what runs on this machine, and who holds the ports
-  service [stop|restart]       start the background service and its icon, or stop it
-  update                       take a newer version of this binary, and restart the service
-  panel                        open the panel of the running sessions
-  remember                     remember the project here, so that the panel lists it cold
-  forget                       forget the project here, which the panel stops listing
-  config                       write the resolved configuration as JSON
-  types                        write the package specifier of the TypeScript types matching this binary
-  skill                        write a skill that teaches this tool to a coding agent
-  help [command]               write what a command does, or the list of them
+  start [--all] <name...>        start the apps these names pull in
+  stop [--all] <name...>         stop the apps these names pull in
+  restart [--all] <name...>      restart the apps these names pull in
+  reload                         make the session read its configuration again
+  set <name=value...>            give parameters of the configuration a value, and replay it
+  quit                           stop the apps of the session and close it
+  state [--json]                 write what the session here is doing
+  logs [-n <lines>] [name...]    write the end of the logs, or follow them with -f
+  run [name...] [name=value...]  hold the session in this terminal, streaming the logs
+  status [--json]                write what runs on this machine, and who holds the ports
+  service [stop|restart]         start the background service and its icon, or stop it
+  update                         take a newer version of this binary, and restart the service
+  panel                          open the panel of the running sessions
+  remember                       remember the project here, so that the panel lists it cold
+  forget                         forget the project here, which the panel stops listing
+  config [name=value...]         write the resolved configuration as JSON
+  types                          write the package specifier of the TypeScript types matching this binary
+  skill                          write a skill that teaches this tool to a coding agent
+  help [command]                 write what a command does, or the list of them
 
 A name is an app, a facade — which pulls in the apps of its routes — or a group declared in the
 configuration. The session port is taken when it starts and released when it stops; every facade
@@ -290,7 +291,9 @@ export default config(params, ({ api, deployed, slowApi, products, locale }) => 
 }));
 ```
 
-**Where a value comes from.** A value is the first intention that exists: the one kept for the network if the field follows it, the session's — chosen, or brought back by the last network that had one — and the one kept for the project if it keeps it. It holds if it is among the choices of the moment and no rule disables it; otherwise the default answers — or the first enabled choice — and the intention comes back once it is possible again. On a network that kept nothing, the value in force stays. A kept value is anything but the gesture in progress; one that the rules of its field no longer take, such as a `max` lowered under it, **yields**: to the bound it crosses for `min` and `max`, to the default otherwise. The configuration applies, the intention stays in memory, and dsvs says so while it lasts, in the log: `products=20 no longer holds (at most 15): products=15 until it does`. A kept value makes the project listed, as `dsvs remember` does, and `dsvs forget` forgets it with the project.
+**Where a value comes from.** A value is the first intention that exists: the one just asked for, the one kept for the network if the field follows it, the session's — chosen, or brought back by the last network that had one — and the one kept for the project if it keeps it. It holds if it is among the choices of the moment and no rule disables it; otherwise the default answers — or the first enabled choice — and the intention comes back once it is possible again. On a network that kept nothing, the value in force stays, and what you choose there is kept for it. A kept value is anything but the gesture in progress; one that the rules of its field no longer take, such as a `max` lowered under it, **yields**: to the bound it crosses for `min` and `max`, to the default otherwise. The configuration applies, the intention stays in memory, and dsvs says so while it lasts — in the log, under the field in the panel and the TUI, in `dsvs state` and in the output of the command that replayed it: `products=20 no longer holds (at most 15): products=15 until it does`. A kept value makes the project listed, as `dsvs remember` does, and `dsvs forget` forgets it with the project.
+
+**A gesture is a submission.** `dsvs set` refuses, with its reason, a hidden, disabled or read-only field, an unreadable value, one outside the choices or disabled, and one that would make the form invalid, and nothing changes. Two linked fields are asked together: `dsvs set api=staging deployed.version=v3`. A form that the context makes invalid anyway — a default that does not hold, an error on the whole form — keeps the configuration in force, and `dsvs state` says so; at start, `dsvs run name=value` picks what makes it valid.
 
 **Hidden fields.** A hidden field has no value for the build: it is `undefined` there, every field of a hidden group too, and the build must not use it — `api === "local" ? products : 0`. The rules always see the value it keeps, which it finds again when it reappears. The types stay those of the model, since the schema is fixed: `api === "stagin"`, `p.deployed.verison` or a choice outside the list are type errors, a hidden field read without a guard is not. dsvs catches that: when a field is hidden, it builds a second time with its kept value, and if the result differs, the configuration uses it anyway and dsvs says so like a value that yields — `slowApi, products are hidden, yet apps.api.command[3] depends on them` — while the kept configuration stays the one built without it.
 
@@ -352,7 +355,7 @@ The apps follow the declaration, and no process is cut from under whoever uses i
 
 By default the apps open **no port** on the machine: they live on virtual addresses in an unprivileged network namespace, whose traffic and DNS go out through the machine's own stack, VPN and system proxy included. `--net loopback` does without it, `--net netns` requires it instead of falling back silently. The session runs again inside a transient systemd unit, its box: a hard stop then leaves no process behind, not even what a runner detaches. Without a systemd session it runs without the box, says so, and that guarantee is gone.
 
-`dsvs config` writes the configuration as dsvs sees it — defaults applied, routes ordered — in the JSON format it reads back. A configuration with a form comes out built from what a session opened here would have, without its form.
+`dsvs config` writes the configuration as dsvs sees it — defaults applied, routes ordered — in the JSON format it reads back. A configuration with a form comes out built from what a session opened here would have, plus the values asked on top, without its form: `dsvs config api=staging` is the snapshot of the shop on staging. `dsvs config --session` writes the one in force in the running session, and `--params --session` says where each value comes from.
 
 ## How it is built
 

@@ -15,16 +15,35 @@
 // # The socket carries no version
 //
 // The hub carries one, this socket none, and that is deliberate: an update moves the service to the
-// new binary before the sessions move themselves, so a new client talks for a while to old sessions —
-// and to those that, outside a systemd box, keep their binary. That is workable because what crosses
-// fits in a few verbs — start, stop, restart, reload, renew, quit, logs — written by the clients
-// exactly as the session understands them. Renaming them would get them silently ignored, and that is
-// the one thing not to do without thinking: reload used to mean "take the binary on disk", which the
-// command line now calls renew, because a reload that replaces the binary instead of rereading the
-// configuration could not be exposed as such. A session from before the rename ignores renew: the
-// update bounds each handover and then says that this session keeps its binary. The state a session
-// renders, for its part, gives the version it carries: that is what lets a handover be checked
-// instead of trusted.
+// new binary before the sessions move themselves, so a new client talks for a while to old sessions
+// — and to those that, outside a systemd box, keep their binary. That is workable because what
+// crosses fits in a few verbs — start, stop, restart, reload, renew, quit, logs, set — written by
+// the clients exactly as the session understands them. Renaming them would get them silently
+// ignored, and that is the one thing not to do without thinking: reload used to mean "take the
+// binary on disk", which the command line now calls renew, because a reload that replaces the
+// binary instead of rereading the configuration could not be exposed as such. A session from before
+// the rename ignores renew: the update bounds each handover and then says that this session keeps
+// its binary. The state a session renders, for its part, gives the version it carries: that is what
+// lets a handover be checked instead of trusted.
+//
+// # Changing a parameter, or giving an order, is a question
+//
+// set gives values to the parameters the configuration declares, and the session answers "ok" or the
+// reason for the refusal, once it has replayed its configuration; the connection then closes. It is a
+// question on its own connection, like logs, not an order on a driver's stream: the orders on that
+// stream return nothing, and a refusal is read where the gesture happened. A session from before this
+// verb answers that it does not read the greeting, and the client translates that into saying it must
+// be updated.
+//
+// start, stop and restart are likewise asked as questions, with the same words as on the stream: "ok"
+// when the order has gone out to its apps, the reason otherwise — an unknown name, an app whose order
+// queue is full. That is what makes the command line exit with an error on a refusal. An "ok" can
+// carry the rest of its line: what the session did with the order when there is something to say — a
+// facade stop that keeps an app another one serves. An older client would read it as a refusal; the
+// update moves clients to the new binary before sessions, and that is what makes it workable. A session
+// from before does not read the question; the client then sends it the order on a driver's stream, as
+// before, and without an answer — an order is too old to demand an update. The stream keeps these
+// verbs: a lent interface starts the requested apps on it, and the panel gives its own there.
 //
 // # A handover is not a departure
 //
@@ -40,9 +59,10 @@
 //
 // # Reading without attaching
 //
-// Two verbs read without lending a terminal: watch, which renders the state on every change — that is
-// what the panel consumes —, and logs, which renders the tail of the logs as one line of JSON then
-// closes. logs is a question, not a stream: following the logs means attaching as "plain".
+// Three verbs read without lending a terminal: watch, which renders the state on every change — that is
+// what the panel consumes —, logs, which renders the tail of the logs as one line of JSON then closes,
+// and config, which likewise renders the configuration in force. logs is a question, not a stream:
+// following the logs means attaching as "plain".
 //
 // # The three exits of Attach
 //

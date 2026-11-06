@@ -51,6 +51,10 @@ type Server struct {
 	stop    func()
 	because error
 
+	// told receives a word when a client got its answer from a settled session: it is what a session
+	// that gives up waits for before leaving.
+	told chan struct{}
+
 	// hosts are the interfaces being rendered. Stopping waits for them: a client that took its terminal
 	// back while the session still paints it would find it dirty.
 	hosts sync.WaitGroup
@@ -89,7 +93,7 @@ func Adopt(config string, listen, lock int) (*Server, error) {
 }
 
 func accept(sock *hub.Socket) *Server {
-	s := &Server{sock: sock, settled: make(chan struct{})}
+	s := &Server{sock: sock, settled: make(chan struct{}), told: make(chan struct{}, 1)}
 	go s.welcome()
 	return s
 }
@@ -117,10 +121,18 @@ func (s *Server) Ready(ctx context.Context, session *core.Session, stop func()) 
 	})
 }
 
-// Fail says the session will not serve, and stays long enough for someone to come and read it.
-func (s *Server) Fail(err error) {
+// Fail says the session will not serve, and stays long enough for someone to come and read it: until
+// the first client that read it, at most grace. Staying longer would make a client that came afterwards
+// — the dsvs start that follows the dsvs forget the reason advises — read a reason from before its
+// gesture. It says whether a client read it.
+func (s *Server) Fail(err error) (told bool) {
 	s.settle(func() { s.because = err })
-	time.Sleep(grace)
+	select {
+	case <-s.told:
+		return true
+	case <-time.After(grace):
+		return false
+	}
 }
 
 // Close hands back the lent terminals: the attached interfaces go away, and it waits for them to finish
@@ -160,13 +172,21 @@ func (s *Server) welcome() {
 		go func() {
 			defer s.hosts.Done()
 			s.host(conn.(*net.UnixConn))
+			select {
+			case <-s.settled:
+				select {
+				case s.told <- struct{}{}:
+				default:
+				}
+			default:
+			}
 		}()
 	}
 }
 
-// host serves a client. Two kinds: an interface, which lends its terminal for the TUI to render on,
-// and a driver, which reads the state and gives orders without showing anything. The first word says
-// which.
+// host serves a client. Three kinds: an interface, which lends its terminal for the TUI to render on,
+// a driver, which reads the state and gives orders without showing anything, and a question, which
+// gets its answer and leaves (logs, config, set, start, stop, restart). The first word says which.
 func (s *Server) host(conn *net.UnixConn) {
 	defer conn.Close()
 	greeting, fds, err := fdpass.Recv(conn)
@@ -183,6 +203,18 @@ func (s *Server) host(conn *net.UnixConn) {
 	case len(fields) >= 2 && fields[0] == "logs":
 		shut(fds)
 		s.tail(conn, number(fields[1], 50), fields[2:])
+	case len(fields) == 1 && fields[0] == "config":
+		shut(fds)
+		s.configuration(conn)
+	case len(fields) >= 2 && fields[0] == "set":
+		shut(fds)
+		s.answer(conn, func() (string, error) { return "", s.set(strings.TrimPrefix(greeting, "set")) })
+	case len(fields) >= 1 && steering[fields[0]] != nil:
+		shut(fds)
+		s.answer(conn, func() (string, error) { return s.apply(fields[0], fields[1:]) })
+	case len(fields) == 1 && fields[0] == "reload":
+		shut(fds)
+		s.answer(conn, func() (string, error) { return "", s.session.Reload() })
 	default:
 		shut(fds)
 		fmt.Fprintf(conn, "err unreadable greeting: %q\n", greeting)
@@ -246,7 +278,7 @@ func (s *Server) pilot(conn *net.UnixConn) {
 	if s.because != nil {
 		// A driver's stream is framed by line ends: a reason that contains some would stop after the
 		// first, and the path of a configuration without the fault it is blamed for says nothing.
-		fmt.Fprintf(conn, "err %s\n", strings.Join(strings.Fields(s.because.Error()), " "))
+		fmt.Fprintf(conn, "err %s\n", oneLine(s.because))
 		return
 	}
 	watching, leave := context.WithCancel(s.ctx)
@@ -277,12 +309,12 @@ func (s *Server) pilot(conn *net.UnixConn) {
 func (s *Server) tail(conn *net.UnixConn, n int, names []string) {
 	<-s.settled
 	if s.because != nil {
-		fmt.Fprintf(conn, "err %s\n", strings.Join(strings.Fields(s.because.Error()), " "))
+		fmt.Fprintf(conn, "err %s\n", oneLine(s.because))
 		return
 	}
 	wanted, err := s.wanted(names)
 	if err != nil {
-		fmt.Fprintf(conn, "err %s\n", strings.Join(strings.Fields(err.Error()), " "))
+		fmt.Fprintf(conn, "err %s\n", oneLine(err))
 		return
 	}
 	series := [][]core.Line{ending(s.session.Log)}
@@ -304,6 +336,83 @@ func (s *Server) tail(conn *net.UnixConn, n int, names []string) {
 		return
 	}
 	fmt.Fprintf(conn, "logs %s\n", text)
+}
+
+// configuration returns the configuration in force, as one line of JSON: the one dsvs config writes,
+// built from the session's values, what it watches included.
+func (s *Server) configuration(conn *net.UnixConn) {
+	<-s.settled
+	if s.because != nil {
+		fmt.Fprintf(conn, "err %s\n", oneLine(s.because))
+		return
+	}
+	cfg := s.session.Config()
+	cfg.Watch = cfg.Watched()
+	text, err := json.Marshal(cfg)
+	if err != nil {
+		fmt.Fprintf(conn, "err %s\n", oneLine(err))
+		return
+	}
+	fmt.Fprintf(conn, "config %s\n", text)
+}
+
+// answer answers a question — set, reload, start, stop, restart — once the session is settled: "ok"
+// followed by what it has to say about it, or the reason for the refusal. It is a question on its own
+// connection, not an order on a driver's stream, because a refusal must be read where the gesture
+// happened, and the orders on that stream return nothing. "ok" does not say an order is carried out —
+// a stop takes the time it takes —, the state will say so.
+func (s *Server) answer(conn *net.UnixConn, ask func() (string, error)) {
+	<-s.settled
+	said, err := "", s.because
+	if err == nil {
+		said, err = ask()
+	}
+	if err != nil {
+		fmt.Fprintf(conn, "err %s\n", oneLine(err))
+		return
+	}
+	fmt.Fprintln(conn, strings.TrimSpace("ok "+said))
+}
+
+// set gives values to the session's parameters, and returns once it has replayed. Each name=value
+// is a word, quoted the Go way when its value holds spaces; a client from before the quotes writes
+// bare words, which read the same.
+func (s *Server) set(words string) error {
+	pairs, err := split(words)
+	if err != nil {
+		return err
+	}
+	values := make(map[string]string, len(pairs))
+	for _, pair := range pairs {
+		name, value, found := strings.Cut(pair, "=")
+		if !found {
+			return fmt.Errorf("set takes name=value, not %q", pair)
+		}
+		values[name] = value
+	}
+	return s.session.Set(values)
+}
+
+// split cuts a line into words separated by blanks, a Go-quoted word keeping its own.
+func split(line string) ([]string, error) {
+	var words []string
+	for line = strings.TrimSpace(line); line != ""; line = strings.TrimSpace(line) {
+		raw := line
+		if end := strings.IndexAny(line, " \t"); end >= 0 {
+			raw = line[:end]
+		}
+		word := raw
+		if strings.HasPrefix(line, `"`) {
+			var err error
+			if raw, err = strconv.QuotedPrefix(line); err != nil {
+				return nil, fmt.Errorf("unreadable value: %s", line)
+			}
+			word, _ = strconv.Unquote(raw)
+		}
+		words = append(words, word)
+		line = line[len(raw):]
+	}
+	return words, nil
 }
 
 // saw records an attached interface, and returns what it takes to forget it when it leaves.
@@ -349,8 +458,12 @@ func (s *Server) orders(conn *net.UnixConn, resize func(cols, rows int), leave f
 				if len(fields) == 2 {
 					resize(number(fields[0], 80), number(fields[1], 24))
 				}
-			case verb == "start", verb == "stop", verb == "restart":
-				s.apply(verb, strings.Fields(rest))
+			case steering[verb] != nil:
+				// An order on this stream has no answer: its refusal is read in the session's log,
+				// which the attached interface shows.
+				if _, err := s.apply(verb, strings.Fields(rest)); err != nil {
+					s.session.Log.Addf("!! %s", oneLine(err))
+				}
 			case verb == "reload":
 				// Reread the configuration, without restarting anything. What a saved file already
 				// triggers on its own, for the imports no watched path covers.
@@ -369,27 +482,35 @@ func (s *Server) orders(conn *net.UnixConn, resize func(cols, rows int), leave f
 
 // apply carries an order to the apps these names bring along — an app, a facade or a group, exactly
 // like the command line of a new session: a client joining a session already alive has no reason to go
-// about it differently.
-func (s *Server) apply(verb string, names []string) {
+// about it differently. A stop keeps the apps an unnamed facade still serves, and says so, in the
+// session's log as well as to whoever asked. It returns what refused it: a name the session does not
+// know, or an app that already has too many pending orders.
+func (s *Server) apply(verb string, names []string) (said string, err error) {
 	wanted, err := s.wanted(names)
 	if err != nil {
-		s.session.Log.Addf("!! %v", err)
-		return
+		return "", err
 	}
+	if verb == "stop" {
+		release := s.session.Config().Release(names, wanted)
+		wanted, said = release.Stops, release.String()
+	}
+	if said != "" {
+		s.session.Log.Addf("-- %s", said)
+	}
+	var refused []error
 	for _, name := range wanted {
-		app := s.session.App(name)
-		if app == nil {
-			continue
-		}
-		switch verb {
-		case "start":
-			app.Start()
-		case "stop":
-			app.Stop()
-		case "restart":
-			app.Restart()
+		if app := s.session.App(name); app != nil {
+			refused = append(refused, steering[verb](app))
 		}
 	}
+	return said, errors.Join(refused...)
+}
+
+// steering are the orders given to an app, keyed by their verb on the socket.
+var steering = map[string]func(*core.App) error{
+	"start":   (*core.App).Start,
+	"stop":    (*core.App).Stop,
+	"restart": (*core.App).Restart,
 }
 
 // wanted returns the apps these names bring along, and all of the session's when there are none: on
@@ -417,6 +538,9 @@ func ending(journal *core.Journal) []core.Line {
 	}
 	return lines
 }
+
+// oneLine puts a reason on one line: the socket's answers are framed by line ends.
+func oneLine(err error) string { return strings.Join(strings.Fields(err.Error()), " ") }
 
 // shut closes descriptors nobody wants: a driver has no terminal to lend, and whatever it sent anyway
 // must not leak.

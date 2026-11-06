@@ -225,6 +225,48 @@ func TestNamesResolveToApps(t *testing.T) {
 	}
 }
 
+// Stopping a facade stops only the apps of its routes that no other facade serves: the api the admin
+// shares with the shop stays, and the stop says why. Also naming the app, its group or the other facade
+// takes it along.
+func TestStoppingAFacadeKeepsWhatAnotherServes(t *testing.T) {
+	t.Parallel()
+	cfg := Config{
+		Ingresses: []Ingress{
+			NewIngress(Ingress{Host: "shop.localhost", Routes: []Route{{Path: "/", App: "front"}, {Path: "/api", App: "api"}}}),
+			NewIngress(Ingress{Host: "admin.localhost", Routes: []Route{{Path: "/", App: "admin"}, {Path: "/api", App: "api"}}}),
+		},
+		Apps:   []App{{Name: "front"}, {Name: "api"}, {Name: "admin"}},
+		Groups: []Group{{Name: "back", Members: []string{"api"}}},
+	}
+	for _, c := range []struct {
+		names []string
+		stops string
+		said  string
+	}{
+		{[]string{"shop.localhost"}, "front", "stopping front; keeping api, still served by admin.localhost"},
+		{[]string{"shop.localhost", "admin.localhost"}, "api,front,admin", ""},
+		{[]string{"shop.localhost", "api"}, "api,front", ""},
+		{[]string{"shop.localhost", "back"}, "api,front", ""},
+		{[]string{"api"}, "api", ""},
+		{nil, "front,api,admin", ""},
+	} {
+		wanted, err := cfg.Wanted(c.names)
+		if c.names == nil {
+			wanted = []string{"front", "api", "admin"}
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		release := cfg.Release(c.names, wanted)
+		if got := strings.Join(release.Stops, ","); got != c.stops {
+			t.Errorf("stop %v stops %s, want %s", c.names, got, c.stops)
+		}
+		if got := release.String(); got != c.said {
+			t.Errorf("stop %v says %q, want %q", c.names, got, c.said)
+		}
+	}
+}
+
 func TestLoadRefusesWhatWouldBreakLater(t *testing.T) {
 	t.Parallel()
 	app := `{ name: "a", command: ["srv", "{port}"] }`
