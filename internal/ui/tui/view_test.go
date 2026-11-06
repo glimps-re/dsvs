@@ -342,15 +342,40 @@ func TestModalKeepsItsMargins(t *testing.T) {
 	}
 }
 
-// TestFrames asserts nothing: it prints the screens for someone to look at (go test -run Frames -v).
-func TestFrames(t *testing.T) {
-	t.Parallel()
-	base := demo(t)
-	for _, variant := range variants(t, base, 96, 20) {
-		t.Logf("── %s ──\n%s\n", variant.name, ansi.Strip(variant.frame))
+// LOOK=<dir> drops there each TUI screen as a terminal receives it, sequences included, as
+// tui-<screen>.ans: a way to read its states back without a terminal, like the panel's PNGs. cat
+// renders them.
+func TestLookLeavesTheTUIAsText(t *testing.T) {
+	into := os.Getenv("LOOK")
+	if into == "" {
+		t.Skip("LOOK=<dir> drops the screens as .ans")
 	}
-	for _, variant := range variants(t, base, 58, 14) {
-		t.Logf("── narrow · %s ──\n%s\n", variant.name, ansi.Strip(variant.frame))
+	base := demo(t)
+	shown := variants(t, base, 96, 20)
+	for _, narrow := range variants(t, base, 58, 14) {
+		shown = append(shown, variant{"narrow-" + narrow.name, narrow.frame})
+	}
+	params := resize(formed(t, formBody), 96, 20)
+	params.cursor = index(t, params, "api")
+	shown = append(shown, variant{"params", params.View().Content})
+	stale := refused(t, resize(formed(t, formBody), 96, 20))
+	shown = append(shown, variant{"config-refused", stale.View().Content},
+		variant{"card-config-refused", press(stale, "i").View().Content})
+	grouped := resize(formed(t, groupedBody), 96, 20)
+	grouped.cursor = index(t, grouped, "deployed.traces")
+	shown = append(shown, variant{"params-grouped", grouped.View().Content})
+	grouped.cursor = index(t, grouped, "products")
+	typing := press(grouped, "enter", "backspace", "backspace", "9", "9", "9", "9", "9")
+	shown = append(shown, variant{"input", typing.View().Content},
+		variant{"input-refused", press(typing, "enter").View().Content})
+	if err := grouped.session.Set(map[string]string{"api": "local"}); err != nil {
+		t.Fatal(err)
+	}
+	shown = append(shown, variant{"params-group-hidden", grouped.synced().View().Content})
+	for _, one := range shown {
+		if err := os.WriteFile(filepath.Join(into, "tui-"+one.name+".ans"), []byte(one.frame+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 
@@ -367,17 +392,23 @@ func variants(t *testing.T, base Model, width, height int) []variant {
 		item string
 		keys []string
 	}{
-		"group":             {"beta", nil},
-		"app-ready":         {"front", []string{"right"}},
-		"app-fallen":        {"admin", []string{"right"}},
-		"app-never-started": {"storybook", []string{"right"}},
-		"facade":            {"localhost", []string{"right"}},
-		"facade-subdomain":  {"admin.localhost", []string{"right"}},
-		"card-app-log":      {"front", []string{"right", "i"}},
-		"help":              {"session", []string{"?"}},
-		"no-list":           {"session", []string{"b"}},
-		"filter":            {"front", []string{"right", "/"}},
-		"console":           {"front", []string{"right", "enter"}},
+		"group":               {"beta", nil},
+		"app-ready":           {"front", []string{"right"}},
+		"app-fallen":          {"admin", []string{"right"}},
+		"app-never-started":   {"storybook", []string{"right"}},
+		"facade":              {"localhost", []string{"right"}},
+		"facade-subdomain":    {"admin.localhost", []string{"right"}},
+		"help":                {"session", []string{"?"}},
+		"no-list":             {"session", []string{"b"}},
+		"filter":              {"front", []string{"right", "/"}},
+		"console":             {"front", []string{"right", "enter"}},
+		"card-app":            {"front", []string{"i"}},
+		"card-app-log":        {"front", []string{"right", "i"}},
+		"card-facade":         {"localhost", []string{"i"}},
+		"card-session":        {"session", []string{"i"}},
+		"card-group":          {"beta", []string{"i"}},
+		"confirmation":        {"session", []string{"q"}},
+		"confirmation-cancel": {"session", []string{"q", "right"}},
 	}
 	names := slices.Sorted(maps.Keys(scripts))
 	out := make([]variant, 0, len(scripts))
@@ -516,9 +547,9 @@ func demoNet(t *testing.T, isolated bool) Model {
 		Dir:  t.TempDir(),
 		Ingresses: []config.Ingress{
 			config.NewIngress(config.Ingress{Host: "localhost", Routes: []config.Route{
-				{Path: "/front-beta/", App: "front"},
-				{Path: "/api/front", Proxy: config.Target{URL: "https://staging.example.com", ChangeOrigin: true}},
-				{Path: "/", Redirect: "/front-beta/"},
+				{Path: "/shop-beta/", App: "front"},
+				{Path: "/api", Proxy: config.Target{URL: "https://staging.example.com", ChangeOrigin: true}},
+				{Path: "/", Redirect: "/shop-beta/"},
 			}}),
 			config.NewIngress(config.Ingress{Host: "admin.localhost", Routes: []config.Route{
 				{Path: "/admin/", App: "admin"},
@@ -569,28 +600,6 @@ type upGateway struct{}
 func (upGateway) Start(context.Context) error { return nil }
 func (upGateway) Stop(context.Context) error  { return nil }
 func (upGateway) Stats(string) (int, int)     { return 127, 1 }
-
-// TestModalFrames prints the modals for someone to look at (go test -run ModalFrames -v).
-func TestModalFrames(t *testing.T) {
-	t.Parallel()
-	base := resize(demo(t), 96, 24)
-	for _, step := range []struct {
-		name string
-		item string
-		keys []string
-	}{
-		{"confirmation", "session", []string{"q"}},
-		{"confirmation-cancel", "session", []string{"q", "right"}},
-		{"help", "session", []string{"?"}},
-		{"card-facade", "localhost", []string{"i"}},
-		{"card-app", "front", []string{"i"}},
-		{"card-session", "session", []string{"i"}},
-		{"card-group", "beta", []string{"i"}},
-	} {
-		m := press(at(t, base, step.item), step.keys...)
-		t.Logf("── %s ──\n%s\n", step.name, ansi.Strip(strings.Join(boxOf(t, m), "\n")))
-	}
-}
 
 // The cursor's background must not swallow the state's colour.
 func TestCursorKeepsTheStatusColour(t *testing.T) {
@@ -862,7 +871,7 @@ func TestResizeFollowsThePanel(t *testing.T) {
 // takes.
 func TestLongLinesFold(t *testing.T) {
 	t.Parallel()
-	m := at(t, press(resize(demo(t), 96, 24), "b"), "front") // without the list, the log takes the whole screen
+	m := at(t, press(resize(demo(t), 96, 24), "b"), "front") // without the list: the log takes the whole screen
 	// No space or punctuation: what is read back must be the line, character for character.
 	long := strings.Repeat("abcdefghij", 30)
 	m.session.Apps()[0].Log.Add(long)
@@ -1371,4 +1380,283 @@ func drag(m Model, fromX, fromY, toX, toY int) (Model, tea.Cmd) {
 	m = motion(click(m, fromX, fromY), toX, toY)
 	next, cmd := m.Update(tea.MouseReleaseMsg{X: toX, Y: toY, Button: tea.MouseLeft})
 	return next.(Model), cmd
+}
+
+// A parameter is an item under the session: the name on the left, its value on the right, and ⏎ or
+// space moves it to the next choice without touching what the log displays.
+// formBody declares a choice, two flags one of which is hidden, a disabled flag and a text.
+const formBody = `import { config, disabled, form, hidden } from "dsvs";
+const params = form({ api: ["local", "staging"], slowApi: false, fakePayments: false, traces: false, branch: "main" }, (p) => {
+  hidden(p.fakePayments);
+  disabled(p.traces, { when: "only from the company network" });
+});
+export default config(params, ({ api, slowApi }) => ({
+  port: 4300,
+  ingress: [{ host: "localhost", routes: [{ path: "/", app: "front" }] }],
+  apps: [{ name: "front", command: ["sleep", "300", api, String(slowApi), "{port}"] }],
+}));`
+
+// formed sets up a real session on this configuration, which node evaluates: the list holds its
+// form.
+func formed(t *testing.T, body string) Model {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	t.Cleanup(server.Close)
+	held := core.Endpoint{IP: "127.0.0.1", Port: server.Listener.Addr().(*net.TCPAddr).Port}
+
+	path := filepath.Join(t.TempDir(), "config.dsvs.ts")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	form, cfg, err := config.Load(path, nil, config.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := core.NewSession(form, *cfg, heldNet{held, false}, ownPort{}, func(*core.Session) core.Gateway { return upGateway{} })
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		session.Run(ctx, nil)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-stopped
+	})
+
+	return newModel(session, cancel, false)
+}
+
+// A configuration the session does not apply shows on its line, and its card says why; the
+// evaluation that applies it again clears both.
+func TestARefusedConfigurationShowsOnTheSession(t *testing.T) {
+	t.Parallel()
+	m := refused(t, resize(formed(t, formBody), 120, 30))
+	if row := ansi.Strip(m.listRow(0, m.sidebarWidth(), true)); !strings.Contains(row, "✗ port 4300") {
+		t.Errorf("the session's line says nothing: %q", row)
+	}
+	card := ansi.Strip(strings.Join(boxOf(t, press(m, "i")), "\n"))
+	if !strings.Contains(card, "not applied") || !strings.Contains(card, "SyntaxError") {
+		t.Errorf("the session's card does not say why:\n%s", card)
+	}
+
+	if err := os.WriteFile(m.session.Config().Path, []byte(formBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if row := ansi.Strip(m.listRow(0, m.sidebarWidth(), true)); strings.Contains(row, "✗") {
+		t.Errorf("applied again, the session still says so: %q", row)
+	}
+}
+
+// refused breaks this session's configuration and makes it reread it: the session keeps its own,
+// and says so.
+func refused(t *testing.T, m Model) Model {
+	t.Helper()
+	if err := os.WriteFile(m.session.Config().Path, []byte(formBody+","), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.session.Reload(); err == nil {
+		t.Fatal("an unreadable configuration reloads")
+	}
+	return m
+}
+
+func TestParametersAreTurnedFromTheList(t *testing.T) {
+	t.Parallel()
+	m := resize(formed(t, formBody), 120, 30)
+	session := m.session
+	frame := ansi.Strip(m.View().Content)
+	for _, want := range []string{"api", "local", "slowApi", "○", "branch", "main"} {
+		if !strings.Contains(frame, want) {
+			t.Errorf("the list does not show %q:\n%s", want, frame)
+		}
+	}
+	if strings.Contains(frame, "fakePayments") {
+		t.Errorf("the list shows a hidden field:\n%s", frame)
+	}
+	if names := []string{m.items[1].name, m.items[2].name, m.items[3].name, m.items[4].name}; !slices.Equal(names, []string{"api", "slowApi", "traces", "branch"}) {
+		t.Fatalf("the parameters should follow the form, the list is %v", m.items)
+	}
+	value := func(name string) string {
+		field, _ := session.Form().Field(name)
+		return field.Value
+	}
+
+	m.cursor = 1
+	m = press(m, "enter")
+	if got := value("api"); got != "staging" {
+		t.Errorf("api = %q after ⏎, want staging", got)
+	}
+	m = m.synced()
+	m.cursor = 2
+	m = press(m, "space")
+	if got := value("slowApi"); got != "true" {
+		t.Errorf("slowApi = %q after space, want true", got)
+	}
+	generation := session.Generation()
+	m.cursor = 3
+	m = press(m, "enter", "space")
+	m.cursor = 4
+	m = press(m, "space")
+	if session.Generation() != generation || value("traces") != "false" || value("branch") != "main" {
+		t.Error("a disabled field or a text moved with a list gesture")
+	}
+	m = m.synced()
+	if frame := ansi.Strip(m.View().Content); !strings.Contains(frame, "●") {
+		t.Errorf("the list does not show the raised flag:\n%s", frame)
+	}
+	if m.items[m.selected].kind != kindSession {
+		t.Errorf("the log shows %q, it should stay on the session", m.items[m.selected].name)
+	}
+}
+
+// groupedBody declares a group hidden when api=local — without the build reading api: hiding the
+// group only changes the form —, a disabled flag with its reason, a bounded number and a text a
+// form rule refuses.
+const groupedBody = `import { config, disabled, form, hidden, max, min, validateTree } from "dsvs";
+const params = form({ api: ["staging", "local"], deployed: { version: ["v2", "v3"], traces: false }, products: 20, branch: "main" }, (p) => {
+  hidden(p.deployed, { when: ({ valueOf }) => valueOf(p.api) === "local" });
+  disabled(p.deployed.traces, { when: "traces are only reachable from the company network" });
+  min(p.products, 0);
+  max(p.products, 5000);
+  validateTree(p, ({ valueOf }) => (valueOf(p.branch) === "wip" ? "wip is not a branch" : null));
+});
+export default config(params, ({ products, branch }) => ({
+  port: 4300,
+  ingress: [{ host: "localhost", routes: [{ path: "/", app: "front" }] }],
+  apps: [{ name: "front", command: ["sleep", "300", String(products), branch, "{port}"] }],
+}));`
+
+// A group is written under its title, its fields indented under it, and goes with its title when
+// everything it contains is hidden — even if the configuration does not change.
+func TestParametersComeInGroups(t *testing.T) {
+	t.Parallel()
+	m := resize(formed(t, groupedBody), 120, 30)
+	list := func() []string {
+		rows, _ := m.listRows(m.listWidth(m.listPanelWidth()), false)
+		for i, line := range rows {
+			rows[i] = strings.TrimRight(ansi.Strip(line), " ")
+		}
+		return rows
+	}
+	rows := list()
+	title := slices.Index(rows, indent(childIndent)+"deployed")
+	if title < 0 || !strings.HasPrefix(rows[title+1], indent(childIndent+2)+"version") || !strings.HasPrefix(rows[title+2], indent(childIndent+2)+"traces") {
+		t.Fatalf("the deployed group is not written under its title:\n%s", strings.Join(rows, "\n"))
+	}
+
+	generation := m.session.Generation()
+	if err := m.session.Set(map[string]string{"api": "local"}); err != nil {
+		t.Fatal(err)
+	}
+	m = m.synced()
+	if m.session.Generation() != generation {
+		t.Fatal("hiding the group changed the configuration: the test no longer sees what it looks for")
+	}
+	if rows := list(); slices.ContainsFunc(rows, func(line string) bool {
+		return strings.Contains(line, "deployed") || strings.Contains(line, "traces")
+	}) {
+		t.Errorf("the hidden group stays in the list:\n%s", strings.Join(rows, "\n"))
+	}
+}
+
+// Under the cursor, a parameter states at the top of the log what it has to say: a disabled field's
+// reasons, the refusal of the last gesture made on it. Elsewhere, the log is whole.
+func TestTheLogOpensOnWhatTheParameterSays(t *testing.T) {
+	t.Parallel()
+	m := resize(formed(t, groupedBody), 120, 30)
+	head := func() string { return ansi.Strip(strings.Join(m.logPanel(false), "\n")) }
+
+	m.cursor = index(t, m, "deployed.traces")
+	if said := head(); !strings.Contains(said, "disabled: traces are only reachable from the company network") {
+		t.Errorf("a disabled flag does not say why:\n%s", said)
+	}
+	m.cursor = index(t, m, "api")
+	if said := head(); strings.Contains(said, "disabled") || strings.Contains(said, "✗") {
+		t.Errorf("a parameter with nothing to say writes:\n%s", said)
+	}
+
+	m.cursor = index(t, m, "branch")
+	m = press(m, "enter", "backspace", "backspace", "backspace", "backspace", "w", "i", "p", "enter")
+	if said := head(); !strings.Contains(said, "✗ the form refuses it: wip is not a branch") {
+		t.Errorf("the input's refusal does not read:\n%s", said)
+	}
+	if field, _ := m.session.Form().Field("branch"); field.Value != "main" {
+		t.Errorf("a refused gesture changed branch to %q", field.Value)
+	}
+	m = press(m, "enter", "enter")
+	if said := head(); strings.Contains(said, "✗") {
+		t.Errorf("the refusal survives the next gesture:\n%s", said)
+	}
+}
+
+// A chosen value the file no longer accepts yields to its bound, and the TUI says so while it
+// lasts: an arrow on its line, the sentence at the top of the log.
+func TestAValueThatNoLongerHoldsSaysSo(t *testing.T) {
+	t.Parallel()
+	m := resize(formed(t, groupedBody), 120, 30)
+	if err := m.session.Set(map[string]string{"products": "4000"}); err != nil {
+		t.Fatal(err)
+	}
+	path := m.session.Config().Path
+	if err := os.WriteFile(path, []byte(strings.Replace(groupedBody, "max(p.products, 5000)", "max(p.products, 1000)", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	m.cursor = index(t, m, "products")
+	if row := ansi.Strip(m.listRow(m.cursor, m.sidebarWidth(), true)); !strings.Contains(row, "↓ 1000") {
+		t.Errorf("the line does not say that products yields: %q", row)
+	}
+	if said := ansi.Strip(strings.Join(m.logPanel(false), "\n")); !strings.Contains(said, "↓ products=4000 no longer holds (at most 1000): products=1000 until it does") {
+		t.Errorf("the log does not open on what yields:\n%s", said)
+	}
+}
+
+// A configuration that uses a hidden field gets it said on the session's card.
+func TestTheSessionCardSaysWhatTheFormNotices(t *testing.T) {
+	t.Parallel()
+	body := strings.Replace(groupedBody, `branch, "{port}"] }]`, `branch, "{port}"], env: { V: String(deployed.version) } }]`, 1)
+	body = strings.Replace(body, "({ products, branch })", "({ products, branch, deployed })", 1)
+	m := resize(formed(t, body), 120, 30)
+	if err := m.session.Set(map[string]string{"api": "local"}); err != nil {
+		t.Fatal(err)
+	}
+	if card := ansi.Strip(strings.Join(m.sessionCard(), "\n")); !strings.Contains(card, "deployed.version, deployed.traces are hidden, yet apps.front.env.V depends on them") {
+		t.Errorf("the card does not say the configuration uses a hidden field:\n%s", card)
+	}
+}
+
+// ⏎ on a text or a number opens an input in place of its value: what is typed is written at the
+// cursor, ⏎ sends it to the session, and esc drops it without sending anything.
+func TestATextOrANumberIsTypedFromTheList(t *testing.T) {
+	t.Parallel()
+	m := resize(formed(t, groupedBody), 120, 30)
+	value := func(name string) string {
+		field, _ := m.session.Form().Field(name)
+		return field.Value
+	}
+	m.cursor = index(t, m, "products")
+	m = press(m, "enter")
+	if row := ansi.Strip(m.listRow(m.cursor, m.sidebarWidth(), true)); !strings.Contains(row, "[20 ]") {
+		t.Errorf("the input does not open on the value: %q", row)
+	}
+	m = press(m, "backspace", "backspace", "3", "0", "0", "enter")
+	if got := value("products"); got != "300" || m.input != noInput {
+		t.Errorf("products = %q after typing 300, input open: %v", got, m.input == paramInput)
+	}
+
+	generation := m.session.Generation()
+	m = press(m, "enter", "home", "9", "esc")
+	if m.session.Generation() != generation || value("products") != "300" {
+		t.Errorf("esc sent the input: products = %q", value("products"))
+	}
+	m = press(m, "enter", "home", "1", "enter")
+	if got := value("products"); got != "1300" {
+		t.Errorf("a keystroke at the start gives %q, want 1300", got)
+	}
 }
