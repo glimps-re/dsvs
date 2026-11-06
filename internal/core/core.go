@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+	"github.com/fsnotify/fsnotify"
 	"golang.org/x/sys/unix"
 
 	"dsvs/internal/config"
@@ -29,6 +32,14 @@ const (
 	eventBuffer = 256
 	gracePeriod = 5 * time.Second
 	probeEvery  = 200 * time.Millisecond
+
+	// The configuration file is watched by the kernel (inotify): this poll is only the safety net
+	// in case the bell breaks — it decides nothing, touched has the last word.
+	watchFallback = 10 * time.Second
+
+	// What an editor is given to finish its save burst — temporary file, write, rename — before
+	// comparing: a read in the middle would see a half-written file.
+	settleDelay = 50 * time.Millisecond
 
 	// What the terminal reader is given to finish draining its buffer after the process dies. The
 	// buffer is already readable by then: this delay only lets the read go through.
@@ -448,6 +459,9 @@ type Session struct {
 	// declares. Before Run, nobody supervises yet.
 	running context.Context
 	crew    sync.WaitGroup
+	// saved dates the files the configuration in force was made from: it is what the watcher
+	// compares against, and it is updated on every re-read, successful or not.
+	saved map[string]string
 }
 
 // NewSession builds the session, its apps and its facades. newGateway receives the session to read
@@ -462,6 +476,7 @@ func NewSession(cfg config.Config, network Network, front Front, newGateway func
 		Log:   NewJournal("session", logSize, defaultRows),
 	}
 	s.enlist(cfg.Apps)
+	s.saved = saved(cfg.Watched())
 	s.adopt(cfg.Ingresses)
 	s.gw = newGateway(s)
 	for _, line := range cfg.Echo {
@@ -529,6 +544,10 @@ func (s *Session) Reload() error {
 	defer s.reloading.Unlock()
 
 	current := s.Config()
+	s.mu.Lock()
+	s.saved = saved(current.Watched())
+	s.mu.Unlock()
+
 	next, err := config.Load(current.Path, current.ForcedWatch)
 	if err != nil {
 		s.LogSink(s.Log)("!! " + err.Error())
@@ -611,6 +630,147 @@ func (s *Session) adopt(declared []config.Ingress) {
 	if err := s.front.Hosts(hosts); err != nil {
 		s.Log.Addf("!! hosts not announced: %v", err)
 	}
+}
+
+// watch re-reads the configuration when one of the tool's files changes on disk: one saves in one's
+// editor, the routes follow. It is not only the entry file that is watched but all its *.dsvs.ts
+// neighbors — a configuration commonly imports its own. An event is only a bell, never a truth:
+// touched does the comparing, which absorbs bursts, duplicates, and the directory's files that are
+// none of the tool's business.
+func (s *Session) watch(ctx context.Context) {
+	bell, quiet := ring(s.Config().Watched())
+	defer quiet()
+	// What moved before the bell was set did not ring: a first look catches it, and there is no
+	// blind window left between the initial read and the watch.
+	if s.touched() {
+		_ = s.Reload()
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-bell:
+			settle(ctx, bell)
+		case <-time.After(watchFallback):
+		}
+		if s.touched() {
+			_ = s.Reload()
+		}
+	}
+}
+
+// ring sets a kernel bell on each watched directory — the directory and not the file, because most
+// editors save by renaming a temporary file over it: a bell set on the file would die with it. If
+// none can be set, it never rings: the fallback poll then does all the work, as before.
+func ring(paths []string) (<-chan struct{}, func()) {
+	bell := make(chan struct{}, 1)
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return bell, func() {}
+	}
+	posed := 0
+	for _, dir := range dirsOf(paths) {
+		if err := watcher.Add(dir); err == nil {
+			posed++
+		}
+	}
+	if posed == 0 {
+		watcher.Close()
+		return bell, func() {}
+	}
+	go func() {
+		for {
+			select {
+			case _, live := <-watcher.Events:
+				if !live {
+					return
+				}
+				select {
+				case bell <- struct{}{}:
+				default:
+				}
+			case _, live := <-watcher.Errors:
+				if !live {
+					return
+				}
+			}
+		}
+	}()
+	return bell, func() { _ = watcher.Close() }
+}
+
+// settle lets a save's burst finish, draining the bell while it rings.
+func settle(ctx context.Context, bell <-chan struct{}) {
+	deadline := time.After(settleDelay)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-bell:
+		case <-deadline:
+			return
+		}
+	}
+}
+
+// touched says whether the directory moved since the configuration was last read — at start, or on
+// a reload, successful or not.
+func (s *Session) touched() bool {
+	s.mu.RLock()
+	watched, seen := s.cfg.Watched(), s.saved
+	s.mu.RUnlock()
+	return !maps.Equal(saved(watched), seen)
+}
+
+// saved dates the watched files. A named path is dated whatever its name — it was asked for — and a
+// directory only for its configuration files: a project directory is full of other .ts files that
+// are none of the tool's business. An editor that saves changes the date or the size; an atomic
+// replacement too, the file being recreated.
+func saved(paths []string) map[string]string {
+	out := map[string]string{}
+	for _, path := range paths {
+		info, err := os.Stat(path)
+		switch {
+		case err != nil:
+			continue
+		case !info.IsDir():
+			out[path] = stamp(info)
+			continue
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), config.Suffix) {
+				continue
+			}
+			if info, err := entry.Info(); err == nil {
+				out[filepath.Join(path, entry.Name())] = stamp(info)
+			}
+		}
+	}
+	return out
+}
+
+func stamp(info os.FileInfo) string {
+	return fmt.Sprintf("%d:%d", info.ModTime().UnixNano(), info.Size())
+}
+
+// dirsOf returns the directories to set a bell on: the path itself if it is one, otherwise the one
+// containing the file. Without duplicates — two neighboring files are worth only one bell.
+func dirsOf(paths []string) []string {
+	var dirs []string
+	for _, path := range paths {
+		dir := path
+		if info, err := os.Stat(path); err != nil || !info.IsDir() {
+			dir = filepath.Dir(path)
+		}
+		if !slices.Contains(dirs, dir) {
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs
 }
 
 // reloadBrowsers asks the dev-servers to reload the page: "r" followed by enter, what their help calls
@@ -865,6 +1025,8 @@ func (s *Session) Open(ctx context.Context) error {
 // Run supervises until the context is canceled, then releases the port once the apps have stopped.
 // Only the named apps start: without a name, nothing is launched and the tool just waits.
 func (s *Session) Run(ctx context.Context, names []string) {
+	go s.watch(ctx)
+
 	s.mu.Lock()
 	s.running = ctx
 	for _, app := range s.apps {

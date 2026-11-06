@@ -744,6 +744,85 @@ func TestReloadReplacesWhatIsDeclarative(t *testing.T) {
 	}
 }
 
+// Saving is enough: the configuration is re-read without anything to ask, and saving without having
+// changed anything stirs nothing.
+func TestSavingReloads(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.FileName)
+	declare := func(target string) {
+		t.Helper()
+		body := `export default {
+    port: 4300,
+    ingress: [{ host: "localhost", routes: [{ path: "/", app: "app" }, { path: "/api", proxy: { target: "` + target + `" } }] }],
+    apps: [{ name: "app", command: ["sh", "-c", "sleep 300 & wait", "{port}"] }],
+}`
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	declare("https://first.example")
+	cfg, err := config.Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.watch(ctx)
+
+	declare("https://second.example")
+	waitFor(t, "the configuration re-read on its own", func() bool {
+		in, _ := session.Facade("localhost")
+		route, _ := in.Match("/api/x")
+		return route.Proxy.URL == "https://second.example"
+	})
+
+	// A save that changes nothing must neither stir the logs nor reload the browsers. It is
+	// digested when touched falls back: the re-read happened, all that remains is to check it said
+	// nothing.
+	before := len(session.Log.Lines())
+	declare("https://second.example")
+	waitFor(t, "the save digested", func() bool { return !session.touched() })
+	if after := len(session.Log.Lines()); after != before {
+		t.Errorf("the log grew by %d lines for a save without change", after-before)
+	}
+
+	// A project directory is full of .ts files that are none of the tool's business: only its own
+	// count.
+	if err := os.WriteFile(filepath.Join(dir, "eslint.config.ts"), []byte("export default [];"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if session.touched() {
+		t.Errorf("a file foreign to the %s suffix would make the configuration be re-read", config.Suffix)
+	}
+	// A neighbor that carries the suffix does count: that is where the targets one does not commit
+	// live.
+	if err := os.WriteFile(filepath.Join(dir, "proxies"+config.Suffix), []byte("export const api = {};"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !session.touched() {
+		t.Errorf("a neighbor in %s should make the configuration be re-read", config.Suffix)
+	}
+}
+
+// The kernel bell: a write in the directory rings at once. It is what makes the re-read immediate —
+// the fallback poll, ten thousand times slower, only covers its failure.
+func TestRingBellsOnWrite(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	bell, quiet := ring([]string{dir})
+	defer quiet()
+	if err := os.WriteFile(filepath.Join(dir, "neighbor"+config.Suffix), []byte("export {};"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-bell:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the bell did not ring for a write in the directory")
+	}
+}
+
 // The command line's port is a session choice: the file cannot take it back, and a reload therefore
 // has nothing to say about it — no "the port is taken" on every save.
 func TestForcedPortStaysQuiet(t *testing.T) {
@@ -1056,5 +1135,48 @@ func supervising(t *testing.T, session *Session) {
 		case <-time.After(10 * time.Second):
 			t.Error("the session did not stop")
 		}
+	})
+}
+
+// A JSON configuration does not carry the suffix of the tool's files, and a configuration that
+// declares its own paths no longer watches its directory: in both cases, saving it must be enough.
+// It is the configuration that is followed, not its name.
+func TestSavingAConfigWithoutTheSuffixReloads(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, config.JSONName)
+	elsewhere := filepath.Join(t.TempDir(), "targets"+config.Suffix)
+	if err := os.WriteFile(elsewhere, []byte("export const api = {};"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	declare := func(target string) {
+		t.Helper()
+		body := fmt.Sprintf(`{
+  "port": 4300,
+  "watch": [%q],
+  "ingress": [{ "host": "localhost", "routes": [
+    { "path": "/", "app": "app" },
+    { "path": "/api", "proxy": { "target": %q } }] }],
+  "apps": [{ "name": "app", "command": ["sh", "-c", "sleep 300 & wait", "{port}"] }]
+}`, elsewhere, target)
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	declare("https://first.example")
+	cfg, err := config.Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go session.watch(ctx)
+
+	declare("https://second.example")
+	waitFor(t, "the configuration re-read on its own", func() bool {
+		in, _ := session.Facade("localhost")
+		route, _ := in.Match("/api/x")
+		return route.Proxy.URL == "https://second.example"
 	})
 }
