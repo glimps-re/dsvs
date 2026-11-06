@@ -15,10 +15,12 @@ import (
 
 	"github.com/creack/pty"
 
+	"dsvs/internal/build"
 	"dsvs/internal/config"
 	"dsvs/internal/core"
 	"dsvs/internal/fdpass"
 	"dsvs/internal/hub"
+	"dsvs/internal/projects"
 )
 
 // An interface attaches on the terminal the client lends, and the session is what writes on it: none
@@ -293,6 +295,69 @@ func TestReloadAndRenewAreTwoOrders(t *testing.T) {
 	told(t, session, filepath.Base(path))
 }
 
+// forget is refused while an app of the project runs, and says what to do. Once its apps are off, it
+// forgets what the project keeps, and the session left open replays its configuration without it: the
+// kept value returns to its default.
+func TestForgetWaitsForTheAppsToStop(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.dsvs.ts")
+	body := `import { config, form, keep } from "dsvs";
+export default config(form({ env: ["local", "staging"] }, (p) => { keep(p.env); }), ({ env }) => ({
+  port: 4399,
+  ingress: [{ host: "shop.localhost", routes: [{ path: "/", app: "sleeper" }, { path: "/api", proxy: { target: "https://" + env + ".example.com" } }] }],
+  apps: [{ name: "sleeper", command: ["sh", "-c", "sleep 30", "{port}"] }],
+}));`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := projects.Keep(path, map[string]string{"env": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	form, cfg, err := config.Load(path, nil, core.InputFor(path, nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if field, _ := form.Field("env"); field.From != "kept" {
+		t.Fatalf("env comes from %s, want kept: the test keeps nothing", field.From)
+	}
+	session := supervised(t, form, *cfg)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+	link, err := Watch(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+
+	if err := link.Order("start", "sleeper"); err != nil {
+		t.Fatal(err)
+	}
+	until(t, link, func(s State) bool { return s.Apps[0].Status != "idle" })
+	if _, _, err := Forget(path); err == nil || !strings.Contains(err.Error(), "sleeper still running") || !strings.Contains(err.Error(), build.Name()+" stop --all") {
+		t.Errorf("forget while sleeper runs = %v, want a refusal that says what to do", err)
+	}
+	if kept := projects.Recall(path); kept["env"] != "staging" {
+		t.Errorf("the refusal forgot the values: %v", kept)
+	}
+
+	if err := link.Order("stop", "sleeper"); err != nil {
+		t.Fatal(err)
+	}
+	until(t, link, func(s State) bool { return s.Apps[0].Status == "idle" })
+	if _, valued, err := Forget(path); err != nil || !valued {
+		t.Fatalf("forget once sleeper stopped = %v, %v", valued, err)
+	}
+	if kept := projects.Recall(path); len(kept) > 0 {
+		t.Errorf("kept values after forget = %v", kept)
+	}
+	if field, _ := session.Form().Field("env"); field.Value != "local" || field.From != "default" {
+		t.Errorf("env = %s, from %s after forget, want local, from default", field.Value, field.From)
+	}
+}
+
 // told waits for this text in the session's log: an order arrives through the socket, and what it
 // yields is written in a goroutine other than the test's.
 func told(t *testing.T, session *core.Session, text string) {
@@ -352,7 +417,12 @@ func running(t *testing.T) (*core.Session, string) {
 		},
 		Ingresses: []config.Ingress{config.NewIngress(config.Ingress{Host: "shop.localhost"})},
 	}
-	session := core.NewSession(config.Form{}, cfg, core.Loopback{}, noFront{}, func(*core.Session) core.Gateway { return idleGateway{} })
+	return supervised(t, config.Form{}, cfg), cfg.Path
+}
+
+func supervised(t *testing.T, form config.Form, cfg config.Config) *core.Session {
+	t.Helper()
+	session := core.NewSession(form, cfg, core.Loopback{}, noFront{}, func(*core.Session) core.Gateway { return idleGateway{} })
 	ctx, cancel := context.WithCancel(context.Background())
 	stopped := make(chan struct{})
 	go func() {
@@ -363,7 +433,7 @@ func running(t *testing.T) (*core.Session, string) {
 		cancel()
 		<-stopped
 	})
-	return session, cfg.Path
+	return session
 }
 
 func bind(t *testing.T, path string) *Server {

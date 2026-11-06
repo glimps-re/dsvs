@@ -31,10 +31,10 @@
 // it had, and its supervisor withdraws itself as soon as it stops — "no longer declared and
 // stopped" is therefore not a representable state. The session owns the intents chosen since it
 // started, which the handover carries, and the last evaluated form; each replay hands it those
-// intents, and the configuration engine derives the values from them. An evaluation that fails, or
-// that yields an invalid form, keeps the configuration in force, and the session says why
-// (NotApplied) — it is the only one to say it — until the evaluation that applies the file again,
-// and which the log tells.
+// intents and what the project keeps, and the configuration engine derives the values from them. An
+// evaluation that fails, or that yields an invalid form, keeps the configuration in force, and the
+// session says why (NotApplied) — it is the only one to say it — until the evaluation that applies
+// the file again, and which the log tells.
 //
 // # The handover, and what Pdeathsig costs it
 //

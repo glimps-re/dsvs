@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 
 	"dsvs/internal/config"
+	"dsvs/internal/projects"
 )
 
 const (
@@ -560,14 +561,14 @@ func (s *Session) Facades() []*Ingress {
 	return s.ingresses
 }
 
-// Reload replays the configuration with the session's intents: it is what replaces what is
-// declarative — the facades, their routes, their targets, the groups, and the list of apps. What is
-// alive does not reload — the port is taken, the subnet is carved out, a process does not change
-// command midway: an app whose declaration moved says so and waits for its restart, a removed app
-// runs until it is stopped. An unreadable or invalid configuration changes nothing: the session
-// carries on with the running one. Neither does an invalid form, but it is the one the session shows
-// from then on, with its errors. In every case it says why (NotApplied), until the evaluation that
-// applies the file again, and which the log tells.
+// Reload replays the configuration with the session's intents and what the project keeps: it is what
+// replaces what is declarative — the facades, their routes, their targets, the groups, and the list of
+// apps. What is alive does not reload — the port is taken, the subnet is carved out, a process does
+// not change command midway: an app whose declaration moved says so and waits for its restart, a
+// removed app runs until it is stopped. An unreadable or invalid configuration changes nothing: the
+// session carries on with the running one. Neither does an invalid form, but it is the one the session
+// shows from then on, with its errors. In every case it says why (NotApplied), until the evaluation
+// that applies the file again, and which the log tells.
 func (s *Session) Reload() error { return s.replay() }
 
 // Form returns the last evaluated form: what an interface shows of the parameters.
@@ -575,6 +576,13 @@ func (s *Session) Form() config.Form {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.form
+}
+
+// InputFor returns the input of an evaluation of this configuration: what a gesture asks, what the
+// session chose, and what the project keeps. It is the rule of every replay, and that of a session's
+// first load.
+func InputFor(path string, session, asked map[string]string) config.Input {
+	return config.Input{Asked: asked, Session: session, Kept: projects.Recall(path)}
 }
 
 // NotApplied says, in one line, why the configuration in force is not the one the file builds for
@@ -598,7 +606,7 @@ func (s *Session) replay() error {
 	intents := maps.Clone(s.intents)
 	s.mu.Unlock()
 
-	form, built, err := config.Load(current.Path, current.ForcedWatch, config.Input{Session: intents})
+	form, built, err := config.Load(current.Path, current.ForcedWatch, InputFor(current.Path, intents, nil))
 	if err != nil {
 		// The log keeps the whole failure, including what the program said; the status reads its head.
 		why := headline(current.Path, err)
@@ -610,6 +618,12 @@ func (s *Session) replay() error {
 	shown := s.form
 	s.form = form
 	s.mu.Unlock()
+	// What the form says is logged when it starts, not on every replay while it lasts.
+	for _, said := range form.Yields() {
+		if !slices.Contains(shown.Yields(), said) {
+			s.LogSink(s.Log)("-- " + said)
+		}
+	}
 	if built == nil {
 		problems := strings.Join(form.Problems(), "; ")
 		s.lags(problems)

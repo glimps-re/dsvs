@@ -477,7 +477,7 @@ func (p *panel) act(z zone) bool {
 		go p.wake(z.config)
 		return true
 	case forget:
-		if !p.reported(z.config, projects.Forget(z.config)) {
+		if _, _, err := projects.Forget(z.config); !p.reported(z.config, err) {
 			return true
 		}
 		// What runs carries on: one forgets an address, one does not stop a session. It therefore keeps

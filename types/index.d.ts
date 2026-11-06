@@ -181,9 +181,11 @@ export type TreeError = string | { field?: Path<unknown>; message: string } | nu
 
 /**
  * Declares the fields and their rules. The schema is replayed at each evaluation, with what the machine
- * shows: it only declares. A move that would make the form invalid is refused, and an evaluation
- * without a move that makes it invalid keeps the configuration in force. Prefer shape to validation:
- * `choices` that removes a value makes it fall back to the default, where `validateTree` refuses.
+ * shows: it only declares. A move that would make the form invalid is refused. A kept value — by the
+ * session, `keep` or `network` — that the rules of its field no longer accept yields, and dsvs says so:
+ * to the bound it exceeds for `min` and `max`, to the default otherwise, and it comes back as soon as
+ * it holds. An evaluation the form refuses anyway — a default that does not hold, an error of the whole
+ * form — keeps the configuration in force.
  */
 export declare function form<const M extends Model>(model: M, schema?: Schema<Values<M>>): Form<M>;
 
@@ -212,6 +214,11 @@ export declare function hidden<V>(path: Path<V>, options?: { when?: Logic<V, boo
 export declare function disabled<V>(path: Path<V>, options?: { when?: Logic<V, boolean | string> }): void;
 /** Shown, not settable and not validated: an imposed value. */
 export declare function readonly<V>(path: Path<V>, options?: { when?: Logic<V, boolean> }): void;
+/**
+ * The chosen value outlives the session, for this project on this machine, and the project is from then
+ * on remembered, as by `dsvs remember`.
+ */
+export declare function keep<V>(path: Path<V>, options?: { when?: Logic<V, boolean> }): void;
 
 /** The current choices, in display order. On a text or a number, they restrict it. */
 export declare function choices<V extends Leaf>(path: Path<V>, list: Logic<V, readonly NoInfer<V>[]>): void;

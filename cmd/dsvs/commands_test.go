@@ -178,10 +178,10 @@ func TestOptionsAreTakenAfterTheArguments(t *testing.T) {
 	}
 }
 
-// state and status take no argument: giving one is an error that says so, rather than a word nobody
-// reads.
+// state, status, remember and forget take no argument: giving one is an error that says so, rather
+// than a word nobody reads.
 func TestReadingCommandsRefuseAnArgument(t *testing.T) {
-	for _, name := range []string{"state", "status"} {
+	for _, name := range []string{"state", "status", "remember", "forget"} {
 		if err := dispatch(&shape{}, []string{name, "api"}); err == nil ||
 			!strings.Contains(err.Error(), "takes no argument") {
 			t.Errorf("dsvs %s api = %v; want the argument refused", name, err)
