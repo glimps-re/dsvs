@@ -5,6 +5,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +30,7 @@ export default async () => ({
     apps: ["shop", "admin"].map(app),
 });`)
 
-	cfg, err := Load(path, nil)
+	_, cfg, err := Load(path, nil, Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +66,7 @@ export default {
     apps: [{ name: "a", command: ["srv", "{port}"] }],
 }`)
 
-	cfg, err := Load(path, nil)
+	_, cfg, err := Load(path, nil, Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +90,7 @@ export default {
     ],
 }`)
 
-	cfg, err := Load(path, nil)
+	_, cfg, err := Load(path, nil, Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,12 +113,12 @@ func TestLoadErrorsCarryTheCause(t *testing.T) {
 		return line
 	}
 
-	if _, err := Load(path, nil); first(err) != path+":3:11: Error: the worktree has no proxies" {
+	if _, _, err := Load(path, nil, Input{}); first(err) != path+":3:11: Error: the worktree has no proxies" {
 		t.Errorf("first line %q, want the thrown error and its place", first(err))
 	}
 
 	path = write(t, "export default {\n  port: 4200,, apps: [] };")
-	if _, err := Load(path, nil); !strings.HasPrefix(first(err), path+":2:14: SyntaxError") {
+	if _, _, err := Load(path, nil, Input{}); !strings.HasPrefix(first(err), path+":2:14: SyntaxError") {
 		t.Errorf("a syntax error reads %q", first(err))
 	}
 
@@ -128,18 +129,18 @@ export default { port: 4200, apps: [], ingress: [{ host: "a.localhost", routes: 
 	if err := os.WriteFile(imported, []byte("export function target() {\n  throw new Error(\"no target\");\n}\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(path, nil); first(err) != imported+":2:9: Error: no target" {
+	if _, _, err := Load(path, nil, Input{}); first(err) != imported+":2:9: Error: no target" {
 		t.Errorf("an error thrown in an import reads %q", first(err))
 	}
 
 	// A missing import is reported at the line of the import, which node does not give, and its paths
 	// read from the project.
 	path = write(t, "// the apps live elsewhere\nimport { apps } from \"./apps.dsvs.ts\";\nimport { z } from 'zod-absent';\nexport default { port: 4200, apps };")
-	if _, err := Load(path, nil); first(err) != path+":2:22: Error [ERR_MODULE_NOT_FOUND]: Cannot find module 'apps.dsvs.ts' imported from config.dsvs.ts" {
+	if _, _, err := Load(path, nil, Input{}); first(err) != path+":2:22: Error [ERR_MODULE_NOT_FOUND]: Cannot find module 'apps.dsvs.ts' imported from config.dsvs.ts" {
 		t.Errorf("a missing import reads %q", first(err))
 	}
 	path = write(t, "import { z } from 'zod-absent';\nexport default { port: 4200 };")
-	if _, err := Load(path, nil); !strings.HasPrefix(first(err), path+":1:19: Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'zod-absent' imported from ") {
+	if _, _, err := Load(path, nil, Input{}); !strings.HasPrefix(first(err), path+":1:19: Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'zod-absent' imported from ") {
 		t.Errorf("a missing package reads %q", first(err))
 	}
 }
@@ -159,7 +160,7 @@ func TestHostChoosesTheFacade(t *testing.T) {
     ],
 }`)
 
-	cfg, err := Load(path, nil)
+	_, cfg, err := Load(path, nil, Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,7 +204,7 @@ func TestNamesResolveToApps(t *testing.T) {
     groups: [{ name: "everything", members: ["shop", "admin"] }],
 }`)
 
-	cfg, err := Load(path, nil)
+	_, cfg, err := Load(path, nil, Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,7 +285,7 @@ func TestLoadRefusesWhatWouldBreakLater(t *testing.T) {
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			if _, err := Load(write(t, "export default "+body), nil); err == nil {
+			if _, _, err := Load(write(t, "export default "+body), nil, Input{}); err == nil {
 				t.Fatal("configuration accepted although it is invalid")
 			}
 		})
@@ -326,7 +327,7 @@ func TestAKeyOrATypeTheConfigurationDoesNotReadIsRefusedInItsWords(t *testing.T)
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			_, err := Load(write(t, "export default "+c.body), nil)
+			_, _, err := Load(write(t, "export default "+c.body), nil, Input{})
 			if err == nil || !strings.HasSuffix(err.Error(), string(filepath.Separator)+c.said) {
 				t.Errorf("refusal = %v, want %q", err, c.said)
 			}
@@ -441,7 +442,7 @@ func TestLoadReadsAStaticConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := Load(path, nil)
+	_, cfg, err := Load(path, nil, Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +512,7 @@ func TestWatchedPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg, err := Load(path, nil)
+	_, cfg, err := Load(path, nil, Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,8 +535,27 @@ func TestWatchedPaths(t *testing.T) {
 
 func write(t *testing.T, body string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), FileName)
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+	return writeFile(t, FileName, body, 0o644)
+}
+
+// programs writes these executable configurations, then makes the test parallel: this order is what
+// prevents a "text file busy". A file still open for writing while a neighboring test forks passes into
+// the child until its exec, and launching the program fails as long as the child holds it. Before
+// t.Parallel(), parallel tests wait, and none forks.
+func programs(t *testing.T, bodies ...string) []string {
+	t.Helper()
+	paths := make([]string, len(bodies))
+	for i, body := range bodies {
+		paths[i] = writeFile(t, "config.sh", body, 0o755)
+	}
+	t.Parallel()
+	return paths
+}
+
+func writeFile(t *testing.T, name, body string, mode os.FileMode) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -580,11 +600,169 @@ func TestAConfigurationThatHangsIsCutShort(t *testing.T) {
 	path := write(t, "setInterval(() => {}, 1000);\nawait new Promise(() => {});\nexport default {};")
 
 	start := time.Now()
-	_, err := Load(path, nil)
+	_, _, err := Load(path, nil, Input{})
 	if err == nil || !strings.Contains(err.Error(), "did not answer within") {
 		t.Fatalf("Load = %v, want did not answer within", err)
 	}
 	if took := time.Since(start); took > time.Second {
 		t.Errorf("the error came after %s, want under a second", took)
+	}
+}
+
+const minimalJSON = `"port": 4380, "ingress": [{ "routes": [{ "path": "/", "app": "a" }] }], "apps": [{ "name": "a", "command": ["srv", "{port}"] }]`
+
+const minimal = `port: 4380, ingress: [{ routes: [{ path: "/", app: "a" }] }], apps: [{ name: "a", command: ["srv", "{port}"] }]`
+
+// paramsConfig is a configuration with two parameters, whose build returns what it received: that is
+// what the test reads to know what the program saw.
+const paramsConfig = `
+import { config, form } from "dsvs";
+export default config(form({ env: ["local", "staging"], slow: false }), ({ env, slow }, observed) => ({
+  ` + minimal + `,
+  ingress: [{ routes: [
+    { path: "/", app: "a" },
+    { path: "/api", ...(env === "local" ? { app: "a" } : { proxy: { target: "https://staging.example.com" } }) },
+  ] }],
+  apps: [{ name: "a", command: ["srv", "{port}"], env: { SLOW: typeof slow + ":" + slow, SEEN: JSON.stringify(observed) } }],
+}));`
+
+func TestAConfigurationWithoutAFormHasAnEmptyOne(t *testing.T) {
+	t.Parallel()
+	for name, path := range map[string]string{
+		"an object":  write(t, "export default {"+minimal+"}"),
+		"a function": write(t, "export default (values, observed) => ({"+minimal+", subnet: Object.keys(values).length ? 'x' : undefined})"),
+		"a .json":    writeFile(t, JSONName, `{`+minimalJSON+`}`, 0o644),
+	} {
+		form, cfg, err := Load(path, nil, Input{Asked: map[string]string{"env": "staging"}})
+		switch {
+		case err != nil:
+			t.Errorf("%s: %v", name, err)
+		case len(form.Fields) != 0 || cfg.Port != 4380:
+			t.Errorf("%s: form %+v, port %d", name, form, cfg.Port)
+		}
+	}
+}
+
+func TestTheOldParamsExportSaysWhatReplacesIt(t *testing.T) {
+	t.Parallel()
+	path := write(t, `export const params = { env: ["local", "staging"] };
+export default ({ env }) => ({`+minimal+`});`)
+	_, _, err := Load(path, nil, Input{})
+	if err == nil || !strings.Contains(err.Error(), `export const params is replaced by form() from "dsvs": see the types`) {
+		t.Errorf("Load = %v, want the message that says what replaces it", err)
+	}
+}
+
+func TestTheInputChoosesTheValuesTheConfigurationIsBuiltFrom(t *testing.T) {
+	t.Parallel()
+	form, cfg, err := Load(write(t, paramsConfig), nil, Input{Asked: map[string]string{"env": "staging", "slow": "true"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target := cfg.Ingresses[0].Routes[0].Proxy.URL; target != "https://staging.example.com" {
+		t.Errorf("target of /api = %q, want the staging one", target)
+	}
+	if got := cfg.Apps[0].Env["SLOW"]; got != "boolean:true" {
+		t.Errorf("the build received %q, want boolean:true", got)
+	}
+	env, _ := form.Field("env")
+	if next := env.Next(); next != "local" {
+		t.Errorf("Next after staging = %q, want the return to the first choice", next)
+	}
+	if slow, _ := form.Field("slow"); slow.Type != "flag" || !slices.Equal(slow.Choices, []string{"false", "true"}) {
+		t.Errorf("slow = %+v, want a flag, the default first", slow)
+	}
+}
+
+func TestTheFunctionReceivesWhatTheMachineShows(t *testing.T) {
+	t.Parallel()
+	path := write(t, paramsConfig)
+	_, none, err := Load(path, nil, Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := none.Apps[0].Env["SEEN"]; got != "null" {
+		t.Errorf("observed = %s, want null", got)
+	}
+	seen := &Observed{Links: []Link{{Name: "tun0", Type: "tuntap", Addrs: []string{"10.8.0.2/24"}}}}
+	_, cfg, err := Load(path, nil, Input{Observed: seen})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Apps[0].Env["SEEN"]; got != `{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}]}` {
+		t.Errorf("observed = %s", got)
+	}
+	if cfg.Observed != seen {
+		t.Error("the configuration must keep the observation it is made from")
+	}
+}
+
+func TestAFormIsValidated(t *testing.T) {
+	// A program returns what it wants, including what the engine could not write.
+	cases := map[string]string{
+		"empty name":               `[{"name":"","type":"choice","choices":["a"],"value":"a","from":"default"}]`,
+		"name with a space":        `[{"name":"a b","type":"choice","choices":["a"],"value":"a","from":"default"}]`,
+		"the same one twice":       `[{"name":"env","type":"text","value":"a","from":"default"},{"name":"env","type":"text","value":"a","from":"default"}]`,
+		"unknown type":             `[{"name":"env","type":"date","value":"a","from":"default"}]`,
+		"no choice":                `[{"name":"env","type":"choice","value":"","from":"default"}]`,
+		"choice with a space":      `[{"name":"env","type":"choice","choices":["a b"],"value":"a b","from":"default"}]`,
+		"duplicate choice":         `[{"name":"env","type":"choice","choices":["a","a"],"value":"a","from":"default"}]`,
+		"value off the choices":    `[{"name":"env","type":"choice","choices":["a"],"value":"b","from":"default"}]`,
+		"flag without its choices": `[{"name":"slow","type":"flag","choices":["yes","no"],"value":"yes","from":"default"}]`,
+		"unreadable number":        `[{"name":"delay","type":"number","value":"abc","from":"default"}]`,
+		"unknown origin":           `[{"name":"env","type":"text","value":"a","from":"somewhere"}]`,
+		"reason on 2 lines":        `[{"name":"env","type":"text","value":"a","from":"default","disabled":true,"reasons":["a\nb"]}]`,
+	}
+	names := slices.Sorted(maps.Keys(cases))
+	scripts := make([]string, len(names))
+	for i, name := range names {
+		scripts[i] = "#!/bin/sh\ncat <<'JSON'\n" + `{"form":{"fields":` + cases[name] + `},"config":{` + minimalJSON + "}}\nJSON\n"
+	}
+	paths := programs(t, scripts...)
+	for i, name := range names {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if _, _, err := Load(paths[i], nil, Input{}); err == nil {
+				t.Fatal("form accepted although it is invalid")
+			}
+		})
+	}
+}
+
+// A valid form builds a configuration: a program that returns none is mistaken, and saying so is better
+// than waiting on a form that does not say why.
+func TestAValidFormThatBuildsNothingIsAnError(t *testing.T) {
+	path := programs(t, "#!/bin/sh\necho '{\"form\":{\"fields\":[]},\"config\":null}'\n")[0]
+	_, _, err := Load(path, nil, Input{})
+	if err == nil || !strings.Contains(err.Error(), "built no configuration") {
+		t.Errorf("Load = %v, want a refusal that says why", err)
+	}
+}
+
+func TestAProgramOfAnotherLanguageIsLoaded(t *testing.T) {
+	script := `#!/bin/sh
+case "$DSVS_INPUT" in *'"asked":{"env":"staging"}'*) env=staging from=asked ;; *) env=local from=default ;; esac
+cat <<JSON
+{"form":{"fields":[{"name":"env","type":"choice","choices":["local","staging"],"value":"$env","from":"$from"}]},
+ "config":{"port":4380,"ingress":[{"routes":[{"path":"/","app":"a"}]}],
+ "apps":[{"name":"a","command":["srv","{port}"],"env":{"ENV":"$env"}}]}}
+JSON
+echo said >&2
+`
+	path := programs(t, script)[0]
+	form, cfg, err := Load(path, nil, Input{Asked: map[string]string{"env": "staging"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env, _ := form.Field("env"); cfg.Apps[0].Env["ENV"] != "staging" || env.Value != "staging" || form.Accept(map[string]string{"env": "staging"}) != nil {
+		t.Errorf("env = %q, form %+v", cfg.Apps[0].Env["ENV"], form)
+	}
+	if !slices.Equal(cfg.Echo, []string{"said"}) {
+		t.Errorf("Echo = %v, want what the program said on stderr", cfg.Echo)
+	}
+
+	_, _, err = Load(writeFile(t, "config.sh", script, 0o644), nil, Input{})
+	if err == nil || !strings.Contains(err.Error(), "executable program") {
+		t.Errorf("Load of a non-executable file = %v, want a refusal that says why", err)
 	}
 }

@@ -1,5 +1,7 @@
-// Shape of what config.dsvs.ts exports. The file is code, run by node, which strips its types: it can
-// derive its apps from a helper, the workspace or the environment, only the result counts.
+// Shape of what config.dsvs.ts exports, and declarations of the form of its parameters. The file is
+// code, run by node, which strips its types: it can derive its apps from a helper, the workspace or
+// the environment, only the result counts. The code of `form()` and its rules comes from the binary,
+// which serves it under the name "dsvs": this package carries only its types.
 export interface Config {
   /** The only port open on the machine, like the ingress controller in production. */
   port: number;
@@ -100,3 +102,156 @@ export interface App {
 }
 
 export type Color = "red" | "green" | "yellow" | "blue" | "magenta" | "cyan";
+
+/**
+ * The model of a form: each field by its default, which also gives its type. A boolean makes a flag,
+ * a number a number, a text a text, a list of texts a choice — the default first, and the list is the
+ * universe of its values —, an object a group, whose name precedes those of its fields
+ * (`api.deployment`). The order is the display order.
+ */
+export type Model = { readonly [name: string]: boolean | number | string | readonly [string, ...string[]] | Model };
+
+/**
+ * The values the build receives: a boolean per flag, a number per number, a text per text, one of the
+ * values of each choice. A hidden or disabled field has its own too: its effective value, the one it
+ * takes back when it returns.
+ */
+export type Values<M> = {
+  -readonly [K in keyof M]: M[K] extends readonly string[]
+    ? M[K][number]
+    : M[K] extends boolean
+      ? boolean
+      : M[K] extends number
+        ? number
+        : M[K] extends string
+          ? string
+          : Values<M[K]>;
+};
+
+declare const valueOfPath: unique symbol;
+
+/** A path in the form, typed by the value it designates: `p.api.deployment`. */
+export type Path<V> = { readonly [valueOfPath]?: V } & (V extends string | number | boolean
+  ? {}
+  : { readonly [K in keyof V]-?: Path<V[K]> });
+
+/** What a field is, for another rule. */
+export interface FieldState {
+  hidden: boolean;
+  disabled: boolean;
+  readonly: boolean;
+}
+
+/**
+ * What a rule reads. It adapts to the values through `valueOf`, which is reactive, and to the network by
+ * closing over `observed`, which the schema receives: an evaluation is a fresh process, whose context
+ * is fixed.
+ */
+export interface Context<V> {
+  /** The value of the field or group the rule is set on. */
+  value(): V;
+  valueOf<T>(path: Path<T>): T;
+  stateOf(path: Path<unknown>): FieldState;
+  /** The path the rule is set on: what tells a schema applied to two groups which one it is in. */
+  pathKeys(): readonly string[];
+}
+
+/** A rule: a value, or a pure function of what it reads. No rule writes. */
+export type Logic<V, R> = R | ((context: Context<V>) => R);
+
+type Leaf = string | number | boolean;
+
+declare const modelOfForm: unique symbol;
+
+/** What `form()` returns, and `config()` consumes. */
+export interface Form<M> {
+  readonly [modelOfForm]: M;
+}
+
+/** What `config()` returns: the configuration's default export. */
+export interface Configuration {
+  readonly [modelOfForm]: "configuration";
+}
+
+/** A set of rules, applied to a path, to two groups for instance. */
+export type Schema<V> = (path: Path<V>, observed: Observed | null) => void;
+
+/** An error of `validateTree`: a message for the form, or attached to a field. */
+export type TreeError = string | { field?: Path<unknown>; message: string } | null | undefined | false;
+
+/**
+ * Declares the fields and their rules. The schema is replayed at each evaluation, with what the machine
+ * shows: it only declares. A move that would make the form invalid is refused, and an evaluation
+ * without a move that makes it invalid keeps the configuration in force. Prefer shape to validation:
+ * `choices` that removes a value makes it fall back to the default, where `validateTree` refuses.
+ */
+export declare function form<const M extends Model>(model: M, schema?: Schema<Values<M>>): Form<M>;
+
+/**
+ * Builds the configuration from the resolved values of the form, when it is valid: this is the default
+ * export. `async` is allowed.
+ */
+export declare function config<M>(
+  form: Form<M>,
+  build: (values: Values<M>, observed: Observed | null) => Config | Promise<Config>,
+): Configuration;
+
+/** A schema to apply; the function itself, typed. */
+export declare function schema<V>(schema: Schema<V>): Schema<V>;
+export declare function apply<V>(path: Path<V>, schema: Schema<V>): void;
+/** The rules of the schema only hold while the condition holds, read on the path. */
+export declare function applyWhen<V>(path: Path<V>, when: (context: Context<V>) => boolean, schema: Schema<V>): void;
+export declare function applyWhenValue<V>(path: Path<V>, predicate: (value: V) => boolean, schema: Schema<V>): void;
+
+/**
+ * The field, or everything the group contains, exists for no interface: neither shown, nor validated,
+ * nor settable. Its value is kept, and comes back with it.
+ */
+export declare function hidden<V>(path: Path<V>, options?: { when?: Logic<V, boolean> }): void;
+/** Shown, inert, and not validated. A reason, if there is one, is written under the field and in the refusal. */
+export declare function disabled<V>(path: Path<V>, options?: { when?: Logic<V, boolean | string> }): void;
+/** Shown, not settable and not validated: an imposed value. */
+export declare function readonly<V>(path: Path<V>, options?: { when?: Logic<V, boolean> }): void;
+
+/** The current choices, in display order. On a text or a number, they restrict it. */
+export declare function choices<V extends Leaf>(path: Path<V>, list: Logic<V, readonly NoInfer<V>[]>): void;
+/** The current default, as long as nobody has chosen; a choice made comes back as soon as it is possible. */
+export declare function defaultValue<V extends Leaf>(path: Path<V>, value: Logic<V, NoInfer<V>>): void;
+
+export declare function required(path: Path<string> | Path<boolean>, options?: { when?: Logic<string, boolean>; message?: string }): void;
+export declare function min(path: Path<number>, bound: Logic<number, number>, options?: { message?: string }): void;
+export declare function max(path: Path<number>, bound: Logic<number, number>, options?: { message?: string }): void;
+export declare function minLength(path: Path<string>, bound: Logic<string, number>, options?: { message?: string }): void;
+export declare function maxLength(path: Path<string>, bound: Logic<string, number>, options?: { message?: string }): void;
+export declare function pattern(path: Path<string>, pattern: Logic<string, RegExp>, options?: { message?: string }): void;
+/**
+ * Returns a message when the value is wrong. May be `async`: the evaluation waits for it, within its
+ * ten seconds, at each replay.
+ */
+export declare function validate<V extends Leaf>(
+  path: Path<V>,
+  logic: (context: Context<V>) => string | null | undefined | false | Promise<string | null | undefined | false>,
+): void;
+/** The rule of a group or of the whole form; may be `async`. */
+export declare function validateTree<V>(
+  path: Path<V>,
+  logic: (context: Context<V>) => TreeError | readonly TreeError[] | Promise<TreeError | readonly TreeError[]>,
+): void;
+
+/**
+ * What the machine shows, and nobody sets. null when nothing observes it: netlink failed, and the
+ * session's log says why.
+ */
+export interface Observed {
+  /** The interfaces that are up and have at least one global address, sorted by name. */
+  links: Link[];
+}
+
+export interface Link {
+  /** `"wlan0"`, `"tun0"`, `"wg0"`… */
+  name: string;
+  /** The type the kernel gives it: `"device"`, `"tuntap"`, `"wireguard"`, `"bridge"`… */
+  type: string;
+  /** Its global addresses, in CIDR: `"10.8.0.2/24"`. */
+  addrs: string[];
+}

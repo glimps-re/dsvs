@@ -183,7 +183,7 @@ Node strips the types without checking them: `satisfies Config` only protects yo
 
 ### The TypeScript types
 
-The `types/` package declares every field and documents it: it is the reference. It holds declarations only, imported with `import type`: the package is therefore not needed for the configuration to run, and a project installs it as an optional dependency, pinned to the tag of the binary:
+The `types/` package declares every field and documents it: it is the reference. It holds declarations only: the code of `form()` and its rules comes from the binary, which serves it under the name `"dsvs"` to the configuration and to what it imports. The package is therefore not needed for the configuration to run, and a project installs it as an optional dependency, pinned to the tag of the binary:
 
 ```sh
 pnpm add --save-optional "dsvs@$(dsvs types)"
@@ -230,6 +230,78 @@ The specifier is a `git+ssh` URL on this repository, so it needs an SSH key that
 | `dir` | string | Working directory, absolute or relative to the configuration. Default: its folder. |
 | `color` | string | Its color in the logs: `red`, `green`, `yellow`, `blue`, `magenta` or `cyan`. Default: taken from a palette, in order. |
 
+### Parameters: a form
+
+A configuration can declare **parameters**: a form that the build consumes. `form(model, schema)` declares the fields by their default — a boolean makes a flag, a number a number, a string a text, a list a choice with the default first, an object a group — and the schema sets their rules; `config(form, build)` builds the configuration from the resolved values, once the form is valid. The rules are those of Angular's Signal Forms — `hidden`, `disabled`, `readonly`, `required`, `min`, `max`, `minLength`, `maxLength`, `pattern`, `validate`, `validateTree`, `apply`, `applyWhen` — plus two: `choices` and `defaultValue` give the choices and default of the moment.
+
+For a shop whose API comes from the local server (the api app) or from a deployed one:
+
+```ts
+import { config, form, max, min } from "dsvs";
+
+const params = form({ api: ["local", "staging", "demo"], products: 20 }, (p) => {
+  min(p.products, 0);
+  max(p.products, 5000);
+});
+
+export default config(params, ({ api, products }) => ({
+  port: 4380,
+  ingress: [{ host: "shop.localhost", routes: [{ path: "/", app: "front" }, { path: "/api", ...(api === "local" ? { app: "api" } : { proxy: { target: `https://${api}.example.com`, changeOrigin: true } }) }] }],
+  apps: [
+    { name: "api", command: ["node", "api.mjs", "--port={port}", `--products=${products}`] },
+    { name: "front", command: ["pnpm", "start", "--port={port}"] },
+  ],
+}));
+```
+
+Without a form, the default export stays an object, or a function that ignores its arguments. `export const params` is the former shape, and is refused.
+
+### Any program is a configuration
+
+Node is one implementation of a contract that any executable can fulfil, passed with `--config`: `.json` is a bare configuration, `.ts`, `.mts`, `.js` and `.mjs` go through node, any other file is run itself. It receives in `DSVS_INPUT` one line of JSON — the intentions layer by layer, as text, flags included, and `observed`, `null` when nothing observes the network:
+
+```json
+{"asked":{"deployed.version":"v3"},"session":{"slowApi":"true"},"kept":{"locale":"en"},"observed":{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}]}}
+```
+
+`DSVS_CONFIG` holds its path, and its working directory is the file's folder. It writes on stdout `{"form":{"fields":[…],"errors":[…]},"config":{…}}`: each resolved field in order — `name`, `type` (`choice`, `flag`, `text` or `number`), `choices`, `value`, `from` (`asked`, `network`, `session`, `kept` or `default`), its states `hidden`, `disabled` and its `reasons`, `readonly`, `keep`, `network`, `errors` —, and the configuration those values build, `null` when the form has an error. What it writes on stderr goes to the session log. A non-zero exit, unreadable JSON or ten seconds without an answer are an error that changes nothing. A `dsvs.json` is a bare configuration, without a form.
+
+### Saving is enough
+
+Facades, routes, proxy targets and groups are read again without restarting anything. So is the port: the session moves to the new one and leaves the old one, or, if it is taken, refuses the configuration and says who holds it. What is alive — the subnet, the processes — stays as it is, and the log says so. dsvs watches the configuration file itself, whatever its name, the paths it declares (`watch`), those of the command line (`--watch`), and otherwise its folder: an import that lives elsewhere must be declared, or saving it reloads nothing.
+
+The apps follow the declaration, and no process is cut from under whoever uses it. An app declared during a session appears, ready to start. An app whose command changed is marked `↻ restart pending`: it runs with the previous one, and its restart takes the new one. An app removed from the configuration is marked `⊘ gone from the configuration`: it runs as long as you let it, restarts with what it had, and leaves the list once stopped. Its log can be read until the session ends: `dsvs logs worker` shows it, ending with its departure. Putting it back makes it an ordinary app again, to restart, which takes up that log.
+
+## What runs during a session
+
+By default the apps open **no port** on the machine: they live on virtual addresses in an unprivileged network namespace, whose traffic and DNS go out through the machine's own stack, VPN and system proxy included. `--net loopback` does without it, `--net netns` requires it instead of falling back silently. The session runs again inside a transient systemd unit, its box: a hard stop then leaves no process behind, not even what a runner detaches. Without a systemd session it runs without the box, says so, and that guarantee is gone.
+
+`dsvs config` writes the configuration as dsvs sees it — defaults applied, routes ordered — in the JSON format it reads back. A configuration with a form comes out built from what a session opened here would have, plus the values asked on top, without its form: `dsvs config api=staging` is the snapshot of the shop on staging. `dsvs config --session` writes the one in force in the running session, and `--params --session` says where each value comes from.
+
+## How it is built
+
+Each package carries its decisions, what was tried and set aside, and its known limits in its package comment: `go doc ./internal/hub`, `go doc ./internal/core`, `go doc ./cmd/dsvs`, and so on. The seams between them:
+
+- `config` loads and validates, and nothing downstream checks again; `core` supervises; `gateway` serves; `hub` holds the port and dispatches it; `fdpass` carries file descriptors, through a socket as across an exec, and frames the lines of the protocol; `ui/*` consume snapshots and an event stream that can overflow without losing a wake-up — log lines, though, can drop, and the stream says how many.
+- `core.Network` says where the apps listen, `core.Front` who holds the port: two questions, two interfaces. `core.Gateway` and `core.Network` are the points of replacement — a driven nginx, loopback or netns — and a web interface would be one more consumer of the core.
+
+## Contributing
+
+Issues and pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to build and test, the commit conventions and how releases are made; [SECURITY.md](SECURITY.md) how to report a vulnerability.
+
+## License
+
+dsvs is released under the [MIT License](LICENSE).
+### Any program is a configuration
+
+Node is one implementation of a contract that any executable can fulfil, passed with `--config`: `.json` is a bare configuration, `.ts`, `.mts`, `.js` and `.mjs` go through node, any other file is run itself. It receives in `DSVS_INPUT` one line of JSON — the intentions layer by layer, as text, flags included, and `observed`, `null` when nothing observes the network:
+
+```json
+{"asked":{"deployed.version":"v3"},"network":{"api":"staging"},"session":{"slowApi":"true"},"kept":{"locale":"en"},"observed":{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}],"exits":[{"via":"198.51.100.1","dev":"eth0"}]}}
+```
+
+`DSVS_CONFIG` holds its path, and its working directory is the file's folder. It writes on stdout `{"form":{"fields":[…],"errors":[…],"notices":[…]},"config":{…}}`: each resolved field in order — `name`, `type` (`choice`, `flag`, `text` or `number`), `choices`, `disabledChoices` with each reason, `value`, `from` (`asked`, `network`, `session`, `kept` or `default`), its states `hidden`, `disabled` and its `reasons`, `readonly`, `keep`, `network`, `errors`, and `yielded`, the kept value that no longer holds with its layer and errors — then `notices`, what the form says without refusing anything, and the configuration those values build, `null` when the form has an error. What it writes on stderr goes to the session log. A non-zero exit, unreadable JSON or ten seconds without an answer are an error that changes nothing. A `dsvs.json` is a bare configuration, without a form.
+
 ### Saving is enough
 
 Facades, routes, proxy targets and groups are read again without restarting anything. What is alive — the port, the subnet, the processes — stays as it is, and the log says so. dsvs watches the configuration file itself, whatever its name, the paths it declares (`watch`), those of the command line (`--watch`), and otherwise its folder: an import that lives elsewhere must be declared, or saving it reloads nothing.
@@ -240,7 +312,7 @@ The apps follow the declaration, and no process is cut from under whoever uses i
 
 By default the apps open **no port** on the machine: they live on virtual addresses in an unprivileged network namespace, whose traffic and DNS go out through the machine's own stack, VPN and system proxy included. `--net loopback` does without it, `--net netns` requires it instead of falling back silently. The session runs again inside a transient systemd unit, its box: a hard stop then leaves no process behind, not even what a runner detaches. Without a systemd session it runs without the box, says so, and that guarantee is gone.
 
-`dsvs config` writes the configuration as dsvs sees it — defaults applied, routes ordered — in the JSON format it reads back.
+`dsvs config` writes the configuration as dsvs sees it — defaults applied, routes ordered — in the JSON format it reads back. A configuration with a form comes out built from what a session opened here would have, without its form.
 
 ## How it is built
 

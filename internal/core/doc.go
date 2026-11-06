@@ -29,7 +29,12 @@
 // type: an app's drift is not stored, it is derived from the declaration its last run was launched
 // with and from the current one. A removed app survives as long as its process, restarts with what
 // it had, and its supervisor withdraws itself as soon as it stops — "no longer declared and
-// stopped" is therefore not a representable state.
+// stopped" is therefore not a representable state. The session owns the intents chosen since it
+// started, which the handover carries, and the last evaluated form; each replay hands it those
+// intents, and the configuration engine derives the values from them. An evaluation that fails, or
+// that yields an invalid form, keeps the configuration in force, and the session says why
+// (NotApplied) — it is the only one to say it — until the evaluation that applies the file again,
+// and which the log tells.
 //
 // # The handover, and what Pdeathsig costs it
 //
@@ -38,6 +43,13 @@
 // will say on the other side, Adopt takes it back, and the supervision loop does not know whether
 // the run it holds comes from a launch or an adoption: it is the same follow, a run and the state
 // it is in.
+//
+// An update never loses a session on its configuration. The configuration in force crosses over
+// through the response that built it: the new image serves on it without evaluating anything, then
+// replays the file as after a save. A new binary that rejects the file — a rule it no longer reads,
+// a file already broken — therefore keeps the configuration in force and says so (NotApplied),
+// rather than having to build it to start, where a rejection would take the apps down with the
+// cgroup.
 //
 // Pdeathsig and the systemd box cover the same thing, and one is redundant when the other is there.
 // PR_SET_PDEATHSIG fires on the death of the thread that forked, and execve destroys every thread

@@ -490,7 +490,7 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 		return err
 	}
 
-	cfg, err := load(path, s.port, s.shift, s.watch)
+	form, cfg, err := opened(path, s, taken)
 	if err != nil {
 		return failed(err)
 	}
@@ -515,7 +515,7 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 	// the identity of the session: the hub names it by it, and refuses a second session of the same file
 	// by it.
 	front := hub.New(cfg.Path, network.Mode().Isolated)
-	session := core.NewSession(cfg, network, front, func(s *core.Session) core.Gateway {
+	session := core.NewSession(form, cfg, network, front, func(s *core.Session) core.Gateway {
 		return gateway.NewProxy(cfg.Port, s, s.Sink())
 	})
 	session.SetRenewal(renewal(session, attachers, network))
@@ -590,6 +590,26 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 	return nil
 }
 
+// opened reads the configuration for the first time, on what the handover had chosen: a new session
+// thus starts on what had been chosen in it, with nothing to restart. An invalid form builds nothing,
+// and there is no configuration in effect to fall back on: the error says so. A handover does have
+// one, and resumes from it without evaluating anything: an update therefore does not lose a session
+// over a file the new binary refuses.
+func opened(path string, s *shape, taken *core.Handover) (config.Form, config.Config, error) {
+	var intents map[string]string
+	if taken != nil {
+		intents = taken.Params
+	}
+	form, cfg, err := load(taken.Load, path, s.port, s.shift, s.watch, config.Input{Session: intents})
+	if err != nil {
+		return form, config.Config{}, err
+	}
+	if err := form.Accept(nil); err != nil {
+		return form, config.Config{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return form, *cfg, nil
+}
+
 // resolve returns the path of the configuration, the one that identifies the session: the one named,
 // or the first found walking up from the current directory. A client and its session compute it the
 // same way, and that is what makes them find each other.
@@ -606,22 +626,23 @@ func resolve(path string) (string, error) {
 	return filepath.Abs(path)
 }
 
-// load reads the configuration and applies the session's choices: the port, and the paths to watch on
-// top of its own. The two ways of choosing the port exclude each other — a typed port is absolute, a
-// shift applies to the one the file declares — and either one forces it, which makes it hold across
-// reloads.
-func load(path string, port, shift int, watch paths) (config.Config, error) {
-	cfg, err := config.Load(path, watch)
-	if err != nil {
-		return config.Config{}, err
-	}
+// loader reads a configuration: by evaluating it (config.Load), or from the answer a handover carries.
+type loader func(path string, watch []string, in config.Input) (config.Form, *config.Config, error)
+
+// load reads the configuration through read and applies the session's choices to the one the form
+// builds: the port, and the paths to watch on top of its own. The two ways of choosing the port exclude
+// each other — a typed port is absolute, a shift applies to the one the file declares — and either one
+// forces it, which makes it hold across reloads.
+func load(read loader, path string, port, shift int, watch paths, in config.Input) (config.Form, *config.Config, error) {
+	form, cfg, err := read(path, watch, in)
 	switch {
+	case err != nil || cfg == nil:
 	case port > 0:
 		cfg.Port, cfg.ForcedPort = port, port
 	case shift != 0:
 		cfg.Port, cfg.ForcedPort = cfg.Port+shift, cfg.Port+shift
 	}
-	return cfg, nil
+	return form, cfg, err
 }
 
 // portShift is the port shift of this instance, as its environment carries it: the service's unit sets
@@ -667,9 +688,12 @@ func printConfig(s *shape) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := load(path, s.port, s.shift, s.watch)
+	form, cfg, err := load(config.Load, path, s.port, s.shift, s.watch, config.Input{})
 	if err != nil {
 		return err
+	}
+	if err := form.Accept(nil); err != nil {
+		return fmt.Errorf("%s: %w", path, err)
 	}
 	for _, said := range cfg.Echo {
 		fmt.Fprintln(os.Stderr, said)
