@@ -18,10 +18,18 @@ import (
 type Form struct {
 	Fields []Field `json:"fields"`
 	// Errors are the form's errors that no field carries.
-	Errors []string `json:"errors,omitzero"`
+	Errors []string `json:"errors"`
 	// Notices are what the form says without refusing anything, and that no shown field carries: a
 	// build that depends on a hidden field.
 	Notices []string `json:"notices"`
+}
+
+// MarshalJSON writes its fields and its errors, even when there are none: a tool has nothing to guess
+// from a missing key.
+func (f Form) MarshalJSON() ([]byte, error) {
+	type plain Form
+	f.Fields, f.Errors, f.Notices = append([]Field{}, f.Fields...), append([]string{}, f.Errors...), append([]string{}, f.Notices...)
+	return json.Marshal(plain(f))
 }
 
 // Field is a field of the form, as the rules made it for this evaluation. A dotted name
@@ -51,7 +59,7 @@ type Field struct {
 	Pattern   string   `json:"pattern,omitzero"`
 	Keep      bool     `json:"keep,omitzero"`
 	Network   bool     `json:"network,omitzero"`
-	Errors    []string `json:"errors,omitzero"`
+	Errors    []string `json:"errors"`
 	// Yielded is the kept intention that the field's rules no longer take. Value replaces it as long as
 	// it does not hold — the bound it exceeds, otherwise the default, and From says default — and it
 	// comes back as soon as it holds: nothing erases it from memory.

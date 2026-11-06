@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -215,6 +217,28 @@ func TestWatchLearnsTheWholeReason(t *testing.T) {
 	}
 }
 
+// A session that did not start leaves as soon as its reason has been read. It used to stay for its
+// whole grace, and the dsvs start that followed the dsvs forget it advised still found it there: it read
+// the reason from before its gesture instead of launching a new session.
+func TestAFailedSessionLeavesOnceItsReasonIsRead(t *testing.T) {
+	_, path := session(t)
+	server := bind(t, path)
+	gone := make(chan struct{})
+	go func() {
+		server.Fail(errors.New("the form refuses it: discount: at most 30"))
+		close(gone)
+	}()
+
+	if _, err := Watch(path); err == nil {
+		t.Fatal("the driver got a link to a session that gave up")
+	}
+	select {
+	case <-gone:
+	case <-time.After(grace / 2):
+		t.Fatal("the session stayed after giving its reason")
+	}
+}
+
 // The logs verb returns the tail of the logs without attaching anything: the session's, and those of
 // the apps the names bring along — all of them with no name. It is what a terminal that does not want
 // the stream reads.
@@ -295,6 +319,305 @@ func TestReloadAndRenewAreTwoOrders(t *testing.T) {
 	told(t, session, filepath.Base(path))
 }
 
+// A reload the file refuses is refused where it was asked for, with the reason the state gives; one
+// that applies simply answers.
+func TestAReloadTheFileRefusesFails(t *testing.T) {
+	session, path := parametrized(t)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+
+	if _, err := Order(path, "reload"); err != nil {
+		t.Fatalf("reload of a sound file = %v", err)
+	}
+	if err := os.WriteFile(path, []byte(`throw new Error("discount: at most 30");`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Order(path, "reload")
+	if err == nil || !strings.Contains(err.Error(), "discount: at most 30") || err.Error() != session.NotApplied() {
+		t.Errorf("reload of a refused file = %v, want the reason the state gives (%q)", err, session.NotApplied())
+	}
+}
+
+// Set answers only once the session has replayed: the driver that follows already sees the value, and
+// the state lists the choices it takes.
+func TestSetAnswersOnceTheSessionReplayed(t *testing.T) {
+	session, path := parametrized(t)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+
+	link, err := Watch(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+	first := <-link.States()
+	if want := []config.Field{{Name: "env", Type: "choice", Choices: []string{"local", "staging"}, Value: "local", From: "default"}}; !reflect.DeepEqual(first.Params, want) {
+		t.Fatalf("params = %+v, want %+v", first.Params, want)
+	}
+
+	if err := Set(path, map[string]string{"env": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	if field, _ := session.Form().Field("env"); field.Value != "staging" {
+		t.Errorf("env = %q right after the answer, want staging", field.Value)
+	}
+	state := until(t, link, func(s State) bool { return s.Params[0].Value == "staging" })
+	if state.Observed != nil {
+		t.Errorf("observed = %+v, want absent when nothing observes", state.Observed)
+	}
+	text, _ := json.Marshal(state)
+	if strings.Contains(string(text), `"observed"`) {
+		t.Errorf("the JSON state carries observed: %s", text)
+	}
+	// An empty list is written: no TUI is watching, and the form has no error.
+	for _, empty := range []string{`"interfaces":[]`, `"errors":[]`} {
+		if !strings.Contains(string(text), empty) {
+			t.Errorf("the JSON state should carry %s: %s", empty, text)
+		}
+	}
+}
+
+// The configuration in force is the one the session's values built, not that of a new session.
+func TestTheConfigurationInForceIsTheSessions(t *testing.T) {
+	session, path := parametrized(t)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+
+	if err := Set(path, map[string]string{"env": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	text, err := Configuration(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(text) || !strings.Contains(string(text), `"target":"https://staging.example.com"`) {
+		t.Errorf("the configuration in force should lead /api to staging: %s", text)
+	}
+}
+
+// A text value arrives whole, spaces included, and a session still reads the bare words of a client
+// from before quoting.
+func TestSetKeepsATextWithItsSpaces(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.dsvs.ts")
+	body := `import { config, form } from "dsvs";
+export default config(form({ client: "" }), () => ({
+  port: 4399,
+  ingress: [{ host: "shop.localhost", routes: [{ path: "/", app: "sleeper" }] }],
+  apps: [{ name: "sleeper", command: ["sh", "-c", "sleep 30", "{port}"] }],
+}));`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	form, cfg, err := config.Load(path, nil, config.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := supervised(t, form, *cfg)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+
+	if err := Set(path, map[string]string{"client": `Jane "the" Doe`}); err != nil {
+		t.Fatal(err)
+	}
+	if field, _ := session.Form().Field("client"); field.Value != `Jane "the" Doe` {
+		t.Errorf("client = %q, want the whole value", field.Value)
+	}
+	if _, err := ask(path, "set client=jane"); err != nil {
+		t.Fatal(err)
+	}
+	if field, _ := session.Form().Field("client"); field.Value != "jane" {
+		t.Errorf("client = %q after a bare word, want jane", field.Value)
+	}
+}
+
+// A configuration that throws on the new gateway keeps the old one's targets, and the state says so
+// until a reload succeeds on today's network.
+func TestAFailedNetworkReplayLeavesTheSessionBehind(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.dsvs.ts")
+	write := func(unknown string) {
+		body := `export default (_, observed) => {
+  if (observed?.exits[0]?.via === "` + unknown + `") throw new Error("unknown gateway");
+  return {
+    port: 4399,
+    ingress: [{ host: "shop.localhost", routes: [{ path: "/", app: "sleeper" }] }],
+    apps: [{ name: "sleeper", command: ["sh", "-c", "sleep 30", "{port}"] }],
+  };
+};`
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("203.0.113.9")
+	first := &config.Observed{Links: []config.Link{}, Exits: []config.Exit{{Via: "198.51.100.1", Dev: "eth0"}}}
+	form, cfg, err := config.Load(path, nil, config.Input{Observed: first})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := supervised(t, form, *cfg)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+	link, err := Watch(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+	if state := <-link.States(); state.NotApplied != "" {
+		t.Fatalf("a session built on what it observes applies its configuration, not applied = %q", state.NotApplied)
+	}
+
+	if err := session.Observe(&config.Observed{Links: []config.Link{}, Exits: []config.Exit{{Via: "203.0.113.9", Dev: "eth0"}}}); err == nil {
+		t.Fatal("the configuration that throws on this gateway should say so")
+	}
+	state := until(t, link, func(s State) bool { return s.NotApplied != "" })
+	if state.Observed.Exits[0].Via != "203.0.113.9" {
+		t.Errorf("observed = %+v, want today's network", state.Observed)
+	}
+	if text, _ := json.Marshal(state); !strings.Contains(string(text), `"notApplied":"config.dsvs.ts:2:56: Error: unknown gateway"`) {
+		t.Errorf("the JSON state does not say what is not applied: %s", text)
+	}
+
+	write("none")
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	until(t, link, func(s State) bool { return s.NotApplied == "" })
+}
+
+func TestSetRefusesWhatTheConfigurationDoesNotTake(t *testing.T) {
+	session, path := parametrized(t)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+
+	err := Set(path, map[string]string{"env": "nope"})
+	if err == nil || !strings.Contains(err.Error(), "local, staging") {
+		t.Fatalf("Set = %v, want a refusal that lists the choices", err)
+	}
+	if field, _ := session.Form().Field("env"); field.Value != "local" {
+		t.Errorf("env = %q after a refusal, want local", field.Value)
+	}
+}
+
+// An order asked as a question gets its answer: nothing when the session took it, its reason when it
+// refuses it — a name it does not know, whatever the verb.
+func TestAnOrderAnswersWhatTheSessionMadeOfIt(t *testing.T) {
+	session, path := running(t)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+
+	for _, verb := range []string{"start", "stop", "restart"} {
+		if _, err := Order(path, verb, "ghost"); err == nil || !strings.Contains(err.Error(), `"ghost"`) {
+			t.Errorf("%s ghost = %v, want the refusal that names ghost", verb, err)
+		}
+	}
+	link, err := Watch(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+	if _, err := Order(path, "start", "sleeper"); err != nil {
+		t.Fatal(err)
+	}
+	until(t, link, func(s State) bool { return s.Apps[0].PID > 0 })
+}
+
+// Stopping an address keeps the apps another address serves: the shared api still runs, and the
+// answer says so in one line.
+func TestStoppingAFacadeSaysWhatItKeeps(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	dir := t.TempDir()
+	sleeping := []string{"sh", "-c", "sleep 30"}
+	cfg := config.Config{Dir: dir, Path: filepath.Join(dir, "config.dsvs.json"), Port: 4399,
+		Ingresses: []config.Ingress{
+			config.NewIngress(config.Ingress{Host: "shop.localhost", Routes: []config.Route{{Path: "/", App: "front"}, {Path: "/api", App: "api"}}}),
+			config.NewIngress(config.Ingress{Host: "admin.localhost", Routes: []config.Route{{Path: "/api", App: "api"}}}),
+		},
+		Apps: []config.App{{Name: "front", Command: sleeping, Dir: dir}, {Name: "api", Command: sleeping, Dir: dir}}}
+	session := supervised(t, config.Form{}, cfg)
+	server := bind(t, cfg.Path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+	link, err := Watch(cfg.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+
+	if _, err := Order(cfg.Path, "start", "shop.localhost"); err != nil {
+		t.Fatal(err)
+	}
+	until(t, link, func(s State) bool { return s.Apps[0].PID > 0 && s.Apps[1].PID > 0 })
+	said, err := Order(cfg.Path, "stop", "shop.localhost")
+	if want := "stopping front; keeping api, still served by admin.localhost"; err != nil || said != want {
+		t.Errorf("stop shop.localhost = %q, %v; want %q", said, err, want)
+	}
+	stopped := until(t, link, func(s State) bool { return s.Apps[0].Status == "idle" })
+	if stopped.Apps[1].Status != "starting" {
+		t.Errorf("the api admin serves stopped: %+v", stopped.Apps[1])
+	}
+}
+
+// A session from before acknowledged orders does not read the question: the order still goes to it, on
+// a driver's stream, the way it understood it.
+func TestAnOrderReachesASessionThatPredatesTheAnswer(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := "/old/config.dsvs.ts"
+	listener, err := net.Listen("unix", socket(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	heard := make(chan string, 1)
+	go func() {
+		question, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		greeting, _ := bufio.NewReader(question).ReadString('\n')
+		fmt.Fprintf(question, "err unreadable greeting: %q\n", strings.TrimSpace(greeting))
+		question.Close()
+
+		pilot, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer pilot.Close()
+		lines := bufio.NewReader(pilot)
+		lines.ReadString('\n')
+		fmt.Fprintf(pilot, "state {\"config\":%q}\n", path)
+		order, _ := lines.ReadString('\n')
+		heard <- strings.TrimSpace(order)
+	}()
+
+	if _, err := Order(path, "stop", "sleeper"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case order := <-heard:
+		if order != "stop sleeper" {
+			t.Errorf("the old session heard %q, want stop sleeper", order)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the order never reached the old session")
+	}
+}
+
 // forget is refused while an app of the project runs, and says what to do. Once its apps are off, it
 // forgets what the project keeps, and the session left open replays its configuration without it: the
 // kept value returns to its default.
@@ -332,7 +655,7 @@ export default config(form({ env: ["local", "staging"] }, (p) => { keep(p.env); 
 	}
 	t.Cleanup(func() { link.Close() })
 
-	if err := link.Order("start", "sleeper"); err != nil {
+	if _, err := Order(path, "start", "sleeper"); err != nil {
 		t.Fatal(err)
 	}
 	until(t, link, func(s State) bool { return s.Apps[0].Status != "idle" })
@@ -343,7 +666,7 @@ export default config(form({ env: ["local", "staging"] }, (p) => { keep(p.env); 
 		t.Errorf("the refusal forgot the values: %v", kept)
 	}
 
-	if err := link.Order("stop", "sleeper"); err != nil {
+	if _, err := Order(path, "stop", "sleeper"); err != nil {
 		t.Fatal(err)
 	}
 	until(t, link, func(s State) bool { return s.Apps[0].Status == "idle" })
@@ -418,6 +741,27 @@ func running(t *testing.T) (*core.Session, string) {
 		Ingresses: []config.Ingress{config.NewIngress(config.Ingress{Host: "shop.localhost"})},
 	}
 	return supervised(t, config.Form{}, cfg), cfg.Path
+}
+
+// parametrized sets up a session whose configuration declares env, and whose /api target depends on it.
+func parametrized(t *testing.T) (*core.Session, string) {
+	t.Helper()
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.dsvs.ts")
+	body := `import { config, form } from "dsvs";
+export default config(form({ env: ["local", "staging"] }), ({ env }) => ({
+  port: 4399,
+  ingress: [{ host: "shop.localhost", routes: [{ path: "/", app: "sleeper" }, { path: "/api", proxy: { target: "https://" + env + ".example.com" } }] }],
+  apps: [{ name: "sleeper", command: ["sh", "-c", "sleep 30", "{port}"] }],
+}));`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	form, cfg, err := config.Load(path, nil, config.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return supervised(t, form, *cfg), path
 }
 
 func supervised(t *testing.T, form config.Form, cfg config.Config) *core.Session {

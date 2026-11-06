@@ -29,17 +29,20 @@
 // type: an app's drift is not stored, it is derived from the declaration its last run was launched
 // with and from the current one. A removed app survives as long as its process, restarts with what
 // it had, and its supervisor withdraws itself as soon as it stops — "no longer declared and
-// stopped" is therefore not a representable state. A network observation is a replay like any other
-// (Observe, behind the same method as Reload). The session owns the intents chosen since it
-// started, which the handover carries, and the last evaluated form; each replay hands it those
-// intents and what the project keeps for itself and for the observed network, and the configuration
-// engine derives the values from them. Coming back to a network therefore brings back its values
-// without an extra replay. A value the network brings back becomes, once applied, the session's
-// intent: on a network that kept nothing for its field, the value in force stays, not a choice made
-// elsewhere before it. An evaluation that fails, or that yields an invalid form, keeps the
-// configuration in force, and the session says why (NotApplied) — it is the only one to say it —
-// until the evaluation that applies the file again, whether it is a save or a network, and which
-// the log tells.
+// stopped" is therefore not a representable state. A parameter value and a network observation are
+// replays like any other (Set, Observe, behind the same method as Reload). The session owns the
+// intents chosen since it started, which the handover carries, and the last evaluated form; each
+// replay hands it those intents, what the project keeps for itself and for the observed network,
+// and what a gesture asks for, and the configuration engine derives the values from them. Coming
+// back to a network therefore brings back its values without an extra replay. Only a gesture
+// writes: the session's intents, as soon as the form accepts them, then, once the configuration is
+// applied, what the form that built it keeps, for the project and for the network that evaluated
+// it. A value the network brings back becomes, once applied, the session's intent: on a network
+// that kept nothing for its field, the value in force stays, not a choice made elsewhere before it.
+// An evaluation that fails, or that yields an invalid form, keeps the configuration in force, and
+// the session says why (NotApplied) — it is the only one to say it, and the panel, the TUI and the
+// status read it there — until the evaluation that applies the file again, whether it is a save, a
+// gesture or a network, and which the log tells.
 //
 // # The handover, and what Pdeathsig costs it
 //

@@ -43,9 +43,10 @@ without a terminal, and keeps running. --all takes every app of the configuratio
 		name:    "stop",
 		args:    "[--all] <name...>",
 		summary: "stop the apps these names pull in",
-		long: `stop stops the apps these names pull in, or every app of the configuration with --all. The
-session keeps its port and its facades — a path leading to a stopped app answers 502 — and dsvs
-quit is what closes it. A session must be running.`,
+		long: `stop stops the apps these names pull in, or every app of the configuration with --all. A facade
+keeps the apps that another facade still serves, and stop says which: stopping an address does not
+cut the one next to it. The session keeps its port and its facades — a path leading to a stopped app
+answers 502 — and dsvs quit is what closes it. A session must be running.`,
 		declare: ordering(s, "stop"),
 	}, {
 		name:    "restart",
@@ -59,9 +60,28 @@ one. A session must be running.`,
 		name:    "reload",
 		summary: "make the session read its configuration again",
 		long: `reload makes the session read its configuration again, without restarting anything: facades,
-routes, proxy targets and groups follow the file. Saving the file does the same on its own. A
-session must be running.`,
+routes, proxy targets and groups follow the file. Saving the file does the same on its own. A file
+the session cannot apply fails the command with its reason, and the session keeps the configuration
+in force. A session must be running.`,
 		declare: direct(reloading(s)),
+	}, {
+		name:    "set",
+		args:    "<name=value...>",
+		summary: "give parameters of the configuration a value, and replay it",
+		long: `set gives parameters of the form of the configuration their value and makes the session replay
+it: facades, routes and proxy targets follow at once, and an app whose declaration changed waits for
+its restart. A flag takes true or false, a choice one of its values of the moment, a number or a text
+what it reads; dsvs state lists them. The values given together are taken together. A value the form
+does not take — a parameter hidden, disabled or read-only here, a value it does not read, a choice
+disabled here, or one that would make the form invalid — is refused with its reason, and nothing
+changes. A value taken stays for
+the session; where the form says so, it is also kept for this project on this machine, or for the
+network the machine goes out by, and comes back with it, a new session included; the project is then
+remembered, as dsvs remember does. dsvs forget forgets what is kept with the project. A value held
+that the rules of its field no longer take — a max lowered under it — yields to the bound it crosses,
+or to the default: the configuration applies, the value stays held and comes back once it holds
+again, and dsvs state says so meanwhile. A session must be running.`,
+		declare: direct(func(pairs []string) error { return setting(s, pairs) }),
 	}, {
 		name:    "quit",
 		summary: "stop the apps of the session and close it",
@@ -74,8 +94,11 @@ away.`,
 		args:    "[--json]",
 		summary: "write what the session here is doing",
 		long: `state writes what the session of the configuration found here is doing: its apps, with what each
-one is doing and since when, its facades, and the interfaces attached to it. It is what the
-session pushes to whoever pilots it, and it does not start anything.`,
+one is doing and since when, its facades, the interfaces attached to it, its parameters — where each
+value comes from, which value held yields, what the configuration takes from a hidden one anyway,
+what is disabled and why, what makes the form invalid — and the network. It is what
+the session pushes to whoever pilots it, and it does not start anything. --json writes every field of
+the form, hidden ones included.`,
 		declare: reading(func(asJSON bool) error { return showState(s, asJSON) }),
 	}, {
 		name:    "logs",
@@ -92,11 +115,13 @@ log, names or not. A session must be running.`,
 		},
 	}, {
 		name:    "run",
-		args:    "[name...]",
+		args:    "[name...] [name=value...]",
 		summary: "hold the session in this terminal, streaming the logs",
 		long: `run holds the session of the configuration found here in this terminal, streaming the logs
 as they are written; ctrl+c stops everything. That is the shape of a script, where nothing must
-survive the command. The apps these names pull in are started with it.`,
+survive the command. The apps these names pull in are started with it, and name=value pairs among them
+are asked for at the first reading, as set asks for them: that is how a session starts when what the
+project keeps makes its form invalid.`,
 		declare: direct(func(names []string) error { return serve(false, s, names) }),
 	}, {
 		name:    "status",
@@ -154,11 +179,41 @@ succeeds, since the result asked for holds.`,
 		declare: direct(func(names []string) error { return forgetting(os.Stdout, s, names) }),
 	}, {
 		name:    "config",
+		args:    "[name=value...]",
 		summary: "write the resolved configuration as JSON",
 		long: `config writes the configuration as the tool sees it — defaults applied, routes ordered — in the
-JSON format it can read back. What the configuration script says on its console goes to stderr,
-so that the output stays replayable as it is.`,
-		declare: direct(func([]string) error { return printConfig(s) }),
+JSON format it can read back. Its form takes the values given as name=value, on top of what the
+project keeps, for itself and for the network here — what a session opened here would build — and
+refuses what a session would refuse. The output is the configuration those values build, without the
+form: a snapshot that reads back as it is. dsvs state lists the values in force. What the
+configuration script says on its console goes to stderr, so that the output stays replayable.
+
+--observed answers for another network than the one here: a JSON file describing it, as dsvs state
+--json writes it under "observed", or - to read it from stdin; null is no network at all. The values
+kept for that network come with it. --params writes the form instead of the configuration: every
+field as those values resolve it, hidden ones included, where each value comes from, what is disabled
+and why, what is invalid. It is written even when the form refuses the values, and the refusal
+follows on stderr.
+
+--session writes what the session running here has in force instead: the configuration its own values
+built, or with --params its form, where each value comes from included. Those are the values of the
+session, so it takes neither name=value nor --observed — dsvs set changes them —, and it is refused
+when no session runs here.`,
+		declare: func(fs *flag.FlagSet) func([]string) error {
+			observed := fs.String("observed", "", "answer for the network this JSON `file` describes, - for stdin, instead of the one here")
+			asForm := fs.Bool("params", false, "write the form those values resolve, instead of the configuration")
+			inSession := fs.Bool("session", false, "write what the session running here has in force, instead of what a new one would build")
+			return func(pairs []string) error {
+				if *inSession {
+					return printSession(os.Stdout, s, pairs, *observed, *asForm)
+				}
+				seen, err := networkFor(*observed)
+				if err != nil {
+					return err
+				}
+				return printConfig(os.Stdout, s, pairs, seen, *asForm)
+			}
+		},
 	}, {
 		name:    "types",
 		summary: "write the package specifier of the TypeScript types matching this binary",

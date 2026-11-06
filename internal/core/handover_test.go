@@ -231,3 +231,93 @@ func logged(log *Journal) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// The session's intents cross the handover, and only they do: the file does not say them, and a
+// default is resolved again on the other side. A manifest from before parameters carries none, and
+// is adopted anyway, on the defaults.
+func TestTheHandoverCarriesTheIntents(t *testing.T) {
+	t.Parallel()
+	session, _ := paramsSession(t)
+	if exported, err := session.Export(); err != nil || len(exported.Params) != 0 {
+		t.Errorf("without a choice, the manifest carries %v (%v): a default is not an intent", exported.Params, err)
+	}
+	if err := session.Set(map[string]string{"env": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := session.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, err := json.Marshal(exported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(text), `"params":{"env":"staging"}`) {
+		t.Errorf("the manifest does not carry the intents: %s", text)
+	}
+
+	heir, _ := paramsSession(t)
+	if err := heir.Adopt(Handover{Version: HandoverVersion, Params: exported.Params}); err != nil {
+		t.Fatal(err)
+	}
+	if got := apiTarget(t, heir); got != "https://staging-0.example" {
+		t.Errorf("the heir leads /api to %q, want the staging chosen before the handover", got)
+	}
+
+	var old Handover
+	if err := json.Unmarshal([]byte(`{"version":1,"listen":3,"lock":4,"log":""}`), &old); err != nil {
+		t.Fatal(err)
+	}
+	if old.Params != nil {
+		t.Errorf("params = %v, want nil for a manifest without", old.Params)
+	}
+	if err := session.Adopt(old); err != nil {
+		t.Errorf("Adopt of a v1 manifest without params: %v", err)
+	}
+}
+
+// A handover starts again from the configuration in force without evaluating anything, then replays
+// the file: the one the new binary refuses does not make it lose the session, which serves on the
+// previous configuration and says why. Without a response — a handover from an older binary —, the
+// new image evaluates.
+func TestAHandoverKeepsTheConfigurationTheNewBinaryRefuses(t *testing.T) {
+	t.Parallel()
+	session, rewrite := paramsSession(t)
+	if err := session.Set(map[string]string{"env": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	exported, err := session.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	text, err := json.Marshal(exported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var taken Handover
+	if err := json.Unmarshal(text, &taken); err != nil {
+		t.Fatal(err)
+	}
+	path := session.Config().Path
+	rewrite(`export const params = {};
+export default { port: 4300, ingress: [], apps: [] };`)
+	if _, _, err := (*Handover)(nil).Load(path, nil, config.Input{}); err == nil {
+		t.Fatal("without a handover, the refused file loads")
+	}
+
+	form, cfg, err := taken.Load(path, nil, InputFor(path, nil, taken.Params, nil))
+	if err != nil {
+		t.Fatalf("the new image does not start again from the configuration in force: %v", err)
+	}
+	heir := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	if err := heir.Adopt(taken); err != nil {
+		t.Fatal(err)
+	}
+	supervising(t, heir)
+	if got := apiTarget(t, heir); got != "https://staging-0.example" {
+		t.Errorf("the heir leads /api to %q, want the configuration in force before the handover", got)
+	}
+	if got := heir.NotApplied(); !strings.Contains(got, "export const params is replaced by form()") {
+		t.Errorf("not applied = %q, want the new binary's refusal", got)
+	}
+}
