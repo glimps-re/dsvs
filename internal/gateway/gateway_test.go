@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -225,11 +226,58 @@ func TestUpstreamFollowsARestart(t *testing.T) {
 	}
 }
 
-// testNet is the session as the proxy sees it: the facades and the backends come from the test. Host
-// resolution is the real one.
+// After a network change, the remote target no longer answers on the connections opened on the old
+// one — they are dead without knowing it —, only on a new one. The first request afterwards must
+// not reuse one.
+func TestANetworkChangeLeavesItsConnectionsBehind(t *testing.T) {
+	t.Parallel()
+	var network atomic.Int32
+	type openedOn struct{}
+	staging := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Context().Value(openedOn{}) != network.Load() {
+			<-r.Context().Done()
+			return
+		}
+		fmt.Fprint(w, "staging")
+	}))
+	staging.Config.ConnContext = func(ctx context.Context, _ net.Conn) context.Context {
+		return context.WithValue(ctx, openedOn{}, network.Load())
+	}
+	staging.Start()
+	t.Cleanup(staging.Close)
+	fake := &testNet{facades: facades(config.Ingress{Routes: []config.Route{{Path: "/", Proxy: config.Target{URL: staging.URL}}}})}
+	fake.seen.Store(&config.Observed{Exits: []config.Exit{{Via: "192.0.2.1", Dev: "eth0"}}})
+	front := httptest.NewServer(NewProxy(0, fake, func(string, string) {}))
+	t.Cleanup(front.Close)
+	client := http.Client{Timeout: 2 * time.Second}
+	get := func() error {
+		res, err := client.Get(front.URL + "/")
+		if err != nil {
+			return err
+		}
+		defer res.Body.Close()
+		if body, _ := io.ReadAll(res.Body); string(body) != "staging" {
+			return fmt.Errorf("%d %q", res.StatusCode, body)
+		}
+		return nil
+	}
+
+	if err := get(); err != nil {
+		t.Fatalf("at the office: %v", err)
+	}
+	network.Add(1)
+	fake.seen.Store(&config.Observed{Exits: []config.Exit{{Via: "198.51.100.1", Dev: "eth0"}}})
+	if err := get(); err != nil {
+		t.Errorf("the first request on the new network reused a connection from the old one: %v", err)
+	}
+}
+
+// testNet is the session as the proxy sees it: the facades, the backends and the network come from
+// the test. Host resolution is the real one.
 type testNet struct {
 	facades config.Config
 	live    map[string]core.Backend
+	seen    atomic.Pointer[config.Observed]
 }
 
 func facades(list ...config.Ingress) config.Config {
@@ -243,6 +291,8 @@ func facades(list ...config.Ingress) config.Config {
 func (t *testNet) Facade(host string) (config.Ingress, bool) { return t.facades.Ingress(host) }
 
 func (t *testNet) Backend(app string) core.Backend { return t.live[app] }
+
+func (t *testNet) Observed() *config.Observed { return t.seen.Load() }
 
 func (t *testNet) Listen(port int) (net.Listener, error) {
 	return net.Listen("tcp", fmt.Sprintf(":%d", port))

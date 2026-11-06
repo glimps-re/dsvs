@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/x/term"
 
@@ -549,7 +550,22 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 		return err
 	}
 
-	form, cfg, err := opened(path, s, taken)
+	serving, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	// The subscription comes before the configuration is read: it receives the network as it is, and
+	// the apps start on the right target instead of waiting for a replay. Its log lines wait for the
+	// session.
+	notes := make(chan string, 4)
+	note := func(line string) {
+		select {
+		case notes <- line:
+		default:
+		}
+	}
+	observed, later := observe(serving, ctl, note)
+
+	form, cfg, err := opened(path, s, observed, taken)
 	if err != nil {
 		return failed(err)
 	}
@@ -584,6 +600,9 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 			session.Log.Add("-- " + said)
 		}
 	}
+	if observed != nil {
+		note("-- network: " + observed.String() + recalled(form))
+	}
 
 	// The apps of the handover become this session's own again before the proxy opens: those that
 	// answered still answer, and no request hits a 502 for the time of a probe. Failing the adoption
@@ -614,8 +633,16 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 
 	front.Say(session.LogSink(session.Log))
 
-	serving, stop := context.WithCancel(context.Background())
-	defer stop()
+	go func() {
+		for line := range notes {
+			session.Log.Add(line)
+		}
+	}()
+	go func() {
+		for change := range later {
+			_ = session.Observe(&change) // a replay that fails is already said in the log
+		}
+	}()
 
 	// The port is taken here, before any interface: when busy, it is an error one reads, not a log line
 	// in an interface that pretends to work. It is changed with --port.
@@ -660,16 +687,16 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 }
 
 // opened reads the configuration for the first time, under the rule of every replay: what the handover
-// had chosen, and what the project keeps. A new session thus starts on what had been chosen in it,
+// had chosen, and what the project and its network keep. A new session thus starts on what had been chosen in it,
 // with nothing to restart. An invalid form builds nothing, and there is no configuration in effect to
 // fall back on: the error says how to start. A handover does have one, and resumes from it without
 // evaluating anything: an update therefore does not lose a session over a file the new binary refuses.
-func opened(path string, s *shape, taken *core.Handover) (config.Form, config.Config, error) {
+func opened(path string, s *shape, observed *config.Observed, taken *core.Handover) (config.Form, config.Config, error) {
 	var intents map[string]string
 	if taken != nil {
 		intents = taken.Params
 	}
-	form, cfg, err := load(taken.Load, path, s.port, s.shift, s.watch, core.InputFor(path, intents, nil))
+	form, cfg, err := load(taken.Load, path, s.port, s.shift, s.watch, core.InputFor(path, observed, intents, nil))
 	if err != nil {
 		return form, config.Config{}, err
 	}
@@ -677,6 +704,40 @@ func opened(path string, s *shape, taken *core.Handover) (config.Form, config.Co
 		return form, config.Config{}, fmt.Errorf("%s: %w; %s forget clears what the project keeps", path, err, build.Name())
 	}
 	return form, *cfg, nil
+}
+
+// recalled says, for the starting line, the values a memory of the project brought back.
+func recalled(form config.Form) string {
+	back := map[string]string{}
+	for _, field := range form.Fields {
+		if !field.Hidden && (field.From == "network" || field.From == "kept") {
+			back[field.Name] = field.Value
+		}
+	}
+	if len(back) == 0 {
+		return ""
+	}
+	return ", back to " + config.Pairs(back)
+}
+
+// observe returns the network as it is at the start, and the channel of its changes. Without a first
+// value within two seconds, the configuration starts without an observation and the next one will
+// replay it: better to start than to block on netlink.
+func observe(ctx context.Context, ctl string, line func(string)) (*config.Observed, <-chan config.Observed) {
+	values, err := netns.Observe(ctx, ctl, line)
+	if err != nil {
+		line("-- network not observed: " + err.Error())
+		return nil, nil
+	}
+	select {
+	case first, open := <-values:
+		if open {
+			return &first, values
+		}
+	case <-time.After(2 * time.Second):
+		line("-- network not observed: no answer in 2s")
+	}
+	return nil, values
 }
 
 // resolve returns the path of the configuration, the one that identifies the session: the one named,

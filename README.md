@@ -234,29 +234,63 @@ The specifier is a `git+ssh` URL on this repository, so it needs an SSH key that
 
 ### Parameters: a form
 
-A configuration can declare **parameters**: a form that the build consumes. `form(model, schema)` declares the fields by their default — a boolean makes a flag, a number a number, a string a text, a list a choice with the default first, an object a group — and the schema sets their rules; `config(form, build)` builds the configuration from the resolved values, once the form is valid. The rules are those of Angular's Signal Forms — `hidden`, `disabled`, `readonly`, `required`, `min`, `max`, `minLength`, `maxLength`, `pattern`, `validate`, `validateTree`, `apply`, `applyWhen` — plus three: `choices` and `defaultValue` give the choices and default of the moment (a choice can be disabled with its reason, and stays in sight), and `keep` keeps a chosen value for the project.
-
-For a shop whose API comes from the local server (the api app) or from a deployed one:
+A configuration can declare **parameters**: a form that the build consumes. `form(model, schema)` declares the fields by their default — a boolean makes a flag, a number a number, a string a text, a list a choice with the default first, an object a group — and the schema sets their rules; `config(form, build)` builds the configuration from the resolved values, once the form is valid. The rules are those of Angular's Signal Forms — `hidden`, `disabled`, `readonly`, `required`, `min`, `max`, `minLength`, `maxLength`, `pattern`, `validate`, `validateTree`, `apply`, `applyWhen` — plus four: `choices` and `defaultValue` give the choices and default of the moment (a choice can be disabled with its reason, and stays in sight), `keep` keeps a chosen value for the project, and `network` keeps it for the network the machine goes out by. The schema also receives the **observed network**: the links that are up and the routes out.
 
 ```ts
-import { config, form, max, min } from "dsvs";
+import { choices, config, defaultValue, disabled, form, hidden, keep, max, min, network, validateTree } from "dsvs";
+import servers from "./servers.dsvs.ts";
 
-const params = form({ api: ["local", "staging", "demo"], products: 20 }, (p) => {
-  min(p.products, 0);
-  max(p.products, 5000);
-});
+// The front of a shop: its API comes from the local server (the api app) or from a deployed one,
+// staging — reachable from the company network — or demo, public.
+const params = form(
+  { api: ["local", "staging", "demo"], deployed: { version: ["v2", "v3"], traces: false }, slowApi: false, products: 20, locale: ["en", "fr"] },
+  (p, observed) => {
+    keep(p.locale);
 
-export default config(params, ({ api, products }) => ({
+    // The server to reach depends on the network: chosen once per network, it comes back with it.
+    network(p.api);
+
+    // staging is only reachable from the company network, through its tunnel, and so are its traces.
+    const atWork = observed?.links.some((link) => link.name.startsWith("tun")) ?? false;
+    choices(p.api, ["local", { value: "staging", disabled: !atWork && "staging is only reachable from the company network" }, "demo"]);
+    defaultValue(p.api, atWork ? "staging" : "demo");
+    hidden(p.deployed, { when: ({ valueOf }) => valueOf(p.api) === "local" });
+    disabled(p.deployed.traces, { when: !atWork && "traces are only reachable from the company network" });
+
+    // What the local server serves is only set when it is the one reached.
+    hidden(p.slowApi, { when: ({ valueOf }) => valueOf(p.api) !== "local" });
+    hidden(p.products, { when: ({ valueOf }) => valueOf(p.api) !== "local" });
+    min(p.products, 0);
+    max(p.products, 5000);
+
+    validateTree(p, ({ valueOf }) =>
+      valueOf(p.locale) === "fr" && valueOf(p.api) === "demo" ? { field: p.locale, message: "demo has no fr build" } : null,
+    );
+  },
+);
+
+export default config(params, ({ api, deployed, slowApi, products, locale }) => ({
   port: 4380,
-  ingress: [{ host: "shop.localhost", routes: [{ path: "/", app: "front" }, { path: "/api", ...(api === "local" ? { app: "api" } : { proxy: { target: `https://${api}.example.com`, changeOrigin: true } }) }] }],
+  ingress: [
+    {
+      host: "shop.localhost",
+      routes: [
+        { path: "/", app: locale === "fr" ? "front-fr" : "front" },
+        { path: "/admin", app: "admin" },
+        { path: "/api", ...(api === "local" ? { app: "api" } : { proxy: { target: `${servers[api]}/${deployed.version}`, changeOrigin: true } }) },
+      ],
+    },
+  ],
   apps: [
-    { name: "api", command: ["node", "api.mjs", "--port={port}", `--products=${products}`] },
-    { name: "front", command: ["pnpm", "start", "--port={port}"] },
+    // A hidden field is undefined here: products and slowApi only serve the local server, traces only a deployed one.
+    { name: "api", command: ["node", "api.mjs", "--port={port}", ...(api === "local" ? [`--products=${products}`, ...(slowApi ? ["--slow"] : [])] : [])] },
+    { name: "front", command: ["pnpm", "start", "--port={port}"], env: { API_TRACES: String(api !== "local" && deployed.traces) }, reload: { stdin: "r\n" } },
+    /* front-fr, admin… */
   ],
 }));
 ```
 
-**Where a value comes from.** A value is the first intention that exists: the session's, and the one kept for the project if the field keeps it. It holds if it is among the choices of the moment and no rule disables it; otherwise the default answers — or the first enabled choice — and the intention comes back once it is possible again. A kept value is anything but the gesture in progress; one that the rules of its field no longer take, such as a `max` lowered under it, **yields**: to the bound it crosses for `min` and `max`, to the default otherwise. The configuration applies, the intention stays in memory, and dsvs says so while it lasts, in the log: `products=20 no longer holds (at most 15): products=15 until it does`. A kept value makes the project listed, as `dsvs remember` does, and `dsvs forget` forgets it with the project.
+**Where a value comes from.** A value is the first intention that exists: the one kept for the network if the field follows it, the session's — chosen, or brought back by the last network that had one — and the one kept for the project if it keeps it. It holds if it is among the choices of the moment and no rule disables it; otherwise the default answers — or the first enabled choice — and the intention comes back once it is possible again. On a network that kept nothing, the value in force stays. A kept value is anything but the gesture in progress; one that the rules of its field no longer take, such as a `max` lowered under it, **yields**: to the bound it crosses for `min` and `max`, to the default otherwise. The configuration applies, the intention stays in memory, and dsvs says so while it lasts, in the log: `products=20 no longer holds (at most 15): products=15 until it does`. A kept value makes the project listed, as `dsvs remember` does, and `dsvs forget` forgets it with the project.
 
 **Hidden fields.** A hidden field has no value for the build: it is `undefined` there, every field of a hidden group too, and the build must not use it — `api === "local" ? products : 0`. The rules always see the value it keeps, which it finds again when it reappears. The types stay those of the model, since the schema is fixed: `api === "stagin"`, `p.deployed.verison` or a choice outside the list are type errors, a hidden field read without a guard is not. dsvs catches that: when a field is hidden, it builds a second time with its kept value, and if the result differs, the configuration uses it anyway and dsvs says so like a value that yields — `slowApi, products are hidden, yet apps.api.command[3] depends on them` — while the kept configuration stays the one built without it.
 
@@ -267,7 +301,7 @@ Without a form, the default export stays an object, or a function that ignores i
 Node is one implementation of a contract that any executable can fulfil, passed with `--config`: `.json` is a bare configuration, `.ts`, `.mts`, `.js` and `.mjs` go through node, any other file is run itself. It receives in `DSVS_INPUT` one line of JSON — the intentions layer by layer, as text, flags included, and `observed`, `null` when nothing observes the network:
 
 ```json
-{"asked":{"deployed.version":"v3"},"session":{"slowApi":"true"},"kept":{"locale":"en"},"observed":{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}]}}
+{"asked":{"deployed.version":"v3"},"network":{"api":"staging"},"session":{"slowApi":"true"},"kept":{"locale":"en"},"observed":{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}],"exits":[{"via":"198.51.100.1","dev":"eth0"}]}}
 ```
 
 `DSVS_CONFIG` holds its path, and its working directory is the file's folder. It writes on stdout `{"form":{"fields":[…],"errors":[…],"notices":[…]},"config":{…}}`: each resolved field in order — `name`, `type` (`choice`, `flag`, `text` or `number`), `choices`, `disabledChoices` with each reason, `value`, `from` (`asked`, `network`, `session`, `kept` or `default`), its states `hidden`, `disabled` and its `reasons`, `readonly`, `keep`, `network`, `errors`, and `yielded`, the kept value that no longer holds with its layer and errors — then `notices`, what the form says without refusing anything, and the configuration those values build, `null` when the form has an error. What it writes on stderr goes to the session log. A non-zero exit, unreadable JSON or ten seconds without an answer are an error that changes nothing. A `dsvs.json` is a bare configuration, without a form.

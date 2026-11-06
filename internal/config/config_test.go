@@ -684,16 +684,72 @@ func TestTheFunctionReceivesWhatTheMachineShows(t *testing.T) {
 	if got := none.Apps[0].Env["SEEN"]; got != "null" {
 		t.Errorf("observed = %s, want null", got)
 	}
-	seen := &Observed{Links: []Link{{Name: "tun0", Type: "tuntap", Addrs: []string{"10.8.0.2/24"}}}}
+	seen := &Observed{Links: []Link{{Name: "tun0", Type: "tuntap", Addrs: []string{"10.8.0.2/24"}}}, Exits: []Exit{{Via: "198.51.100.1", Dev: "tun0"}}}
 	_, cfg, err := Load(path, nil, Input{Observed: seen})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cfg.Apps[0].Env["SEEN"]; got != `{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}]}` {
+	if got := cfg.Apps[0].Env["SEEN"]; got != `{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}],"exits":[{"via":"198.51.100.1","dev":"tun0"}]}` {
 		t.Errorf("observed = %s", got)
+	}
+	_, bare, err := Load(path, nil, Input{Observed: &Observed{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bare.Apps[0].Env["SEEN"]; got != `{"links":[],"exits":[]}` {
+		t.Errorf("observed = %s, want empty collections", got)
 	}
 	if cfg.Observed != seen {
 		t.Error("the configuration must keep the observation it is made from")
+	}
+}
+
+func TestAnObservationReadsAsItsExits(t *testing.T) {
+	t.Parallel()
+	eth := Link{Name: "eth0"}
+	cases := []struct {
+		name string
+		seen *Observed
+		want string
+	}{
+		{"nothing observes", nil, "not observed"},
+		{"nothing", &Observed{}, "offline"},
+		{"one exit", &Observed{Links: []Link{eth}, Exits: []Exit{{Via: "198.51.100.2", Dev: "eth0"}}}, "eth0 via 198.51.100.2"},
+		{"an exit and a vpn", &Observed{Links: []Link{eth, {Name: "wg0"}}, Exits: []Exit{{Via: "198.51.100.2", Dev: "eth0"}}},
+			"eth0 via 198.51.100.2, wg0"},
+		{"a tun in front", &Observed{Links: []Link{eth, {Name: "tun0"}}, Exits: []Exit{{Dev: "tun0"}, {Via: "203.0.113.1", Dev: "eth0"}}},
+			"tun0, eth0 via 203.0.113.1"},
+		{"two exits on one interface", &Observed{Links: []Link{eth}, Exits: []Exit{{Via: "198.51.100.1", Dev: "eth0"}, {Via: "198.51.100.2", Dev: "eth0"}}},
+			"eth0 via 198.51.100.1"},
+		{"a link without exit", &Observed{Links: []Link{eth}}, "offline (eth0)"},
+	}
+	for _, c := range cases {
+		if got := c.seen.String(); got != c.want {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// A network is designated by its preferred exit, and what has no exit is not one.
+func TestANetworkIsItsPreferredExit(t *testing.T) {
+	t.Parallel()
+	eth := Link{Name: "eth0", Addrs: []string{"192.0.2.17/32"}}
+	cases := []struct {
+		name string
+		seen *Observed
+		want string
+	}{
+		{"nothing observes", nil, ""},
+		{"no exit", &Observed{Links: []Link{eth}}, ""},
+		{"one exit", &Observed{Links: []Link{eth}, Exits: []Exit{{Via: "198.51.100.2", Dev: "eth0"}}}, "eth0 via 198.51.100.2"},
+		{"a tun in front", &Observed{Links: []Link{eth, {Name: "tun0"}}, Exits: []Exit{{Dev: "tun0"}, {Via: "203.0.113.1", Dev: "eth0"}}},
+			"tun0"},
+		{"IPv6 only", &Observed{Links: []Link{eth}, Exits: []Exit{{Via: "fe80::1", Dev: "eth0"}}}, "eth0 via fe80::1"},
+	}
+	for _, c := range cases {
+		if got := c.seen.Network(); got != c.want {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
+		}
 	}
 }
 

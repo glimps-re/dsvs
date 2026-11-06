@@ -45,6 +45,25 @@
 // sets it outside the systemd box, and refuses the reload where it set it — the box's cgroup is
 // what replaces it.
 //
+// # What the session sees of the network
+//
+// In the namespace, netlink only shows lo and the TUN: the only process that sees the real network
+// — Wi-Fi, VPN — is the gatekeeper. It is therefore the one that reads, on the "links" request: the
+// connection stays open and it writes one JSON line per state on it, which Observe returns to the
+// supervisor (or reads on the spot when the process is already in the normal world). A link counts
+// when it is administratively up, has its carrier and carries an address of universal scope.
+//
+// The exits are the default routes of the main table, lowest metric first: it is the only generic
+// fact that changes with the NetVM — the interface and the address stay, the gateway changes. The
+// main table only: wg-quick goes through a table of its own, and a VPN that replaces the default
+// route shows up first. The state is re-read whole after each burst has settled, links, addresses
+// and routes together, and not event by event: the kernel removes a deleted link's default route
+// without saying so.
+//
+// Ruled out: reading netlink from the supervisor through a descriptor or a setns. The vishvananda
+// subscriptions that take a namespace do a setns, which requires CAP_SYS_ADMIN on the user
+// namespace that owns the machine's network, and the supervisor does not have it.
+//
 // # Looking inside
 //
 // From outside, nsenter -t <supervisor pid> -U -n -m --preserve-credentials. The -U is not

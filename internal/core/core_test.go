@@ -1180,3 +1180,183 @@ func TestSavingAConfigWithoutTheSuffixReloads(t *testing.T) {
 		return route.Proxy.URL == "https://second.example"
 	})
 }
+
+// paramsSession is a session whose configuration declares env, and whose proxy and app command
+// depend on it: changing the value moves the one and makes the other stale. rewrite replaces the
+// file, for the tests that change it under the session.
+func paramsSession(t *testing.T) (session *Session, rewrite func(body string)) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), config.FileName)
+	rewrite = func(body string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rewrite(paramsBody(`const links = observed?.links.length ?? 0;`))
+	form, cfg, err := config.Load(path, nil, config.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session = NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	supervising(t, session)
+	return session, rewrite
+}
+
+func paramsBody(prelude string) string {
+	return `import { config, form } from "dsvs";
+export default config(form({ env: ["local", "staging"] }), ({ env }, observed) => {
+  ` + prelude + `
+  return {
+    port: 4300,
+    ingress: [{ host: "localhost", routes: [
+      { path: "/", app: "app" },
+      { path: "/api", proxy: { target: "https://" + env + "-" + (typeof links === "undefined" ? 0 : links) + ".example" } },
+    ] }],
+    apps: [{ name: "app", command: ["sh", "-c", "sleep 300 & wait", env, "{port}"] }],
+  };
+});`
+}
+
+func apiTarget(t *testing.T, session *Session) string {
+	t.Helper()
+	in, _ := session.Facade("localhost")
+	route, _ := in.Match("/api/x")
+	return route.Proxy.URL
+}
+
+// A network change the configuration ignores reloads nothing, not even the browsers: the session
+// records the observation and says so, one line, so that the pushed state carries it.
+func TestAnObservationThatChangesNothingIsSilent(t *testing.T) {
+	t.Parallel()
+	session, rewrite := paramsSession(t)
+	rewrite(paramsBody(``))
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	app := session.App("app")
+	app.Start()
+	waitFor(t, "the app ready", func() bool { return app.Snapshot().Status == Ready })
+	generation, lines := session.Generation(), len(session.Log.Lines())
+
+	seen := &config.Observed{Links: []config.Link{{Name: "tun0", Type: "tuntap", Addrs: []string{"10.8.0.2/24"}}}}
+	if err := session.Observe(seen); err != nil {
+		t.Fatal(err)
+	}
+	if session.Generation() != generation || len(session.Log.Lines()) != lines+1 {
+		t.Errorf("an observation without effect reloaded the session:\n%s", joinLines(session.Log.Lines()))
+	}
+	if got := joinLines(session.Log.Lines()); !strings.Contains(got, "-- network: not observed → offline (tun0), configuration unchanged") {
+		t.Errorf("the log does not tell the change:\n%s", got)
+	}
+	if got := joinLines(session.Log.Lines()); strings.Contains(got, "reloading the browser") {
+		t.Error("the browsers were reloaded")
+	}
+	if session.Observed() != seen || session.Config().Observed != seen {
+		t.Error("the session and its configuration must keep the last observation")
+	}
+}
+
+func exitsVia(gateway string) *config.Observed {
+	return &config.Observed{Links: []config.Link{{Name: "eth0", Type: "dummy", Addrs: []string{"192.0.2.17/32"}}},
+		Exits: []config.Exit{{Via: gateway, Dev: "eth0"}}}
+}
+
+func networkLines(session *Session) []string {
+	var told []string
+	for _, line := range session.Log.Lines() {
+		if strings.Contains(line.Text, "-- network:") {
+			told = append(told, line.Text)
+		}
+	}
+	return told
+}
+
+// Same interface, same address, another gateway: a single replay, the proxy's target changes, and
+// the change is said once.
+func TestANetworkChangeIsToldOnce(t *testing.T) {
+	t.Parallel()
+	session, rewrite := paramsSession(t)
+	rewrite(paramsBody(`const links = (observed?.exits[0]?.via ?? "none").replaceAll(".", "-");`))
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, step := range []struct{ gateway, target, told string }{
+		{"198.51.100.1", "https://local-198-51-100-1.example", "-- network: not observed → eth0 via 198.51.100.1, configuration replayed"},
+		{"198.51.100.2", "https://local-198-51-100-2.example", "-- network: eth0 via 198.51.100.1 → eth0 via 198.51.100.2, configuration replayed"},
+	} {
+		generation, told := session.Generation(), len(networkLines(session))
+		if err := session.Observe(exitsVia(step.gateway)); err != nil {
+			t.Fatal(err)
+		}
+		if got := apiTarget(t, session); got != step.target {
+			t.Errorf("target of /api = %q, want %q", got, step.target)
+		}
+		if got := session.Generation(); got != generation+1 {
+			t.Errorf("generation = %d, want %d", got, generation+1)
+		}
+		if lines := networkLines(session); len(lines) != told+1 || lines[len(lines)-1] != step.told {
+			t.Errorf("network lines %q, want one more: %q", lines, step.told)
+		}
+	}
+
+	again := len(networkLines(session))
+	if err := session.Observe(exitsVia("198.51.100.2")); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(networkLines(session)); got != again {
+		t.Errorf("the same observation was said once more: %q", networkLines(session))
+	}
+}
+
+// When the configuration does not depend on the network, the change is said anyway, and an event
+// goes out: it is what makes the panel re-read the state.
+func TestANetworkChangeTheConfigurationIgnoresStillReachesTheState(t *testing.T) {
+	t.Parallel()
+	session, rewrite := paramsSession(t)
+	rewrite(paramsBody(``))
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	events, stop := session.Watch()
+	defer stop()
+	generation := session.Generation()
+
+	if err := session.Observe(exitsVia("198.51.100.2")); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.Generation(); got != generation {
+		t.Errorf("generation = %d, want %d: nothing depends on it", got, generation)
+	}
+	if lines := networkLines(session); len(lines) != 1 || !strings.HasSuffix(lines[0], "configuration unchanged") {
+		t.Errorf("network lines %q, want \"configuration unchanged\"", lines)
+	}
+	select {
+	case <-events:
+	case <-time.After(time.Second):
+		t.Error("no event: the state would not be pushed")
+	}
+}
+
+func TestAnObservationOutlivesAFailedReplay(t *testing.T) {
+	t.Parallel()
+	session, rewrite := paramsSession(t)
+	rewrite(paramsBody(`if (observed) throw new Error("boom");`))
+	seen := &config.Observed{Links: []config.Link{{Name: "tun0", Type: "tuntap", Addrs: []string{"10.8.0.2/24"}}}}
+
+	if err := session.Observe(seen); err == nil {
+		t.Fatal("the configuration that fails on this observation should say so")
+	}
+	if session.Observed() != seen {
+		t.Fatal("the observation is a fact: it stays even when the replay fails")
+	}
+
+	rewrite(paramsBody(`const links = observed.links.length;`))
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if got := apiTarget(t, session); got != "https://local-1.example" {
+		t.Errorf("target of /api = %q, want a configuration built on the new observation", got)
+	}
+}

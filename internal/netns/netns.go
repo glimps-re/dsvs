@@ -181,8 +181,8 @@ func (g *gatekeeper) answer() {
 }
 
 // grant carries out a request in the normal world. The supervisor can only ask for the connection
-// of its way out, whose descriptor it gives, for a way to follow it, and for the move to the binary
-// on disk. Nothing else crosses.
+// of its way out, whose descriptor it gives, for a way to follow it, a way to follow the
+// interfaces, and the move to the binary on disk. Nothing else crosses.
 func (g *gatekeeper) grant(conn *net.UnixConn, request string, fds []int) error {
 	verb, rest, _ := strings.Cut(request, " ")
 	switch verb {
@@ -205,6 +205,10 @@ func (g *gatekeeper) grant(conn *net.UnixConn, request string, fds []int) error 
 		// The connection stays open: the gatekeeper writes on it what goes out, until the
 		// supervisor leaves.
 		return watchers.hold(conn)
+	case "links":
+		// Like watch: the connection stays open, and each value is written on it as long as the
+		// supervisor listens. One subscription per connection, without shared state.
+		return tellLinks(conn)
 	case "reload":
 		if !g.boxed {
 			return errors.New("no systemd box: the gatekeeper keeps its binary, or the supervisor would die of its exec")

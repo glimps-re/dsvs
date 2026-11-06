@@ -502,6 +502,7 @@ func NewSession(form config.Form, cfg config.Config, network Network, front Fron
 		front:    front,
 		Log:      NewJournal("session", logSize, defaultRows),
 	}
+	s.hold(form)
 	s.enlist(cfg.Apps)
 	s.saved = saved(cfg.Watched())
 	s.adopt(cfg.Ingresses)
@@ -561,15 +562,52 @@ func (s *Session) Facades() []*Ingress {
 	return s.ingresses
 }
 
-// Reload replays the configuration with the session's intents and what the project keeps: it is what
-// replaces what is declarative — the facades, their routes, their targets, the groups, and the list of
-// apps. What is alive does not reload — the port is taken, the subnet is carved out, a process does
-// not change command midway: an app whose declaration moved says so and waits for its restart, a
-// removed app runs until it is stopped. An unreadable or invalid configuration changes nothing: the
-// session carries on with the running one. Neither does an invalid form, but it is the one the session
-// shows from then on, with its errors. In every case it says why (NotApplied), until the evaluation
-// that applies the file again, and which the log tells.
+// Reload replays the configuration with the session's intents, what the project keeps and the last
+// observation: it is what replaces what is declarative — the facades, their routes, their targets, the
+// groups, and the list of apps. What is alive does not reload — the port is taken, the subnet is carved
+// out, a process does not change command midway: an app whose declaration moved says so and waits for
+// its restart, a removed app runs until it is stopped. An unreadable or invalid configuration changes
+// nothing: the session carries on with the running one. Neither does an invalid form, but it is the
+// one the session shows from then on, with its errors. In every case it says why (NotApplied), until
+// the evaluation that applies the file again — a save, a network — and which the log tells.
 func (s *Session) Reload() error { return s.replay() }
+
+// Observe records what the machine shows, and replays the configuration if it differs from what the
+// configuration was built with. The observation is kept even when the replay fails: it is a fact,
+// not a declaration, and the next save of the file picks it up. The change is logged once the
+// replay is done, so that the pushed state carries at once the observation and what the
+// configuration derived from it.
+func (s *Session) Observe(seen *config.Observed) error {
+	s.mu.Lock()
+	before := s.observed
+	s.observed = seen
+	s.mu.Unlock()
+	generation, was := s.Generation(), s.Form().Shown()
+	var err error
+	// As long as the file does not apply, the session replays even on the network the configuration
+	// in force comes from: that may be where it applies again.
+	if !reflect.DeepEqual(seen, s.Config().Observed) || s.NotApplied() != "" {
+		err = s.replay()
+	}
+	if !reflect.DeepEqual(seen, before) {
+		outcome := "configuration unchanged"
+		switch {
+		case err != nil:
+			outcome = "the configuration failed on it: the session keeps the previous one"
+		case s.Generation() != generation:
+			outcome = "configuration replayed"
+		}
+		// On another network, a value moves by what was kept there, or by its choices and its
+		// default.
+		now := s.Form().Shown()
+		maps.DeleteFunc(now, func(name, value string) bool { return was[name] == value })
+		if err == nil && len(now) > 0 {
+			outcome += ", now " + config.Pairs(now)
+		}
+		s.LogSink(s.Log)(fmt.Sprintf("-- network: %s → %s, %s", before, seen, outcome))
+	}
+	return err
+}
 
 // Form returns the last evaluated form: what an interface shows of the parameters.
 func (s *Session) Form() config.Form {
@@ -578,11 +616,19 @@ func (s *Session) Form() config.Form {
 	return s.form
 }
 
-// InputFor returns the input of an evaluation of this configuration: what a gesture asks, what the
-// session chose, and what the project keeps. It is the rule of every replay, and that of a session's
-// first load.
-func InputFor(path string, session, asked map[string]string) config.Input {
-	return config.Input{Asked: asked, Session: session, Kept: projects.Recall(path)}
+// InputFor returns the input of an evaluation of this configuration on this network: what a gesture
+// asks, what the session chose, and what the project keeps, for itself and for this network. It is the
+// rule of every replay, and that of a session's first load.
+func InputFor(path string, observed *config.Observed, session, asked map[string]string) config.Input {
+	kept, onNetwork := projects.Recall(path, observed.Network())
+	return config.Input{Asked: asked, Network: onNetwork, Session: session, Kept: kept, Observed: observed}
+}
+
+// Observed returns the last observation, for the status.
+func (s *Session) Observed() *config.Observed {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.observed
 }
 
 // NotApplied says, in one line, why the configuration in force is not the one the file builds for
@@ -606,7 +652,8 @@ func (s *Session) replay() error {
 	intents := maps.Clone(s.intents)
 	s.mu.Unlock()
 
-	form, built, err := config.Load(current.Path, current.ForcedWatch, InputFor(current.Path, intents, nil))
+	observed := s.Observed()
+	form, built, err := config.Load(current.Path, current.ForcedWatch, InputFor(current.Path, observed, intents, nil))
 	if err != nil {
 		// The log keeps the whole failure, including what the program said; the status reads its head.
 		why := headline(current.Path, err)
@@ -631,6 +678,7 @@ func (s *Session) replay() error {
 		s.LogSink(s.Log)("-- " + err.Error())
 		return err
 	}
+	s.hold(form)
 	if s.lags("") != "" {
 		s.LogSink(s.Log)("-- configuration applied again")
 	}
@@ -660,7 +708,7 @@ func (s *Session) replay() error {
 		s.mu.Lock()
 		s.cfg.Observed, s.cfg.Answer = observed, answer
 		s.mu.Unlock()
-		if !reflect.DeepEqual(form, shown) {
+		if !reflect.DeepEqual(observed, current.Observed) || !reflect.DeepEqual(form, shown) {
 			s.emit(Event{Source: s.Log.Name(), Kind: Changed})
 		}
 		return nil
@@ -715,6 +763,19 @@ func headline(path string, err error) string {
 		return first + " " + strings.Join(strings.Fields(rest), " ")
 	}
 	return first
+}
+
+// hold turns a value the network brought back, once applied, into the session's intent: on a
+// network that kept nothing for its field, it is the one that stays, not a choice made elsewhere
+// before it, what the project keeps, or the default.
+func (s *Session) hold(form config.Form) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, field := range form.Fields {
+		if field.From == "network" {
+			s.intents[field.Name] = field.Value
+		}
+	}
 }
 
 // adopt brings the facades in line with the configuration. A facade never changes after it is
