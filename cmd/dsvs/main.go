@@ -47,6 +47,7 @@ func main() {
 	unit := fs.Bool("install-unit", false, "install the systemd --user unit that starts the service at session start")
 	noUnit := fs.Bool("remove-unit", false, "remove the systemd --user unit of this binary, leaving its service running")
 	tell := fs.Bool("version", false, "write the version of the binary and quit")
+	readme := fs.String("readme", "", "`path` of a README whose dsvs help block is rewritten from this binary's help")
 	switch err := fs.Parse(os.Args[1:]); {
 	case errors.Is(err, flag.ErrHelp):
 		general(os.Stdout, s)
@@ -65,6 +66,7 @@ func main() {
 		{"install-unit", *unit, func() error { return installUnit(s.shift) }},
 		{"remove-unit", *noUnit, removeUnit},
 		{"session", *headless, func() error { return serve(true, s, fs.Args()) }},
+		{"readme", *readme != "", func() error { return refreshREADME(*readme) }},
 	}, func() error { return dispatch(s, fs.Args()) })
 	if err != nil {
 		die(err)

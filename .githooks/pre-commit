@@ -1,0 +1,21 @@
+#!/bin/sh
+# The usage block of the README comes from the command table: this hook regenerates it and refuses
+# the commit if it had drifted. Git only reads it after a `git config core.hooksPath .githooks`, once
+# per clone.
+set -eu
+cd "$(git rev-parse --show-toplevel)"
+
+# The official install puts go in /usr/local/go/bin, often outside the PATH — and always outside the
+# PATH of a hook run by a graphical client.
+command -v go >/dev/null || PATH="$PATH:/usr/local/go/bin"
+command -v go >/dev/null || {
+    echo "go not found: install it, or put it in the PATH" >&2
+    exit 1
+}
+
+before=$(git hash-object README.md)
+go generate ./cmd/dsvs
+if [ "$before" != "$(git hash-object README.md)" ]; then
+    echo "README.md regenerated from the help: add it and commit again" >&2
+    exit 1
+fi

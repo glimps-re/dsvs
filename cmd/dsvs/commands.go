@@ -137,6 +137,15 @@ JSON format it can read back. What the configuration script says on its console 
 so that the output stays replayable as it is.`,
 		declare: direct(func([]string) error { return printConfig(s) }),
 	}, {
+		name:    "skill",
+		summary: "write a skill that teaches this tool to a coding agent",
+		long: `skill writes on stdout the skill a coding agent loads to know this tool: what it is, the list of
+the commands, and which of them to ask for the rest. It comes out of the same table as the help,
+so it cannot drift from it. Install it where the agent looks:
+
+  dsvs skill > ~/.claude/skills/dsvs/SKILL.md`,
+		declare: direct(func([]string) error { writeSkill(os.Stdout, s); return nil }),
+	}, {
 		name:    "help",
 		args:    "[command]",
 		summary: "write what a command does, or the list of them",
