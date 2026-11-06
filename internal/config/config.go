@@ -2,18 +2,23 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"dsvs/internal/build"
 )
@@ -334,6 +339,18 @@ func Load(path string, watch []string) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	var shape any
+	// A number stays written as is: that is what tells 4380 from 4380.5 where an integer is expected.
+	decoder := json.NewDecoder(bytes.NewReader(out))
+	decoder.UseNumber()
+	if err := decoder.Decode(&shape); err != nil {
+		return Config{}, fmt.Errorf("%s: unreadable output: %w", path, err)
+	}
+	// The shape is checked before decoding, which keeps quiet about a key it does not know and reports
+	// a value of the wrong type in Go's words.
+	if problems := shaped("", shape, reflect.TypeFor[Config]()); len(problems) > 0 {
+		return Config{}, fault(path, problems)
+	}
 	var cfg Config
 	if err := json.Unmarshal(out, &cfg); err != nil {
 		return Config{}, fmt.Errorf("%s: unreadable output: %w", path, err)
@@ -347,7 +364,11 @@ func Load(path string, watch []string) (Config, error) {
 // evaluate has node evaluate a module, which strips its types, and returns the JSON it gets from it
 // along with what the script said on its console.
 func evaluate(abs string) ([]byte, []string, error) {
-	node := exec.Command("node", "--input-type=module", "-e", shim)
+	answering, done := context.WithTimeout(context.Background(), evaluationLimit)
+	defer done()
+	node := exec.CommandContext(answering, "node", "--input-type=module", "-e", shim)
+	// A grandchild that keeps stdout open must not hold the read back once node is killed.
+	node.WaitDelay = time.Second
 	node.Env = append(os.Environ(), "DSVS_CONFIG="+abs)
 	node.Dir = filepath.Dir(abs)
 	// A script that hangs must not outlive the tool: even outside the systemd box, the kernel takes it
@@ -358,11 +379,94 @@ func evaluate(abs string) ([]byte, []string, error) {
 	var console bytes.Buffer
 	node.Stderr = &console
 	out, err := node.Output()
+	if answering.Err() != nil {
+		return nil, nil, fmt.Errorf("%s: did not answer within %s%s", abs, evaluationLimit, block(console.String()))
+	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("%s: %w%s", abs, err, block(console.String()))
+		// The reason reads from the project's folder: its absolute paths say nothing more there, and the
+		// stack, in the log, keeps them.
+		dir := filepath.Dir(abs) + string(filepath.Separator)
+		why := strings.NewReplacer("file://"+dir, "", dir, "").Replace(thrown(console.String(), err))
+		return nil, nil, fmt.Errorf("%s: %s%s", at(abs, console.String()), why, block(console.String()))
 	}
 	return out, lines(console.String()), nil
 }
+
+// at says where a program failed, file:line:column, like a compiler — that is what an editor knows
+// how to open: the first call of its stack that is in a file, the configuration's or a file it
+// imports, otherwise the header node puts on a syntax error, whose caret gives the column. The
+// evaluated file, for lack of anything better.
+func at(abs, console string) string {
+	if missing := unfound.FindStringSubmatch(console); missing != nil {
+		if line, column, found := imports(missing[2], missing[1]); found {
+			return located(missing[2], strconv.Itoa(line), strconv.Itoa(column))
+		}
+	}
+	for _, frame := range called.FindAllStringSubmatch(console, -1) {
+		if !strings.Contains(frame[1], "[eval") {
+			return located(frame[1], frame[2], frame[3])
+		}
+	}
+	if header := pointed.FindStringSubmatch(console); header != nil {
+		return located(header[1], header[2], strconv.Itoa(len(header[3])+1))
+	}
+	return abs
+}
+
+// imports says where this file imports this missing module: the line and column of the string that
+// names it, as written — a package, or a path leading to it from the file's folder. node, which cannot
+// find it, only gives the module and the file importing it.
+func imports(importer, missing string) (line, column int, found bool) {
+	source, err := os.ReadFile(importer)
+	if err != nil {
+		return 0, 0, false
+	}
+	for i, text := range strings.Split(string(source), "\n") {
+		for _, quoted := range specifier.FindAllStringSubmatchIndex(text, -1) {
+			named := text[quoted[2]:quoted[3]]
+			if named == missing || strings.HasPrefix(named, missing+"/") || filepath.Join(filepath.Dir(importer), named) == missing {
+				return i + 1, quoted[0] + 1, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// located writes a place that node names by a path or by a file URL.
+func located(file, line, column string) string {
+	if parsed, err := url.Parse(file); err == nil && parsed.Scheme == "file" {
+		file = parsed.Path
+	}
+	return file + ":" + line + ":" + column
+}
+
+var (
+	// unfound is the module an import cannot find, and the file importing it.
+	unfound = regexp.MustCompile(`Cannot find (?:module|package) '([^']+)' imported from (\S+)`)
+	// specifier is a quoted string, where an import names its module.
+	specifier = regexp.MustCompile(`["']([^"'\n]+)["']`)
+	// called is a stack call: "at f (file:///…/x.ts:12:5)", or without a function name.
+	called = regexp.MustCompile(`(?m)^\s+at (?:.*\()?(file://[^\s()]+|/[^\s():]+):(\d+):(\d+)\)?$`)
+	// pointed is the header of an error: the file and its line, the code leading to it — one line or
+	// several — and the caret under the column.
+	pointed = regexp.MustCompile(`(?m)^(file://\S+|/\S+):(\d+)\n(?:.*\n)*?( *)\^`)
+)
+
+// thrown names a program's failure by the error it threw — the line node writes at the top of its
+// stack, TypeError: … — and failing that by its exit code: it is the first line of the error, the one
+// an interface with room for a single line reads.
+func thrown(console string, exit error) string {
+	if line := raised.FindString(console); line != "" {
+		return line
+	}
+	return exit.Error()
+}
+
+var raised = regexp.MustCompile(`(?m)^(?:[A-Z][A-Za-z]*)?Error\b[^:\n]*: .+$`)
+
+// evaluationLimit bounds an evaluation: a script that never returns would otherwise hold the reload in
+// progress forever. It is a variable so that a test can shorten it.
+var evaluationLimit = 10 * time.Second
 
 // Find walks up the tree from dir looking for a configuration.
 func Find(dir string) (string, error) {
@@ -597,6 +701,11 @@ func (c Config) validate(path string) error {
 		}
 	}
 
+	return fault(path, problems)
+}
+
+// fault returns a file's problems as an error, or nothing if it has none.
+func fault(path string, problems []string) error {
 	switch len(problems) {
 	case 0:
 		return nil
@@ -627,7 +736,7 @@ func block(text string) string {
 	return "\n" + strings.TrimRight(text, "\n")
 }
 
-// validateTarget checks that a route leads to exactly one thing, and that this thing exists.
+// validateTarget checks that a route leads to a single thing, and that this thing exists.
 func (i Ingress) validateTarget(route Route, apps map[string]bool, fail func(string, ...any)) {
 	declared := 0
 	for _, on := range []bool{route.App != "", route.Proxy.URL != "", route.Redirect != ""} {
@@ -660,6 +769,160 @@ func (i Ingress) validateTarget(route Route, apps map[string]bool, fail func(str
 			fail("%s: target %q of %q has no host", i.Name, route.Proxy.URL, route.Path)
 		}
 	}
+}
+
+// shaped says how a value does not have the shape t describes, in the configuration's words: a key t
+// does not know, with the known key that resembles it, and a value of another type, each by its path.
+// null counts as a missing key, as in decoding.
+func shaped(at string, value any, t reflect.Type) []string {
+	if value == nil {
+		return nil
+	}
+	if t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Struct:
+		object, ok := value.(map[string]any)
+		if !ok {
+			return []string{mistyped(at, "an object", value)}
+		}
+		keys := keysOf(t)
+		var problems []string
+		for _, key := range slices.Sorted(maps.Keys(object)) {
+			i := slices.IndexFunc(keys, func(known reflect.StructField) bool { return known.Name == key })
+			if i < 0 {
+				problems = append(problems, unknown(at, key, keys))
+				continue
+			}
+			problems = append(problems, shaped(within(at, key), object[key], keys[i].Type)...)
+		}
+		return problems
+	case reflect.Map:
+		object, ok := value.(map[string]any)
+		if !ok {
+			return []string{mistyped(at, "an object", value)}
+		}
+		var problems []string
+		for _, key := range slices.Sorted(maps.Keys(object)) {
+			problems = append(problems, shaped(within(at, key), object[key], t.Elem())...)
+		}
+		return problems
+	case reflect.Slice:
+		list, ok := value.([]any)
+		if !ok {
+			return []string{mistyped(at, "a list", value)}
+		}
+		var problems []string
+		for i, item := range list {
+			problems = append(problems, shaped(fmt.Sprintf("%s[%d]", at, i), item, t.Elem())...)
+		}
+		return problems
+	case reflect.String:
+		if _, ok := value.(string); !ok {
+			return []string{mistyped(at, "a text", value)}
+		}
+	case reflect.Bool:
+		if _, ok := value.(bool); !ok {
+			return []string{mistyped(at, "true or false", value)}
+		}
+	case reflect.Int:
+		number, ok := value.(json.Number)
+		if !ok {
+			return []string{mistyped(at, "a number", value)}
+		}
+		if _, err := number.Int64(); err != nil {
+			return []string{mistyped(at, "a whole number", value)}
+		}
+	}
+	return nil
+}
+
+// keysOf returns the keys a configuration type reads, each with its type, in the order it declares
+// them: Name there is the key as written.
+func keysOf(t reflect.Type) []reflect.StructField {
+	var keys []reflect.StructField
+	for field := range t.Fields() {
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if field.IsExported() && name != "-" && name != "" {
+			field.Name = name
+			keys = append(keys, field)
+		}
+	}
+	return keys
+}
+
+// unknown reports a key no field reads, and the known key it most likely meant: the closest one, when
+// it is close enough to be just a typo.
+func unknown(at, key string, keys []reflect.StructField) string {
+	said := fmt.Sprintf("unknown key %q", key)
+	closest, best := "", 0
+	for _, known := range keys {
+		if apart := distance(strings.ToLower(key), strings.ToLower(known.Name)); apart <= max(1, len(known.Name)/3) && (closest == "" || apart < best) {
+			closest, best = known.Name, apart
+		}
+	}
+	if closest != "" {
+		said += fmt.Sprintf(" (did you mean %q?)", closest)
+	}
+	return prefixed(at, said)
+}
+
+// mistyped says what a value should have been, and what it is.
+func mistyped(at, wanted string, value any) string {
+	var is string
+	switch value := value.(type) {
+	case map[string]any:
+		is = "an object"
+	case []any:
+		is = "a list"
+	default:
+		text, _ := json.Marshal(value)
+		is = string(text)
+	}
+	return prefixed(at, wanted+", not "+is)
+}
+
+// within is the path of a key under another.
+func within(at, key string) string {
+	if at == "" {
+		return key
+	}
+	return at + "." + key
+}
+
+func prefixed(at, said string) string {
+	if at == "" {
+		return said
+	}
+	return at + ": " + said
+}
+
+// distance counts the keystrokes between two words: a letter added, removed, changed, or two
+// neighbors swapped.
+func distance(a, b string) int {
+	x, y := []rune(a), []rune(b)
+	rows := make([][]int, len(x)+1)
+	for i := range rows {
+		rows[i] = make([]int, len(y)+1)
+		rows[i][0] = i
+	}
+	for j := range rows[0] {
+		rows[0][j] = j
+	}
+	for i := 1; i <= len(x); i++ {
+		for j := 1; j <= len(y); j++ {
+			changed := 1
+			if x[i-1] == y[j-1] {
+				changed = 0
+			}
+			rows[i][j] = min(rows[i-1][j]+1, rows[i][j-1]+1, rows[i-1][j-1]+changed)
+			if i > 1 && j > 1 && x[i-1] == y[j-2] && x[i-2] == y[j-1] {
+				rows[i][j] = min(rows[i][j], rows[i-2][j-2]+1)
+			}
+		}
+	}
+	return rows[len(x)][len(y)]
 }
 
 // namesFor gives the configurations a binary looks for. The beta has its own and never falls back to

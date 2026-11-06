@@ -1,10 +1,12 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"dsvs/internal/build"
 )
@@ -71,15 +73,46 @@ export default {
 	}
 }
 
-// A script that crashes must say why: "exit status 1" alone tells nothing, the real cause is on the
-// error output of node.
+// A script that crashes must say why and where: "exit status 1" alone tells nothing, the real cause is on
+// the error output of node, and it is what the first line says — the one an interface with a single line
+// shows —, behind the file, line and column an editor knows how to open.
 func TestLoadErrorsCarryTheCause(t *testing.T) {
 	t.Parallel()
-	path := write(t, `throw new Error("the worktree has no proxies");`)
+	path := write(t, "const discount = 40;\nif (discount > 30)\n    throw new Error(\"the worktree has no proxies\");")
+	first := func(err error) string {
+		line, _, _ := strings.Cut(fmt.Sprint(err), "\n")
+		return line
+	}
 
-	_, err := Load(path, nil)
-	if err == nil || !strings.Contains(err.Error(), "the worktree has no proxies") {
-		t.Fatalf("the error should carry the cause the script wrote, returned: %v", err)
+	if _, err := Load(path, nil); first(err) != path+":3:11: Error: the worktree has no proxies" {
+		t.Errorf("first line %q, want the thrown error and its place", first(err))
+	}
+
+	path = write(t, "export default {\n  port: 4200,, apps: [] };")
+	if _, err := Load(path, nil); !strings.HasPrefix(first(err), path+":2:14: SyntaxError") {
+		t.Errorf("a syntax error reads %q", first(err))
+	}
+
+	// An error thrown in a file the configuration imports is reported where it is thrown.
+	path = write(t, `import { target } from "./targets.ts";
+export default { port: 4200, apps: [], ingress: [{ host: "a.localhost", routes: [{ path: "/", proxy: target() }] }] };`)
+	imported := filepath.Join(filepath.Dir(path), "targets.ts")
+	if err := os.WriteFile(imported, []byte("export function target() {\n  throw new Error(\"no target\");\n}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path, nil); first(err) != imported+":2:9: Error: no target" {
+		t.Errorf("an error thrown in an import reads %q", first(err))
+	}
+
+	// A missing import is reported at the line of the import, which node does not give, and its paths
+	// read from the project.
+	path = write(t, "// the apps live elsewhere\nimport { apps } from \"./apps.dsvs.ts\";\nimport { z } from 'zod-absent';\nexport default { port: 4200, apps };")
+	if _, err := Load(path, nil); first(err) != path+":2:22: Error [ERR_MODULE_NOT_FOUND]: Cannot find module 'apps.dsvs.ts' imported from config.dsvs.ts" {
+		t.Errorf("a missing import reads %q", first(err))
+	}
+	path = write(t, "import { z } from 'zod-absent';\nexport default { port: 4200 };")
+	if _, err := Load(path, nil); !strings.HasPrefix(first(err), path+":1:19: Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'zod-absent' imported from ") {
+		t.Errorf("a missing package reads %q", first(err))
 	}
 }
 
@@ -225,6 +258,49 @@ func TestLoadRefusesWhatWouldBreakLater(t *testing.T) {
 			t.Parallel()
 			if _, err := Load(write(t, "export default "+body), nil); err == nil {
 				t.Fatal("configuration accepted although it is invalid")
+			}
+		})
+	}
+}
+
+// A misspelled key does not silently change what runs, and a value of the wrong type is reported in the
+// words of the configuration: both by their path, at every level.
+func TestAKeyOrATypeTheConfigurationDoesNotReadIsRefusedInItsWords(t *testing.T) {
+	t.Parallel()
+	shop := `ingress: [{ host: "shop.localhost", routes: [{ path: "/", app: "front" }] }]`
+	front := `{ name: "front", command: ["srv", "{port}"] }`
+	cases := map[string]struct{ body, said string }{
+		"misspelled key": {
+			`{ port: 4380, ` + shop + `, apps: [` + front + `, { name: "api", command: ["api"], evn: { DISCOUNT: "20" } }] }`,
+			`config.dsvs.ts: apps[1]: unknown key "evn" (did you mean "env"?)`,
+		},
+		"port as text": {
+			`{ port: "4380", ` + shop + `, apps: [` + front + `] }`,
+			`config.dsvs.ts: port: a number, not "4380"`,
+		},
+		"key without a close match, at the root": {
+			`{ port: 4380, ` + shop + `, apps: [` + front + `], verbose: true }`,
+			`config.dsvs.ts: unknown key "verbose"`,
+		},
+		"deep in a route": {
+			`{ port: 4380, ingress: [{ host: "shop.localhost", routes: [{ path: "/", proxy: { target: "http://x", secure: "no", changorigin: true } }] }], apps: [` + front + `] }`,
+			"config.dsvs.ts:\n  - ingress[0].routes[0].proxy: unknown key \"changorigin\" (did you mean \"changeOrigin\"?)\n  - ingress[0].routes[0].proxy.secure: true or false, not \"no\"",
+		},
+		"a whole number expected": {
+			`{ port: 4380.5, ` + shop + `, apps: [` + front + `] }`,
+			`config.dsvs.ts: port: a whole number, not 4380.5`,
+		},
+		"a list, a text": {
+			`{ port: 4380, ` + shop + `, apps: [{ name: "front", command: "srv {port}", env: { DISCOUNT: 20 } }] }`,
+			"config.dsvs.ts:\n  - apps[0].command: a list, not \"srv {port}\"\n  - apps[0].env.DISCOUNT: a text, not 20",
+		},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := Load(write(t, "export default "+c.body), nil)
+			if err == nil || !strings.HasSuffix(err.Error(), string(filepath.Separator)+c.said) {
+				t.Errorf("refusal = %v, want %q", err, c.said)
 			}
 		})
 	}
@@ -465,5 +541,22 @@ func TestLaunchPlacesTheAddress(t *testing.T) {
 	again, _ := app.Launch("127.0.0.1", 1234)
 	if want := "serve --host 127.0.0.1 --port 1234"; strings.Join(again, " ") != want {
 		t.Errorf("second run = %q, want %q", strings.Join(again, " "), want)
+	}
+}
+
+func TestAConfigurationThatHangsIsCutShort(t *testing.T) {
+	was := evaluationLimit
+	evaluationLimit = 300 * time.Millisecond
+	t.Cleanup(func() { evaluationLimit = was })
+	// Without a timer, node exits by itself on an await that never resolves: the timer keeps the process alive.
+	path := write(t, "setInterval(() => {}, 1000);\nawait new Promise(() => {});\nexport default {};")
+
+	start := time.Now()
+	_, err := Load(path, nil)
+	if err == nil || !strings.Contains(err.Error(), "did not answer within") {
+		t.Fatalf("Load = %v, want did not answer within", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Errorf("the error came after %s, want under a second", took)
 	}
 }
