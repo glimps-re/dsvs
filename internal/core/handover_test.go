@@ -109,7 +109,7 @@ func TestAdoptedRunKeepsItsProcess(t *testing.T) {
 	// The resumed wait ends the run: without it, the app would stay ready forever.
 	app.Stop()
 	waitFor(t, "the app stopped", func() bool { return app.Snapshot().Status == Idle })
-	if last := app.Snapshot().Last; last == nil || !last.ByUser {
+	if last := app.Snapshot().Last; last == nil || last.Ending != Stopped {
 		t.Errorf("end of run = %+v, want a requested stop", last)
 	}
 	if err := syscall.Kill(pid, 0); err == nil {
@@ -241,7 +241,7 @@ func TestTheHandoverCarriesTheIntents(t *testing.T) {
 	if exported, err := session.Export(); err != nil || len(exported.Params) != 0 {
 		t.Errorf("without a choice, the manifest carries %v (%v): a default is not an intent", exported.Params, err)
 	}
-	if err := session.Set(map[string]string{"env": "staging"}); err != nil {
+	if err := session.Set(map[string]string{"env": "staging"}, "cli"); err != nil {
 		t.Fatal(err)
 	}
 	exported, err := session.Export()
@@ -283,7 +283,7 @@ func TestTheHandoverCarriesTheIntents(t *testing.T) {
 func TestAHandoverKeepsTheConfigurationTheNewBinaryRefuses(t *testing.T) {
 	t.Parallel()
 	session, rewrite := paramsSession(t)
-	if err := session.Set(map[string]string{"env": "staging"}); err != nil {
+	if err := session.Set(map[string]string{"env": "staging"}, "cli"); err != nil {
 		t.Fatal(err)
 	}
 	exported, err := session.Export()
@@ -319,5 +319,30 @@ export default { port: 4300, ingress: [], apps: [] };`)
 	}
 	if got := heir.NotApplied(); !strings.Contains(got, "export const params is replaced by form()") {
 		t.Errorf("not applied = %q, want the new binary's refusal", got)
+	}
+}
+
+// A departed app's log crosses a handover: an update is not the end of the session.
+func TestTheJournalOfAnAppGoneCrossesTheHandover(t *testing.T) {
+	t.Parallel()
+	session, declare := declaring(t, "front", "docs")
+	session.App("docs").Log.Add("docs spoke")
+	declare("front")
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "docs partie", func() bool { return session.App("docs") == nil })
+
+	taken, err := session.Export()
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := NewSession(session.Form(), session.Config(), heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	if err := next.Adopt(taken); err != nil {
+		t.Fatal(err)
+	}
+	journals, err := next.Journals([]string{"docs"})
+	if err != nil || len(journals) != 1 || !strings.Contains(journals[0].Dump(), "docs spoke") {
+		t.Errorf("docs log after the handover = %v, %v", journals, err)
 	}
 }

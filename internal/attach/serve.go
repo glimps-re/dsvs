@@ -304,24 +304,22 @@ func (s *Server) pilot(conn *net.UnixConn) {
 }
 
 // tail returns the tail of the logs: the session's, and those of the apps these names bring along —
-// all of them with no name. It is a question, not an attachment: the answer goes out as one line of
-// JSON, like a state, and nothing follows.
+// all of them with no name, including those that are gone. It is a question, not an attachment: the
+// answer goes out as one line of JSON, like a state, and nothing follows.
 func (s *Server) tail(conn *net.UnixConn, n int, names []string) {
 	<-s.settled
 	if s.because != nil {
 		fmt.Fprintf(conn, "err %s\n", oneLine(s.because))
 		return
 	}
-	wanted, err := s.wanted(names)
+	journals, err := s.session.Journals(names)
 	if err != nil {
 		fmt.Fprintf(conn, "err %s\n", oneLine(err))
 		return
 	}
 	series := [][]core.Line{ending(s.session.Log)}
-	for _, app := range s.session.Apps() {
-		if slices.Contains(wanted, app.Name) {
-			series = append(series, ending(app.Log))
-		}
+	for _, journal := range journals {
+		series = append(series, ending(journal))
 	}
 	merged := core.Merge(series...)
 	if keep := min(n, maxTail); len(merged) > keep {
@@ -375,12 +373,17 @@ func (s *Server) answer(conn *net.UnixConn, ask func() (string, error)) {
 }
 
 // set gives values to the session's parameters, and returns once it has replayed: a submission for
-// set, a draft for draft. Each name=value is one word, Go-quoted when its value contains spaces; a
-// client from before quoting writes bare words, which read the same.
+// set, a draft for draft. The first word says where the gesture comes from — cli, panel —, then each
+// name=value is one word, Go-quoted when its value contains spaces. An older client writes its values
+// without saying where it comes from, and as bare words if it predates quoting: they read the same.
 func (s *Server) set(verb, words string) error {
 	pairs, err := split(words)
 	if err != nil {
 		return err
+	}
+	by := "older client"
+	if len(pairs) > 0 && !strings.Contains(pairs[0], "=") {
+		by, pairs = pairs[0], pairs[1:]
 	}
 	values := make(map[string]string, len(pairs))
 	for _, pair := range pairs {
@@ -391,9 +394,9 @@ func (s *Server) set(verb, words string) error {
 		values[name] = value
 	}
 	if verb == "draft" {
-		return s.session.Draft(values)
+		return s.session.Draft(values, by)
 	}
-	return s.session.Set(values)
+	return s.session.Set(values, by)
 }
 
 // split cuts a line into words separated by blanks, a Go-quoted word keeping its own.
@@ -522,7 +525,7 @@ var steering = map[string]func(*core.App) error{
 // nothing more than an order with no name.
 func (s *Server) wanted(names []string) ([]string, error) {
 	if len(names) > 0 {
-		return s.session.Config().Wanted(names)
+		return s.session.Wanted(names)
 	}
 	apps := s.session.Apps()
 	every := make([]string, 0, len(apps))

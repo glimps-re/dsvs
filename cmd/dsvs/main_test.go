@@ -267,6 +267,22 @@ func TestStateSaysTheParametersAndTheNetwork(t *testing.T) {
 	}
 }
 
+// An app that starts without listening on its address says so below the table of apps, where its
+// column would not have the room.
+func TestStateSaysWhereAnAppListensInstead(t *testing.T) {
+	state := attach.State{Config: "/p/config.dsvs.ts", Port: 4380, Apps: []attach.App{
+		{Name: "front", Status: "starting", PID: 41, Astray: "listens on 127.0.0.1:5173, not on 10.77.0.3:4123"},
+		{Name: "api", Status: "ready", Ready: true, PID: 42},
+	}}
+	var out bytes.Buffer
+	if err := writeState(&out, state); err != nil {
+		t.Fatal(err)
+	}
+	if line := "front listens on 127.0.0.1:5173, not on 10.77.0.3:4123\n"; !strings.Contains(out.String(), "api    ready     yes    42\n"+line) {
+		t.Errorf("the state says:\n%s\nwant, below the table: %s", out.String(), line)
+	}
+}
+
 // startBody is a form in which two memories, each valid on its own, form a pair the form refuses.
 const startBody = `import { config, form, keep, network, validateTree } from "dsvs";
 const params = form({ env: ["local", "staging"], staging: ["office", "public"], locale: ["en", "fr"] }, (p) => {

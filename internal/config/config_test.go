@@ -13,6 +13,28 @@ import (
 	"dsvs/internal/build"
 )
 
+// The default color of an app follows its name: removing another one, before it, does not change it.
+func TestAnAppKeepsItsColorWhenAnotherLeaves(t *testing.T) {
+	t.Parallel()
+	colors := func(names string) map[string]string {
+		_, cfg, err := Load(write(t, `export default { port: 4200, ingress: [{ host: "localhost", routes: [{ path: "/", redirect: "/shop/" }] }], apps: [`+names+`].map((name) => ({ name, command: ["serve", name] })) };`), nil, Input{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{}
+		for _, app := range cfg.Apps {
+			out[app.Name] = app.Color
+		}
+		return out
+	}
+	all, fewer := colors(`"front", "api", "admin", "worker"`), colors(`"api", "worker"`)
+	for _, name := range []string{"api", "worker"} {
+		if all[name] != fewer[name] {
+			t.Errorf("%s goes from %s to %s when front and admin leave", name, all[name], fewer[name])
+		}
+	}
+}
+
 func TestLoadRunsAScript(t *testing.T) {
 	t.Parallel()
 	// The configuration is a script: what counts is the object it produces, not its shape.
@@ -37,8 +59,8 @@ export default async () => ({
 	if len(cfg.Apps) != 2 || cfg.Apps[1].Name != "admin" {
 		t.Fatalf("apps = %+v", cfg.Apps)
 	}
-	if cfg.Apps[0].Color != "cyan" || cfg.Apps[0].Ansi != 6 {
-		t.Errorf("default color = %q (%d), want cyan (6)", cfg.Apps[0].Color, cfg.Apps[0].Ansi)
+	if shop := cfg.Apps[0]; !slices.Contains(palette, shop.Color) || shop.Ansi != ansiByName[shop.Color] {
+		t.Errorf("default color = %q (%d), want a color of the palette and its code", shop.Color, shop.Ansi)
 	}
 	if cfg.Apps[0].Dir != filepath.Dir(path) || cfg.Dir != filepath.Dir(path) {
 		t.Errorf("directory = %q / %q, want that of the configuration file", cfg.Apps[0].Dir, cfg.Dir)
@@ -267,6 +289,44 @@ func TestStoppingAFacadeKeepsWhatAnotherServes(t *testing.T) {
 	}
 }
 
+// An app that receives no port does not have to take one as long as no facade serves it. Its ready key,
+// when it has one, keeps the RegExp as written in TypeScript: its source and flags cross over, and Go
+// reads it back.
+func TestAnAppWithoutAPortAndItsReadyLine(t *testing.T) {
+	t.Parallel()
+	path := write(t, `export default {
+    port: 4200,
+    ingress: [{ host: "localhost", routes: [{ path: "/", app: "front" }] }],
+    apps: [
+        { name: "front", command: ["srv", "{port}"], ready: { http: "/health" } },
+        { name: "lib", command: ["tsc", "--watch"], ready: { log: /watching\s+for file changes/i } },
+        { name: "copy", command: ["cp", "-r", "a", "b"], ready: { log: "a.b (1)" } },
+    ],
+};`)
+	_, cfg, err := Load(path, nil, Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, lines := range map[string]map[string]bool{
+		"lib":  {"[12:00:01] Watching   for file changes.": true, "Found 0 errors": false},
+		"copy": {"copied a.b (1) to b": true, "copied aXb (1)": false},
+	} {
+		app, _ := cfg.App(name)
+		expected, err := app.Ready.Log.Compile()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for line, want := range lines {
+			if expected.MatchString(line) != want {
+				t.Errorf("%s: %q matches ready.log = %v, want %v", name, line, !want, want)
+			}
+		}
+	}
+	if front, _ := cfg.App("front"); front.Ready.HTTP != "/health" {
+		t.Errorf("ready of front = %+v", front.Ready)
+	}
+}
+
 func TestLoadRefusesWhatWouldBreakLater(t *testing.T) {
 	t.Parallel()
 	app := `{ name: "a", command: ["srv", "{port}"] }`
@@ -274,8 +334,18 @@ func TestLoadRefusesWhatWouldBreakLater(t *testing.T) {
 	cases := map[string]string{
 		"two apps with the same name": `{ port: 1, ingress: [` + front + `], apps: [
 			` + app + `, ` + app + `] }`,
-		"an app that does not say where to listen": `{ port: 1, ingress: [` + front + `],
+		"a routed app that does not say where to listen": `{ port: 1, ingress: [` + front + `],
 			apps: [{ name: "a", command: ["srv"] }] }`,
+		"empty ready": `{ port: 1, ingress: [` + front + `],
+			apps: [{ name: "a", command: ["srv", "{port}"], ready: {} }] }`,
+		"ready with two keys": `{ port: 1, ingress: [` + front + `],
+			apps: [{ name: "a", command: ["srv", "{port}"], ready: { http: "/health", log: "up" } }] }`,
+		"ready.http without a leading slash": `{ port: 1, ingress: [` + front + `],
+			apps: [{ name: "a", command: ["srv", "{port}"], ready: { http: "health" } }] }`,
+		"ready.http on an app without a port": `{ port: 1, ingress: [` + front + `],
+			apps: [` + app + `, { name: "b", command: ["tsc"], ready: { http: "/health" } }] }`,
+		"ready.log that RE2 cannot read": `{ port: 1, ingress: [` + front + `],
+			apps: [{ name: "a", command: ["srv", "{port}"], ready: { log: /(?<=a)b/ } }] }`,
 		"no port": `{ ingress: [` + front + `], apps: [` + app + `] }`,
 		"two facades on the same host": `{ port: 1, ingress: [` + front + `,
 			{ name: "other", host: "localhost", routes: [{ path: "/a", app: "a" }] }],

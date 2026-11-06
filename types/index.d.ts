@@ -86,7 +86,8 @@ export interface App {
   /**
    * Argv, run without a shell, in a terminal the tool lends it. An app does not choose its address:
    * the tool reserves one for it and replaces `{port}` and `{ip}`, here as in `env`. `{port}` is
-   * required somewhere — without it, nothing would know where to reach the app.
+   * required somewhere for an app a facade serves — without it, nothing would know where to reach
+   * it; an app no route leads to does not need it (`tsc --watch`, a worker).
    */
   command: string[];
   /**
@@ -97,9 +98,24 @@ export interface App {
   env?: Record<string, string | undefined>;
   /** Working directory, absolute or relative to the configuration file. Default: its directory. */
   dir?: string;
-  /** Color of the app in the logs. Default: taken from a palette, in order. */
+  /** Color of the app in the logs. Default: drawn from its name in a palette, the same when other apps come or go. */
   color?: Color;
+  /**
+   * What says the app is ready, when its command does not. Without this key: an app a facade serves
+   * is ready when a real request gets an answer, an app that receives `{port}` without a route when
+   * its port opens, an app that receives none as soon as it is started. Once per start: a restart
+   * goes back to "starting".
+   */
+  ready?: Ready;
 }
+
+/**
+ * Exactly one of the two forms. `http`: dsvs requests this path on `{ip}:{port}`, and the app is ready
+ * at the first 2xx code; the command must therefore receive `{port}`. `log`: the app is ready when a
+ * line of its output contains this text, or matches this expression — read by Go (RE2): the `i`, `m`
+ * and `s` flags keep their meaning, a lookbehind or a backreference is refused with the configuration.
+ */
+export type Ready = { http: `/${string}`; log?: never } | { log: string | RegExp; http?: never };
 
 export type Color = "red" | "green" | "yellow" | "blue" | "magenta" | "cyan";
 

@@ -210,7 +210,7 @@ func demo(t *testing.T) ([]project, faces) {
 			Config: "/home/user/Documents/shop/config.dsvs.ts", Port: 4200,
 			Apps: []attach.App{
 				{Name: "front", Status: "ready", Ready: true, PID: 4242, Since: now.Add(-14 * time.Minute)},
-				{Name: "admin", Status: "idle", Last: "exited (2)"},
+				{Name: "admin", Status: "idle", Last: "exited (2)", Fell: true},
 				{Name: "storybook", Status: "starting", Since: now.Add(-2 * time.Second)},
 				{Name: "docs", Status: "ready", Ready: true, Since: now.Add(-3 * time.Hour), Drift: "restart pending"},
 			},
@@ -787,8 +787,8 @@ func TestLookLeavesThePanelAsAPNG(t *testing.T) {
 	failing[0].failed = "config.dsvs.ts: the configuration did not load: SyntaxError: Unexpected token '}' (line 41)"
 	failing[0].live = &attach.State{Config: full[0].config, Port: 4200, Apps: []attach.App{
 		{Name: "front", Status: "ready", Ready: true, Since: time.Now().Add(-2 * time.Hour)},
-		{Name: "admin", Status: "idle", Last: "exited (137) · killed"},
-		{Name: "docs", Status: "idle", Last: "no port after 30s"},
+		{Name: "admin", Status: "idle", Last: "exited (137) · killed", Fell: true},
+		{Name: "docs", Status: "idle", Last: "no port after 30s", Fell: true},
 	}}
 	failing[2].failed = "no session: port 4200 is held by another program"
 
@@ -797,7 +797,7 @@ func TestLookLeavesThePanelAsAPNG(t *testing.T) {
 		many[i] = attach.App{Name: fmt.Sprintf("service-%02d-with-a-rather-long-name", i+1), Status: "ready",
 			Ready: true, Since: time.Now().Add(-time.Duration(3+i) * time.Minute)}
 	}
-	many[4] = attach.App{Name: many[4].Name, Status: "idle", Last: "exited (1)"}
+	many[4] = attach.App{Name: many[4].Name, Status: "idle", Last: "exited (1)", Fell: true}
 	many[9] = attach.App{Name: many[9].Name, Status: "starting", Since: time.Now().Add(-8 * time.Second)}
 	overflowing := append([]project(nil), full...)
 	overflowing[0].live = &attach.State{Config: full[0].config, Port: 4400, Apps: many,
@@ -1570,7 +1570,7 @@ func TestTheFourStatesHaveFourSilhouettes(t *testing.T) {
 	state := attach.State{Config: "/one/dsvs.json", Port: 4200, Apps: []attach.App{
 		{Name: "up", Status: "ready", Ready: true},
 		{Name: "coming", Status: "starting"},
-		{Name: "down", Status: "idle", Last: "exited (2)"},
+		{Name: "down", Status: "idle", Last: "exited (2)", Fell: true},
 		{Name: "off", Status: "idle"},
 	}}
 	canvas, _, rows := paint([]project{{config: state.Config, live: &state}}, looking, with, time.Now(), aside)
@@ -1816,6 +1816,20 @@ func colorsOf(canvas *image.RGBA) []color.RGBA {
 	return out
 }
 
+// Where an app listens when it starts without listening at its address reads in full under its row:
+// the state column would only have room for its beginning.
+func TestAnAppListeningElsewhereSaysWhereUnderItsRow(t *testing.T) {
+	_, with := demo(t)
+	height := func(astray string) int {
+		state := attach.State{Config: "/one/dsvs.json", Port: 4200, Apps: []attach.App{{Name: "front", Status: "starting", Astray: astray}}}
+		canvas, _, _ := paint([]project{{config: state.Config, live: &state}}, looking, with, time.Now(), aside)
+		return canvas.Bounds().Dy()
+	}
+	if quiet, said := height(""), height("listens on 127.0.0.1:5173, not on 10.77.0.3:4123"); said <= quiet {
+		t.Errorf("the panel is %d pixels with the address, %d without: it is not written", said, quiet)
+	}
+}
+
 // When the screen is too short, the panel folds: a single project stays unfolded, and it is the one
 // where something fell — it is the one we came to see. A click on a summary chooses another.
 func TestThePanelFoldsWhenTheScreenIsTooShort(t *testing.T) {
@@ -1827,7 +1841,7 @@ func TestThePanelFoldsWhenTheScreenIsTooShort(t *testing.T) {
 	sessions := []attach.State{
 		{Config: "/a/dsvs.json", Port: 4300, Apps: many},
 		{Config: "/b/dsvs.json", Port: 4310, Apps: []attach.App{
-			{Name: "front", Status: "ready", Ready: true}, {Name: "admin", Status: "idle", Last: "exited (2)"}}},
+			{Name: "front", Status: "ready", Ready: true}, {Name: "admin", Status: "idle", Last: "exited (2)", Fell: true}}},
 		{Config: "/c/dsvs.json", Port: 4320, Apps: []attach.App{{Name: "front", Status: "ready", Ready: true}}},
 	}
 	var shown []project
@@ -1895,8 +1909,9 @@ func TestTheSessionsSayTheWorstFormTogether(t *testing.T) {
 	ready := attach.App{Name: "front", Status: "ready", Ready: true}
 	booting := attach.App{Name: "api", Status: "starting"}
 	leaving := attach.App{Name: "admin", Status: "stopping", Ready: true}
-	fallen := attach.App{Name: "docs", Status: "idle", Last: "exited (1)"}
+	fallen := attach.App{Name: "docs", Status: "idle", Last: "exited (1)", Fell: true}
 	stopped := attach.App{Name: "old", Status: "idle", Last: "stopped"}
+	done := attach.App{Name: "job", Status: "idle", Last: "exited (0)"}
 	of := func(apps ...attach.App) attach.State { return attach.State{Apps: apps} }
 
 	for _, c := range []struct {
@@ -1907,6 +1922,7 @@ func TestTheSessionsSayTheWorstFormTogether(t *testing.T) {
 		{"no session", nil, Idle},
 		{"a session without an app", []attach.State{of()}, Idle},
 		{"nothing running", []attach.State{of(stopped)}, Idle},
+		{"an app that exited on its own with code 0", []attach.State{of(done, stopped)}, Idle},
 		{"everything is ready", []attach.State{of(ready), of(ready, stopped)}, Running},
 		{"an app starts", []attach.State{of(ready), of(booting)}, Starting},
 		{"an app stops, still answering", []attach.State{of(ready, leaving)}, Starting},

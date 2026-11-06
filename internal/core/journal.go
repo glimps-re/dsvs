@@ -366,6 +366,11 @@ func (j *Journal) style(body string) {
 
 func (j *Journal) put(r rune) {
 	l := j.current()
+	if len(l.cells) == 0 {
+		// A line is dated from its first character: born when the previous one completes, it can
+		// wait a long time to be written to, and a merged log would sort it too early.
+		l.at = time.Now()
+	}
 	for len(l.cells) <= j.col {
 		l.cells = append(l.cells, cell{r: ' '})
 	}

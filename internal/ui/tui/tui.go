@@ -591,7 +591,7 @@ func (m Model) enterParam() Model {
 // for the field that completes it (core.Session.Draft). It keeps the refusal if there is one.
 func (m Model) set(name, value string) Model {
 	m.refusal = refusal{}
-	if err := m.session.Draft(map[string]string{name: value}); err != nil {
+	if err := m.session.Draft(map[string]string{name: value}, "tui"); err != nil {
 		m.refusal = refusal{name, err.Error()}
 	}
 	return m

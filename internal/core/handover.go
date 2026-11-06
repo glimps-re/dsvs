@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"time"
 
@@ -33,10 +34,12 @@ type Handover struct {
 	// that is in the kernel, and only this link is missing on the other side.
 	IPs map[string]string `json:"ips,omitempty"`
 	// Fallback is the reason the private network was done without, which the network card displays.
-	Fallback string        `json:"fallback,omitempty"`
-	Log      string        `json:"log"`
-	Apps     []AppState    `json:"apps,omitempty"`
-	Facades  []FacadeState `json:"facades,omitempty"`
+	Fallback string         `json:"fallback,omitempty"`
+	Log      string         `json:"log"`
+	Apps     []AppState     `json:"apps,omitempty"`
+	Facades  []JournalState `json:"facades,omitempty"`
+	// Gone are the logs of the departed apps, which can be read until the end of the session.
+	Gone []JournalState `json:"gone,omitempty"`
 	// Params are the session's intents: the new image replays the configuration with them, and the
 	// file does not say them. A default is never among them: it is resolved again on the other
 	// side.
@@ -89,8 +92,9 @@ type RunState struct {
 	ReadyAt time.Time `json:"readyAt,omitzero"`
 }
 
-// FacadeState carries only a log: the facade itself is reread from the configuration.
-type FacadeState struct {
+// JournalState is a log and the name that carries it: a facade carries only that, the facade itself
+// is re-read from the configuration, and it is all that remains of a departed app.
+type JournalState struct {
 	Name string `json:"name"`
 	Log  string `json:"log"`
 }
@@ -134,8 +138,13 @@ func (s *Session) Export() (Handover, error) {
 	out := Handover{Version: HandoverVersion, Fallback: s.net.Mode().Reason, Log: s.Log.Dump(), Params: intents, Awaiting: awaiting,
 		Answer: s.Config().Answer}
 	for _, in := range s.Facades() {
-		out.Facades = append(out.Facades, FacadeState{Name: in.Cfg.Name, Log: in.Log.Dump()})
+		out.Facades = append(out.Facades, JournalState{Name: in.Cfg.Name, Log: in.Log.Dump()})
 	}
+	s.mu.RLock()
+	for name, journal := range s.gone {
+		out.Gone = append(out.Gone, JournalState{Name: name, Log: journal.Dump()})
+	}
+	s.mu.RUnlock()
 	for _, app := range s.Apps() {
 		state, err := app.export()
 		if err != nil {
@@ -161,6 +170,11 @@ func (s *Session) Adopt(taken Handover) error {
 	s.Log.Write([]byte(taken.Log))
 	s.mu.Lock()
 	maps.Copy(s.intents, taken.Params)
+	for _, gone := range taken.Gone {
+		journal := NewJournal(gone.Name, logSize, defaultRows)
+		journal.Write([]byte(gone.Log))
+		s.gone[gone.Name] = journal
+	}
 	maps.Copy(s.awaiting, taken.Awaiting)
 	s.mu.Unlock()
 	for _, facade := range taken.Facades {
@@ -179,7 +193,7 @@ func (s *Session) Adopt(taken Handover) error {
 			return err
 		}
 	}
-	_ = s.replay(nil, config.Form.Accept) // a refusal is told in the log and in the status, and the session serves anyway
+	_ = s.replay(nil, "", config.Form.Accept) // a refusal is told in the log and in the status, and the session serves anyway
 	return nil
 }
 
@@ -236,10 +250,14 @@ func (s *App) adopt(state AppState) error {
 	if err != nil {
 		return fmt.Errorf("%s: pid %d: %w", s.Name, state.Run.PID, err)
 	}
+	// What an adopted run wrote before the handover is already replayed in the log: it declares
+	// itself ready by what it writes next.
+	_, from, _ := s.Log.Since(math.MaxInt)
 	r := &run{
 		proc: proc,
 		tty:  os.NewFile(uintptr(state.Run.TTY), s.Name),
 		ep:   Endpoint{IP: state.Run.IP, Port: state.Run.Port},
+		from: from,
 	}
 	if state.Run.Ready {
 		s.live.Store(&backend{name: s.Name, ep: r.ep, net: s.net})

@@ -89,8 +89,8 @@ func Open(anchor image.Rectangle, until <-chan struct{}, gone func()) error {
 		waking: map[string]bool{}, pending: map[string]map[string]time.Time{}, replaying: map[string]change{}, refused: map[string]string{},
 		replayed: make(chan replay, 8), forgot: make(chan replay, 8), reports: make(chan report, 8), told: make(chan renewal, 8),
 		awake: make(chan woken, 8), done: make(chan struct{}), working: &working}
-	p.ordered, p.setting, p.keys, p.claim = p.through, attach.Set, mapping(conn), p.focus
-	p.setting = func(config string, values map[string]string) error { return attach.Draft(config, values) }
+	p.ordered, p.keys, p.claim = p.through, mapping(conn), p.focus
+	p.setting = func(config string, values map[string]string) error { return attach.Draft(config, "panel", values) }
 	defer p.release()
 
 	if err := p.reach(); err != nil {

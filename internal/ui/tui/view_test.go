@@ -202,6 +202,24 @@ func TestQuitAsksBeforeStopping(t *testing.T) {
 	}
 }
 
+// An app that exited on its own with code 0 has stopped: only a non-zero code or an unrequested
+// signal makes it fall.
+func TestOnlyAFailedRunMarksAnAppFallen(t *testing.T) {
+	for _, c := range []struct {
+		last core.Outcome
+		want string
+	}{
+		{core.Outcome{Code: 0}, "○"},
+		{core.Outcome{Ending: core.Stopped, Signal: "SIGTERM"}, "○"},
+		{core.Outcome{Code: 3}, "✗"},
+		{core.Outcome{Code: -1, Signal: "SIGKILL"}, "✗"},
+	} {
+		if got, _ := statusOfApp(core.Snapshot{Status: core.Idle, Last: &c.last}); got != c.want {
+			t.Errorf("%s: %s, want %s", c.last, got, c.want)
+		}
+	}
+}
+
 // The info panel describes what focus designates, not what the log displays.
 func TestInfoFollowsTheFocus(t *testing.T) {
 	t.Parallel()
@@ -368,7 +386,7 @@ func TestLookLeavesTheTUIAsText(t *testing.T) {
 	typing := press(grouped, "enter", "backspace", "backspace", "9", "9", "9", "9", "9")
 	shown = append(shown, variant{"input", typing.View().Content},
 		variant{"input-refused", press(typing, "enter").View().Content})
-	if err := grouped.session.Set(map[string]string{"api": "local"}); err != nil {
+	if err := grouped.session.Set(map[string]string{"api": "local"}, "tui"); err != nil {
 		t.Fatal(err)
 	}
 	shown = append(shown, variant{"params-group-hidden", grouped.synced().View().Content})
@@ -1549,7 +1567,7 @@ func TestParametersComeInGroups(t *testing.T) {
 	}
 
 	generation := m.session.Generation()
-	if err := m.session.Set(map[string]string{"api": "local"}); err != nil {
+	if err := m.session.Set(map[string]string{"api": "local"}, "tui"); err != nil {
 		t.Fatal(err)
 	}
 	m = m.synced()
@@ -1609,7 +1627,7 @@ func TestTheLogOpensOnWhatTheParameterSays(t *testing.T) {
 func TestAValueThatNoLongerHoldsSaysSo(t *testing.T) {
 	t.Parallel()
 	m := resize(formed(t, groupedBody), 120, 30)
-	if err := m.session.Set(map[string]string{"products": "4000"}); err != nil {
+	if err := m.session.Set(map[string]string{"products": "4000"}, "tui"); err != nil {
 		t.Fatal(err)
 	}
 	path := m.session.Config().Path
@@ -1634,7 +1652,7 @@ func TestTheSessionCardSaysWhatTheFormNotices(t *testing.T) {
 	body := strings.Replace(groupedBody, `branch, "{port}"] }]`, `branch, "{port}"], env: { V: String(deployed.version) } }]`, 1)
 	body = strings.Replace(body, "({ products, branch })", "({ products, branch, deployed })", 1)
 	m := resize(formed(t, body), 120, 30)
-	if err := m.session.Set(map[string]string{"api": "local"}); err != nil {
+	if err := m.session.Set(map[string]string{"api": "local"}, "tui"); err != nil {
 		t.Fatal(err)
 	}
 	if card := ansi.Strip(strings.Join(m.sessionCard(), "\n")); !strings.Contains(card, "deployed.version, deployed.traces are hidden, yet apps.front.env.V depends on them") {

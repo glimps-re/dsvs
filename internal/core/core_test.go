@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -56,7 +57,7 @@ func TestLifecycle(t *testing.T) {
 	switch {
 	case last == nil:
 		t.Fatal("no run outcome after a stop")
-	case !last.ByUser:
+	case last.Ending != Stopped:
 		t.Errorf("stop requested, outcome = %s", last)
 	}
 	if alive(second) {
@@ -182,9 +183,131 @@ func TestCrashIsNotAStop(t *testing.T) {
 		return snap.Status == Idle && snap.Last != nil
 	})
 	last := app.Snapshot().Last
-	if last.ByUser || last.Code != 3 {
+	if last.Ending != ByItself || last.Code != 3 {
 		t.Errorf("outcome = %+v, want an unrequested exit with code 3", last)
 	}
+}
+
+// The log says how each run ends: a signal nobody asked for by its name, a requested restart as a
+// restart and not as a death.
+func TestTheJournalSaysHowARunEnded(t *testing.T) {
+	t.Parallel()
+	_, app, _ := start(t, sleeper)
+
+	app.Start()
+	waitFor(t, "ready", func() bool { return app.Snapshot().Status == Ready })
+	app.Restart()
+	waitFor(t, "restarted", func() bool { return said(app, "-- restarted") && app.Snapshot().Status == Ready })
+	if said(app, "-- killed by SIGTERM") {
+		t.Error("the requested restart is written as a death")
+	}
+
+	if err := syscall.Kill(-app.Snapshot().PID, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "fallen", func() bool { return app.Snapshot().Status == Idle })
+	if last := app.Snapshot().Last; last.String() != "killed by SIGKILL" || !last.Fell() {
+		t.Errorf("end of run = %q (fell: %v), want killed by SIGKILL, fell", last, last.Fell())
+	}
+	if !said(app, "-- killed by SIGKILL") {
+		t.Errorf("the log does not tell the crash: %v", app.Log.Lines())
+	}
+}
+
+// An app that listens elsewhere than at its address stays "starting", and the status says where it
+// listens: dsvs reads it from the sockets its process tree holds, here those of a node launched by
+// a shell.
+func TestAnAppListeningElsewhereSaysWhere(t *testing.T) {
+	t.Parallel()
+	cfg, spy := fixture(t, []string{"sh", "-c", `node -e 'require("http").createServer().listen(0, "127.0.0.1")'; :`, "{port}"})
+	// An address where nothing listens, even a neighboring test that would take the port back:
+	// loopback returns a free port on 127.0.0.1, which a test server can take in the meantime, and
+	// the app would look ready.
+	port, err := FreePort("127.0.0.2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := NewSession(config.Form{}, cfg, held{ep: Endpoint{IP: "127.0.0.2", Port: port}}, ownPort{}, func(*Session) Gateway { return spy })
+	supervising(t, session)
+	app := session.App("app")
+
+	app.Start()
+	waitFor(t, "the address where it listens", func() bool { return app.Snapshot().Astray != nil })
+	snap := app.Snapshot()
+	if on := snap.Astray.On; snap.Status != Starting || len(on) != 1 || !strings.HasPrefix(on[0], "127.0.0.1:") || on[0] == snap.Astray.Want.String() {
+		t.Errorf("status = %s, %s; want starting, and the address where node listens", snap.Status, snap.Astray)
+	}
+	app.Stop()
+	waitFor(t, "stopped", func() bool { return app.Snapshot().Status == Idle })
+	if snap := app.Snapshot(); snap.Astray != nil {
+		t.Errorf("a stopped app still says %s", snap.Astray)
+	}
+}
+
+// What says an app is ready follows from its command when it declares nothing: an app that receives
+// no port is ready as soon as it is launched, where it used to stay "starting" for lack of a port
+// to probe.
+func TestAnAppWithoutAPortIsReadyOnceLaunched(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	cfg := config.Config{Port: 4300, Dir: dir, Apps: []config.App{{Name: "lib", Command: []string{"sleep", "300"}, Dir: dir}}}
+	session := NewSession(config.Form{}, cfg, Loopback{}, ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	supervising(t, session)
+	app := session.App("lib")
+
+	app.Start()
+	waitFor(t, "ready", func() bool { return app.Snapshot().Status == Ready })
+}
+
+// ready.log: the app is ready when a line of its output says so, once per launch — a previous run's
+// line does not count for the next one.
+func TestALineOfTheOutputSaysTheAppIsReady(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	once := filepath.Join(dir, "once")
+	command := []string{"sh", "-c", fmt.Sprintf(`test -e %s || { touch %s; sleep 0.3; printf '\033[32mWatching\033[0m for file changes\n'; }; sleep 300`, once, once)}
+	cfg := config.Config{Port: 4300, Dir: dir, Apps: []config.App{{Name: "lib", Command: command, Dir: dir,
+		Ready: &config.Ready{Log: &config.Pattern{RegExp: `watching for`, Flags: "i"}}}}}
+	session := NewSession(config.Form{}, cfg, Loopback{}, ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	supervising(t, session)
+	app := session.App("lib")
+
+	app.Start()
+	waitFor(t, "starting", func() bool { return app.Snapshot().Status == Starting })
+	waitFor(t, "ready when its output says so", func() bool { return app.Snapshot().Status == Ready })
+	app.Restart()
+	waitFor(t, "restarted", func() bool { return app.Snapshot().Restarts == 1 })
+	time.Sleep(time.Second)
+	if status := app.Snapshot().Status; status != Starting {
+		t.Errorf("restarted without repeating the line, the app is %s, want starting", status)
+	}
+}
+
+// ready.http: the app is ready on the first 2xx on this path, where a route's probe takes anything
+// that is not a server error.
+func TestAHealthPathWantsA2xx(t *testing.T) {
+	t.Parallel()
+	var healthy atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" || !healthy.Load() {
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	cfg, spy := fixture(t, []string{"sh", "-c", "sleep 300", "{port}"})
+	cfg.Apps[0].Ready = &config.Ready{HTTP: "/health"}
+	session := NewSession(config.Form{}, cfg, held{ep: Endpoint{IP: "127.0.0.1", Port: server.Listener.Addr().(*net.TCPAddr).Port}},
+		ownPort{}, func(*Session) Gateway { return spy })
+	supervising(t, session)
+	app := session.App("app")
+
+	app.Start()
+	time.Sleep(time.Second)
+	if status := app.Snapshot().Status; status != Starting {
+		t.Fatalf("on a 404, the app is %s, want starting", status)
+	}
+	healthy.Store(true)
+	waitFor(t, "ready on the first 2xx", func() bool { return app.Snapshot().Status == Ready })
 }
 
 // A command the queue can no longer take is refused and says so, instead of being lost. Without
@@ -1136,6 +1259,118 @@ func TestAppsFollowTheDeclaration(t *testing.T) {
 	}
 }
 
+// An app removed from the configuration without having run has nothing to finish: it leaves the
+// session at once, and nothing says it still runs. It used to stay there forever, its supervisor
+// waiting for a command without ever going back through the removal.
+func TestAnIdleAppGoneFromTheConfigurationLeavesAtOnce(t *testing.T) {
+	t.Parallel()
+	session, declare := declaring(t, "front")
+
+	declare("front", "docs")
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if session.App("docs") == nil {
+		t.Fatal("the app declared by the reload did not appear")
+	}
+	declare("front")
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	// The departure is logged right after the removal: it is the line being waited for.
+	waitFor(t, "docs partie", func() bool {
+		return session.App("docs") == nil && strings.Contains(joinLines(session.Log.Lines()), "docs leaves")
+	})
+	if got := joinLines(session.Log.Lines()); strings.Contains(got, "docs still runs") {
+		t.Errorf("the session log says docs still runs:\n%s", got)
+	}
+}
+
+// A list of apps that was read no longer moves, even when an app leaves while it is being walked:
+// the removal used to shift it in place, and whoever walked it — the browsers' reload, right after
+// an app that never ran left — hit an empty slot and killed the session.
+func TestTheAppsOnceReadStayAsTheyWere(t *testing.T) {
+	t.Parallel()
+	session, declare := declaring(t, "front", "docs")
+	docs := session.App("docs")
+	docs.Start()
+	waitFor(t, "docs starts", func() bool { return docs.Snapshot().Status != Idle })
+	declare("front")
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+
+	read := session.Apps()
+	want := slices.Clone(read)
+	docs.Stop()
+	waitFor(t, "docs partie", func() bool { return session.App("docs") == nil })
+	if !slices.Equal(read, want) {
+		t.Errorf("the list read before docs left changed under its reader: %v, want %v", read, want)
+	}
+}
+
+// Changing an app's color is no reason to restart it: the color does not reach the process.
+func TestAColorIsNoReasonToRestart(t *testing.T) {
+	t.Parallel()
+	session, _ := declaring(t, "front", "search")
+	search := session.App("search")
+	search.Start()
+	waitFor(t, "search starts", func() bool { return search.Snapshot().Status != Idle })
+
+	path := session.Config().Path
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recolored := strings.Replace(string(body), `{ name: "search",`, `{ name: "search", color: "red",`, 1)
+	if err := os.WriteFile(path, []byte(recolored), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if got := search.Cfg().Color; got != "red" {
+		t.Fatalf("search's color is %q, want red: the test changes nothing", got)
+	}
+	if got := search.Drift(); got != Settled {
+		t.Errorf("drift = %v, want none: only its color changed", got)
+	}
+	if got := joinLines(session.Log.Lines()); strings.Contains(got, "restart pending") {
+		t.Errorf("the log announces a restart for a color:\n%s", got)
+	}
+}
+
+// declaring sets up a supervised session on a configuration that declares these apps, each with its
+// route, and returns how to rewrite the declaration: the reload is up to the test.
+func declaring(t *testing.T, names ...string) (*Session, func(names ...string)) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), config.FileName)
+	declare := func(names ...string) {
+		t.Helper()
+		var apps, routes []string
+		for _, name := range names {
+			apps = append(apps, fmt.Sprintf(`{ name: %q, command: ["sh", "-c", "sleep 300", "{port}"] }`, name))
+			routes = append(routes, fmt.Sprintf(`{ path: "/%s", app: %q }`, name, name))
+		}
+		body := fmt.Sprintf(`export default {
+    port: 4300,
+    ingress: [{ host: "localhost", routes: [%s] }],
+    apps: [%s],
+}`, strings.Join(routes, ", "), strings.Join(apps, ", "))
+		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	declare(names...)
+	form, cfg, err := config.Load(path, nil, config.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	supervising(t, session)
+	return session, declare
+}
+
 // supervising starts the session and waits for it to stop at the end of the test.
 func supervising(t *testing.T, session *Session) {
 	t.Helper()
@@ -1250,7 +1485,7 @@ func TestSettingAValueMovesTheProxyFirst(t *testing.T) {
 	session, _ := paramsSession(t)
 	before := session.Generation()
 
-	if err := session.Set(map[string]string{"env": "staging"}); err != nil {
+	if err := session.Set(map[string]string{"env": "staging"}, "cli"); err != nil {
 		t.Fatal(err)
 	}
 	if got := apiTarget(t, session); got != "https://staging-0.example" {
@@ -1269,7 +1504,7 @@ func TestAValueTheConfigurationDoesNotTakeChangesNothing(t *testing.T) {
 	session, _ := paramsSession(t)
 	generation, cfg := session.Generation(), session.Config()
 
-	err := session.Set(map[string]string{"env": "nope"})
+	err := session.Set(map[string]string{"env": "nope"}, "cli")
 	if err == nil || !strings.Contains(err.Error(), "local, staging") {
 		t.Fatalf("Set = %v, want a refusal that quotes the choices", err)
 	}
@@ -1301,7 +1536,7 @@ export default config(form({ target: "https://staging.example" }), ({ target }) 
 	}
 	generation := session.Generation()
 
-	if err := session.Set(map[string]string{"target": ""}); err == nil || !strings.Contains(err.Error(), `route "/api"`) {
+	if err := session.Set(map[string]string{"target": ""}, "cli"); err == nil || !strings.Contains(err.Error(), `route "/api"`) {
 		t.Fatalf("Set target= : %v, want the route's refusal", err)
 	}
 	if got := session.NotApplied(); got != "" {
@@ -1310,7 +1545,7 @@ export default config(form({ target: "https://staging.example" }), ({ target }) 
 	if session.Generation() != generation {
 		t.Error("a refused gesture changed the configuration in force")
 	}
-	if err := session.Set(map[string]string{"target": "https://demo.example"}); err != nil {
+	if err := session.Set(map[string]string{"target": "https://demo.example"}, "cli"); err != nil {
 		t.Fatal(err)
 	}
 	if got := joinLines(session.Log.Lines()); strings.Contains(got, "configuration applied again") {
@@ -1325,7 +1560,7 @@ func TestAValueThatChangesAnAppLeavesItPending(t *testing.T) {
 	app.Start()
 	waitFor(t, "the app ready", func() bool { return app.Snapshot().Status == Ready })
 
-	if err := session.Set(map[string]string{"env": "staging"}); err != nil {
+	if err := session.Set(map[string]string{"env": "staging"}, "cli"); err != nil {
 		t.Fatal(err)
 	}
 	if got := app.Drift(); got != Stale {
@@ -1474,7 +1709,8 @@ func TestAnObservationOutlivesAFailedReplay(t *testing.T) {
 func TestARefusalOfSeveralFaultsReadsOnOneLine(t *testing.T) {
 	t.Parallel()
 	session, rewrite := paramsSession(t)
-	rewrite(`export default { port: 4300, apps: [{ name: "a", command: ["srv"] }, { name: "b", command: ["srv"] }] };`)
+	rewrite(`export default { port: 4300, ingress: [{ host: "localhost", routes: [{ path: "/a", app: "a" }, { path: "/b", app: "b" }] }],
+  apps: [{ name: "a", command: ["srv"] }, { name: "b", command: ["srv"] }] };`)
 	if err := session.Reload(); err == nil {
 		t.Fatal("an invalid configuration reloads")
 	}
@@ -1590,7 +1826,7 @@ func TestTheFormFollowsTheNetworkAndItsRules(t *testing.T) {
 		}
 		return err
 	}
-	set := func(values map[string]string) func() error { return func() error { return session.Set(values) } }
+	set := func(values map[string]string) func() error { return func() error { return session.Set(values, "cli") } }
 	move := func(seen *config.Observed) func() error { return func() error { return session.Observe(seen) } }
 	from := func(name, value, origin string) {
 		t.Helper()
@@ -1731,9 +1967,9 @@ func TestAnUnseenNetworkKeepsTheValueInForce(t *testing.T) {
 			}
 
 			open(office)
-			do(session.Set(map[string]string{"api": "staging"}))
+			do(session.Set(map[string]string{"api": "staging"}, "cli"))
 			do(session.Observe(home))
-			do(session.Set(map[string]string{"api": "demo"}))
+			do(session.Set(map[string]string{"api": "demo"}, "cli"))
 			do(session.Observe(office))
 			api("staging", "network")
 			do(session.Observe(vpn))
@@ -1815,17 +2051,17 @@ func TestADraftWaitsForTheFieldThatCompletesIt(t *testing.T) {
 	supervising(t, session)
 
 	shown := session.Form()
-	if err := session.Set(map[string]string{"api": "staging"}); err == nil || err.Error() != "the form refuses it: client: staging needs a test account" {
+	if err := session.Set(map[string]string{"api": "staging"}, "cli"); err == nil || err.Error() != "the form refuses it: client: staging needs a test account" {
 		t.Errorf("set api=staging = %v, want the form's refusal", err)
 	}
 	if !reflect.DeepEqual(session.Form(), shown) {
 		t.Error("a refused submission changed the form")
 	}
-	if err := session.Draft(map[string]string{"api": "nope"}); err == nil || err.Error() != `api: "nope" is not one of local, staging` {
+	if err := session.Draft(map[string]string{"api": "nope"}, "panel"); err == nil || err.Error() != `api: "nope" is not one of local, staging` {
 		t.Errorf("draft api=nope = %v, want the field's refusal", err)
 	}
 
-	if err := session.Draft(map[string]string{"api": "staging"}); err != nil {
+	if err := session.Draft(map[string]string{"api": "staging"}, "panel"); err != nil {
 		t.Fatal(err)
 	}
 	if api, client := session.Form().Fields[0], session.Form().Fields[1]; api.Value != "staging" || !slices.Equal(client.Errors, []string{"staging needs a test account"}) {
@@ -1838,7 +2074,7 @@ func TestADraftWaitsForTheFieldThatCompletesIt(t *testing.T) {
 		t.Errorf("the draft kept %v and %v before applying", kept, onNetwork)
 	}
 
-	if err := session.Draft(map[string]string{"client": "lea@shop.test"}); err != nil {
+	if err := session.Draft(map[string]string{"client": "lea@shop.test"}, "tui"); err != nil {
 		t.Fatal(err)
 	}
 	if got := apiTarget(t, session); got != "https://staging.example" || session.NotApplied() != "" {
