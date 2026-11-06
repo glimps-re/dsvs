@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -68,6 +69,83 @@ func TestAttachRendersOnTheLentTerminal(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Error("the client did not return")
+	}
+}
+
+// The session of dsvs run is seen like the others, and belongs to its terminal: ctrl+c asks it to stop
+// everything, and the terminal watches it do so before returning.
+func TestARunSessionStopsOnCtrlC(t *testing.T) {
+	session, path := session(t)
+	server := bind(t, path)
+	serving, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(context.Background(), session, stop)
+
+	lend(t)
+	done := make(chan error, 1)
+	go func() { done <- Run(path, refuse) }()
+	for deadline := time.Now().Add(5 * time.Second); !server.Held(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the session does not know its terminal holds it")
+		}
+	}
+	link, err := Watch(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+	if state := <-link.States(); len(state.Interfaces) != 1 || state.Interfaces[0].Kind != "run" {
+		t.Errorf("interfaces = %+v, want run", state.Interfaces)
+	}
+
+	if err := syscall.Kill(os.Getpid(), syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-serving.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("ctrl+c did not stop the session")
+	}
+	// The terminal follows the session until it leaves: it returns once the session is done.
+	server.Close()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("dsvs run exited on: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dsvs run did not return")
+	}
+}
+
+// A dsvs run terminal that goes away without a word — closed, killed — takes its session with it.
+func TestARunSessionStopsWithItsTerminal(t *testing.T) {
+	session, path := session(t)
+	server := bind(t, path)
+	serving, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(context.Background(), session, stop)
+
+	conn, err := net.Dial("unix", socket(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	screen, tty, err := pty.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { screen.Close(); tty.Close() })
+	if err := fdpass.Send(conn.(*net.UnixConn), "attach run 80 24 1 -", int(tty.Fd()), int(tty.Fd())); err != nil {
+		t.Fatal(err)
+	}
+	if line, _ := bufio.NewReader(conn).ReadString('\n'); line != "ok\n" {
+		t.Fatalf("the session answered %q", line)
+	}
+	conn.Close()
+	select {
+	case <-serving.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session outlived its terminal")
 	}
 }
 
