@@ -1,0 +1,8 @@
+{
+  "name": "dsvs",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The shape of a dsvs configuration. Types only: import type.",
+  "types": "index.d.ts",
+  "files": ["index.d.ts"]
+}

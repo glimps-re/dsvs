@@ -172,6 +172,7 @@ Commands:
   update                       take a newer version of this binary, and restart the service
   panel                        open the panel of the running sessions
   config                       write the resolved configuration as JSON
+  types                        write the package specifier of the TypeScript types matching this binary
   skill                        write a skill that teaches this tool to a coding agent
   help [command]               write what a command does, or the list of them
 

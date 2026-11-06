@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -70,6 +71,33 @@ export default {
 	}
 	if len(cfg.Echo) != 1 || !strings.Contains(cfg.Echo[0], "targets of shop") {
 		t.Errorf("Echo = %q, want what the script said", cfg.Echo)
+	}
+}
+
+// A variable set to undefined is not set, as the types promise: apps with different variables, built
+// from one form, fit in one array.
+func TestAnUndefinedVariableIsNotSet(t *testing.T) {
+	t.Parallel()
+	path := write(t, `
+const [tracing, delay] = [true, 200];
+export default {
+    port: 4200,
+    ingress: [{ host: "localhost", routes: [{ path: "/", app: "front" }, { path: "/api", app: "api" }] }],
+    apps: [
+        { name: "front", command: ["srv", "{port}"], env: { TRACING: String(tracing), DELAY_MS: undefined } },
+        { name: "api", command: ["srv", "{port}"], env: { DELAY_MS: String(delay) } },
+    ],
+}`)
+
+	cfg, err := Load(path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := map[string]string{"TRACING": "true"}; !maps.Equal(cfg.Apps[0].Env, want) {
+		t.Errorf("env of front = %v, want %v", cfg.Apps[0].Env, want)
+	}
+	if want := map[string]string{"DELAY_MS": "200"}; !maps.Equal(cfg.Apps[1].Env, want) {
+		t.Errorf("env of api = %v, want %v", cfg.Apps[1].Env, want)
 	}
 }
 

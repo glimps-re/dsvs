@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -194,8 +195,35 @@ func upgrade() error {
 	return nil
 }
 
+// writeTypes writes the pnpm specifier of the types that go with this binary, and says on errOut when
+// the binary is not exactly on its tag: the package is then the one of the last tag.
+func writeTypes(out, errOut io.Writer) error {
+	tag, exact, err := release(build.Version)
+	if err != nil {
+		return err
+	}
+	if !exact {
+		fmt.Fprintf(errOut, "%s is ahead of its last tag: writing the types of %s\n", build.Version, tag)
+	}
+	_, err = fmt.Fprintf(out, "git+ssh://git@github.com/%s.git#%s&path:/types\n", update.Repo(), tag)
+	return err
+}
+
+var described = regexp.MustCompile(`^(v\d+\.\d+\.\d+)(-\d+-g[0-9a-f]+)?(-dirty)?$`)
+
+// release returns the tag this binary comes from, and whether the binary is exactly that tag: git
+// describe adds the number of commits ahead and -dirty to the version of a clone.
+func release(version string) (tag string, exact bool, err error) {
+	parts := described.FindStringSubmatch(version)
+	if parts == nil {
+		return "", false, errors.New("this binary carries no version: pin the types by hand")
+	}
+	return parts[1], parts[2] == "" && parts[3] == "", nil
+}
+
 // machine is what runs here: this binary, its service, the sessions whose port it holds, and the other
 // dsvs binaries with theirs. A single read, two renderings — the text and the JSON say the same thing.
+// the JSON say the same thing.
 type machine struct {
 	Binary   string        `json:"binary"`
 	Version  string        `json:"version"`

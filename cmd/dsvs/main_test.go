@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"dsvs/internal/build"
 )
 
 // The role is the decision point of the command: set up wrong, it had made a role of the table
@@ -134,4 +137,46 @@ func declaring(t *testing.T, port int) string {
 		t.Fatal(err)
 	}
 	return path
+}
+
+func TestReleaseOfAVersion(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		tag     string
+		exact   bool
+		fails   bool
+	}{
+		{"v0.5.0", "v0.5.0", true, false},
+		{"v0.4.2-6-g4009923", "v0.4.2", false, false},
+		{"v0.4.2-dirty", "v0.4.2", false, false},
+		{"v0.4.2-6-g4009923-dirty", "v0.4.2", false, false},
+		{"dev", "", false, true},
+		{"4009923", "", false, true},
+	} {
+		t.Run(tc.version, func(t *testing.T) {
+			tag, exact, err := release(tc.version)
+			if (err != nil) != tc.fails || tag != tc.tag || exact != tc.exact {
+				t.Errorf("release = (%q, %v, %v); want (%q, %v, error %v)",
+					tag, exact, err, tc.tag, tc.exact, tc.fails)
+			}
+		})
+	}
+}
+
+func TestTypesNameTheRepositoryAndTheTagOfTheBinary(t *testing.T) {
+	t.Setenv("DSVS_REPO", "a/b")
+	was := build.Version
+	build.Version = "v0.4.2-6-g4009923"
+	t.Cleanup(func() { build.Version = was })
+
+	var out, said bytes.Buffer
+	if err := writeTypes(&out, &said); err != nil {
+		t.Fatal(err)
+	}
+	if want := "git+ssh://git@github.com/a/b.git#v0.4.2&path:/types\n"; out.String() != want {
+		t.Errorf("specifier %q; want %q", out.String(), want)
+	}
+	if !strings.Contains(said.String(), "ahead of its last tag") {
+		t.Errorf("stderr %q does not say the binary is ahead", said.String())
+	}
 }
