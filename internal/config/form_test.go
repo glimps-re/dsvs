@@ -114,8 +114,8 @@ choices(p.mode, observed ? ["fast", "slow"] : ["slow"]);`
 	}
 }
 
-// A rule set on a group holds for everything it contains, and a hidden field keeps its value: the
-// build receives it.
+// A rule set on a group holds for everything it contains, and a hidden group does not exist for the
+// build: each of its fields is undefined there.
 func TestARuleOnAGroupHoldsForAllItContains(t *testing.T) {
 	t.Parallel()
 	const model = `{ env: ["local", "staging"], api: { staging: ["office", "vpn"], mirror: false } }`
@@ -135,7 +135,7 @@ disabled(p.api.mirror, { when: true });`
 	if mirror := field(t, form, "api.mirror"); !mirror.Disabled || !reflect.DeepEqual(mirror.Reasons, []string{"nothing is observed"}) {
 		t.Errorf("mirror = %+v, want disabled, with its only written reason", mirror)
 	}
-	if want := map[string]any{"env": "local", "api": map[string]any{"staging": "vpn", "mirror": false}}; !reflect.DeepEqual(values, want) {
+	if want := map[string]any{"env": "local", "api": map[string]any{}}; !reflect.DeepEqual(values, want) {
 		t.Errorf("the build received %v, want %v", values, want)
 	}
 	form, _, err = resolved(t, model, schema, Input{Session: map[string]string{"env": "staging"}})
@@ -144,6 +144,45 @@ disabled(p.api.mirror, { when: true });`
 	}
 	if got := field(t, form, "api.staging"); got.Hidden {
 		t.Errorf("api.staging = %+v, want visible outside local", got)
+	}
+}
+
+// A hidden field has no value for the build, but the rules see the one it holds. A configuration that
+// uses it anyway gets told, by the path of what depends on it, or by the failure of the build with it; it
+// remains built without it.
+func TestAHiddenFieldIsNotBuiltFrom(t *testing.T) {
+	t.Parallel()
+	const schema = `const params = form({ api: ["local", "staging"], discount: 0, note: "" }, (p) => {
+  hidden(p.discount, { when: ({ valueOf }) => valueOf(p.api) !== "local" });
+  defaultValue(p.note, ({ valueOf }) => "discount " + valueOf(p.discount));
+});`
+	staging := Input{Session: map[string]string{"api": "staging", "discount": "20"}}
+	cases := []struct {
+		name, build, discount, notice string
+	}{
+		{"badly written", `String(discount)`, "undefined", "discount is hidden, yet apps.a.env.DISCOUNT depends on it"},
+		{"well written", `api === "local" ? String(discount) : "0"`, "0", ""},
+		{"failing with it", `discount > 10 ? (() => { throw new Error("too much") })() : "0"`, "0", "discount is hidden, and the configuration fails with it: too much"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			body := rules + "\n" + schema + `
+export default config(params, ({ api, discount }) => ({ ` + minimal[:strings.Index(minimal, "apps:")] + `apps: [{ name: "a", command: ["srv", "{port}"], env: { DISCOUNT: ` + c.build + ` } }] }));`
+			form, cfg, err := Load(write(t, body), nil, staging)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Apps[0].Env["DISCOUNT"]; got != c.discount {
+				t.Errorf("DISCOUNT = %q, want %q: the build does not receive a hidden field", got, c.discount)
+			}
+			if notices := strings.Join(form.Notices, "; "); notices != c.notice {
+				t.Errorf("the form says %q, want %q", notices, c.notice)
+			}
+			if note := field(t, form, "note"); note.Value != "discount 20" {
+				t.Errorf("note = %q, want the rules to see the held value", note.Value)
+			}
+		})
 	}
 }
 
@@ -253,6 +292,59 @@ validateTree(p, ({ valueOf }) => valueOf(p.via) === "office" && valueOf(p.locale
 	}
 	if want := []string{"via: public is down"}; !reflect.DeepEqual(form.Problems(), want) || values != nil {
 		t.Errorf("problems %q, want %q: the error of secret is dropped with it", form.Problems(), want)
+	}
+}
+
+// A disabled option stays among the choices, with its reason, and is never taken: a gesture that asks
+// for it is refused, a retained value falls back to the default, and comes back when the option is enabled
+// again. A disabled default gives way to the first enabled choice.
+func TestAChoiceCanBeDisabled(t *testing.T) {
+	t.Parallel()
+	const model = `{ api: ["local", "staging", "demo"], mode: ["fast", "slow"] }`
+	const schema = `const vpn = observed?.links.some((link) => link.name === "tun0") ?? false;
+choices(p.api, ["local", { value: "staging", disabled: !vpn && "staging needs the VPN" }, "demo"]);
+defaultValue(p.api, vpn ? "local" : "demo");
+choices(p.mode, [{ value: "fast", disabled: !vpn }, "slow"]);`
+	vpn := &Observed{Links: []Link{{Name: "tun0"}}}
+	cases := []struct {
+		name              string
+		in                Input
+		api, from, mode   string
+		disabled, refused string
+	}{
+		{"off the VPN", Input{}, "demo", "default", "slow", "staging needs the VPN", ""},
+		{"a disabled retained value falls back to the default", Input{Session: map[string]string{"api": "staging"}}, "demo", "default", "slow", "staging needs the VPN", ""},
+		{"and comes back with the option", Input{Session: map[string]string{"api": "staging"}, Observed: vpn}, "staging", "session", "fast", "", ""},
+		{"a gesture that asks for it", Input{Asked: map[string]string{"api": "staging"}}, "demo", "default", "slow", "staging needs the VPN",
+			"api: staging is disabled here: staging needs the VPN"},
+		{"without a reason", Input{Asked: map[string]string{"mode": "fast"}}, "demo", "default", "slow", "staging needs the VPN", "mode: fast is disabled here"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			form, _, err := resolved(t, model, schema, c.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			api, mode := field(t, form, "api"), field(t, form, "mode")
+			if api.Value != c.api || api.From != c.from || mode.Value != c.mode || api.DisabledChoices["staging"] != c.disabled || len(api.Choices) != 3 {
+				t.Errorf("api = %q from %q (%v, disabled %v), mode = %q; want %q from %q, %q, staging: %q", api.Value, api.From, api.Choices, api.DisabledChoices, mode.Value, c.api, c.from, c.mode, c.disabled)
+			}
+			if err := form.Accept(c.in.Asked); (err == nil) != (c.refused == "") || err != nil && err.Error() != c.refused {
+				t.Errorf("Accept = %v, want %q", err, c.refused)
+			}
+		})
+	}
+
+	form, _, err := resolved(t, `{ api: ["staging", "local"] }`, `choices(p.api, [{ value: "staging", disabled: "staging needs the VPN" }, "local"]);`, Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if api := field(t, form, "api"); api.Value != "local" || api.Next() != "local" {
+		t.Errorf("api = %q, next %q: a disabled default gives way to the first enabled choice, which nothing moves away from", api.Value, api.Next())
+	}
+	if _, _, err := resolved(t, `{ api: ["staging"] }`, `choices(p.api, [{ value: "staging", disabled: true }]);`, Input{}); err == nil || !strings.Contains(err.Error(), "api: its choices are all disabled") {
+		t.Errorf("all options disabled: %v, want an error that says so", err)
 	}
 }
 

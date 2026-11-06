@@ -92,8 +92,28 @@ async function resolve(built, build, input) {
     if (moved) continue;
     const valid = problems.length === 0 && fields.every((field) => field.errors.length === 0);
     const said = fields.map(({ edge, ...field }) => compact({ ...field, yielded: yielded.get(field.name)?.yielded }));
-    return { form: { fields: said, errors: problems }, config: valid ? await build(valueAt(""), input.observed) : null };
+    const config = valid ? await build(valueAt("", false), input.observed) : null;
+    const hidden = fields.filter((field) => field.hidden).map((field) => field.name);
+    const notices = valid && hidden.length > 0 ? [await hiddenUse(hidden, config, () => build(valueAt(""), input.observed))].filter(Boolean) : [];
+    return { form: { fields: said, errors: problems, notices }, config };
   }
+}
+
+// A hidden field does not exist for the build: it receives undefined, and only the rules see its stored
+// value. hiddenUse builds a second time with it, and says what depends on it anyway — the path of the
+// first difference — or that the build fails with it. The configuration used remains the one built
+// without it.
+async function hiddenUse(hidden, config, withHidden) {
+  const named = hidden.length === 1 ? `${hidden[0]} is hidden` : `${hidden.join(", ")} are hidden`;
+  const them = hidden.length === 1 ? "it" : "them";
+  let other;
+  try {
+    other = await withHidden();
+  } catch (error) {
+    return `${named}, and the configuration fails with ${them}: ${String(error?.message ?? error).split("\n")[0]}`;
+  }
+  const at = difference(plain(config), plain(other), "");
+  return at !== null && `${named}, yet ${at || "the configuration"} depends on ${them}`;
 }
 
 const retained = ["network", "session", "kept"];
@@ -158,14 +178,21 @@ async function evaluate(built, input, yielded) {
   const stateOf = (name) => ({ hidden: flag("hidden", name), disabled: reasons(name).length > 0, readonly: flag("readonly", name) });
   const last = (kind, name) => matching(kind, name, true).at(-1);
 
-  const choicesOf = (name) =>
+  // An option is a value, and the reason that disables it: false when it can be chosen.
+  const optionsOf = (name) =>
     once(`choices:${name}`, name, () => {
       const { type, spec } = leaf(name);
       const rule = last("choices", name);
       const listed = rule ? said(rule, "list") : type === "choice" ? spec : type === "flag" ? [spec, !spec] : null;
       if (listed?.length === 0) throw new Error(`${name}: its choices leave none`);
-      return listed && listed.map(String);
+      return listed && listed.map(option);
     });
+  const choicesOf = (name) => optionsOf(name)?.map((one) => one.value) ?? null;
+  const enabledOf = (name) => {
+    const enabled = optionsOf(name)?.filter((one) => one.off === false).map((one) => one.value) ?? null;
+    if (enabled?.length === 0) throw new Error(`${name}: its choices are all disabled`);
+    return enabled;
+  };
   const fallbackOf = (name) =>
     once(`default:${name}`, name, () => {
       const { type, spec } = leaf(name);
@@ -184,25 +211,25 @@ async function evaluate(built, input, yielded) {
   };
   const resolved = (name) =>
     once(`value:${name}`, name, () => {
-      const listed = choicesOf(name);
+      const enabled = enabledOf(name);
       const fallback = fallbackOf(name);
       const [intent, from] = intentOf(name);
-      if (intent !== undefined && reads(leaf(name).type, intent) && (!listed || listed.includes(intent))) return [intent, from];
-      return [!listed || listed.includes(fallback) ? fallback : listed[0], "default"];
+      if (intent !== undefined && reads(leaf(name).type, intent) && (!enabled || enabled.includes(intent))) return [intent, from];
+      return [!enabled || enabled.includes(fallback) ? fallback : enabled[0], "default"];
     });
   const typed = (name) => {
     const [text] = resolved(name);
     const { type } = leaf(name);
     return type === "flag" ? text === "true" : type === "number" ? Number(text) : text;
   };
-  const valueAt = (name) => {
+  const valueAt = (name, hiddenToo = true) => {
     if (leaf(name)) return typed(name);
     const values = {};
     for (const one of built.leaves.filter((one) => covers({ name }, one.name))) {
       const keys = one.name.slice(name ? name.length + 1 : 0).split(".");
       let at = values;
       for (const key of keys.slice(0, -1)) at = at[key] ??= {};
-      at[keys.at(-1)] = typed(one.name);
+      at[keys.at(-1)] = hiddenToo || !flag("hidden", one.name) ? typed(one.name) : undefined;
     }
     return values;
   };
@@ -234,7 +261,7 @@ async function evaluate(built, input, yielded) {
       }
     }
     fields.push({
-      name, type, choices: choicesOf(name) ?? undefined, value, from, hidden, disabled, reasons: reasons(name).filter(Boolean), readonly,
+      name, type, choices: choicesOf(name) ?? undefined, disabledChoices: disabledOf(optionsOf(name)), value, from, hidden, disabled, reasons: reasons(name).filter(Boolean), readonly,
       required: Boolean(requiring), min: bound("min", name), max: bound("max", name), minLength: bound("minLength", name), maxLength: bound("maxLength", name),
       pattern: bound("pattern", name)?.source, keep: flag("keep", name), network: flag("network", name), errors, edge,
     });
@@ -251,6 +278,46 @@ async function evaluate(built, input, yielded) {
     }
   }
   return { fields, problems, valueAt };
+}
+
+// plain returns a configuration as it travels: as JSON, a RegExp by its source and its flags.
+function plain(config) {
+  return JSON.parse(JSON.stringify(config ?? null, (_, value) => (value instanceof RegExp ? { regexp: value.source, flags: value.flags } : value)));
+}
+
+// difference returns the path of the first difference between two JSON values, or null when there is
+// none. A list item that has a name is designated by it: apps.api rather than apps[1].
+function difference(a, b, at) {
+  if (JSON.stringify(a) === JSON.stringify(b)) return null;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+      const item = a[i] ?? b[i];
+      const found = difference(a[i], b[i], typeof item?.name === "string" ? `${at}.${item.name}` : `${at}[${i}]`);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  if (a !== null && b !== null && typeof a === "object" && typeof b === "object" && !Array.isArray(a) && !Array.isArray(b)) {
+    for (const key of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      const found = difference(a[key], b[key], at ? `${at}.${key}` : key);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  return at;
+}
+
+// option reads an entry of choices: a bare value, or { value, disabled }, where disabled is true or says
+// why.
+function option(entry) {
+  if (entry === null || typeof entry !== "object") return { value: String(entry), off: false };
+  return { value: String(entry.value), off: entry.disabled ? (typeof entry.disabled === "string" ? entry.disabled : "") : false };
+}
+
+// disabledOf returns the disabled options, each with its reason, or nothing when all can be chosen.
+function disabledOf(options) {
+  const off = (options ?? []).filter((one) => one.off !== false);
+  return off.length > 0 ? Object.fromEntries(off.map((one) => [one.value, one.off])) : undefined;
 }
 
 // compact keeps only what a field has to say: a false state or an empty list is not written.

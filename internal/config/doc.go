@@ -20,20 +20,23 @@
 // network; a default is never one of them. The machine owns the observation. The form owns the
 // resolved state of each field, computed on every evaluation and never stored here. The configuration
 // is built from the resolved values alone, and only when the form is valid: Load returns nil
-// otherwise, and the form says why.
+// otherwise, and the form says why. A hidden field has none: the build receives it as undefined, only
+// the rules seeing the value it holds. The engine builds a second time with that value when a field is
+// hidden, and the form says what depends on it anyway (Form.Notices).
 //
 // A field's value is the first intention that exists, in this order: asked, kept for the network if
 // the field follows it, chosen in the session, kept for the project if it keeps it. It holds if it
-// parses in the field's type and is among its current choices; otherwise it is the current default.
-// The cascade is the engine's, because keep and network are rules: Go only lays the layers into the
-// input. A stale intention thus falls back to the default without an error, and comes back when the
-// file makes it possible again. A kept intention — anything that is not the gesture in progress —
-// that its field's rules refuse yields likewise, to the bound it exceeds for min and max, to the
-// default otherwise, and the field says so (Field.Yielded): a file that changes does not block a
-// session over a value that was set in it, and does not change it silently. The engine replays the
-// evaluation until nothing yields any more. What stays invalid — a default that does not hold, an
-// error of the whole form — is the file's fault. No rule writes: the graph has no effect, a
-// circular dependency is an error that names its fields, and one evaluation by replay is enough.
+// parses in the field's type and is among its current choices, without being disabled; otherwise it
+// is the current default, and failing that the first enabled choice. The cascade is the engine's,
+// because keep and network are rules: Go only lays the layers into the input. A stale intention thus
+// falls back to the default without an error, and comes back when the file makes it possible again.
+// A kept intention — anything that is not the gesture in progress — that its field's rules refuse
+// yields likewise, to the bound it exceeds for min and max, to the default otherwise, and the field
+// says so (Field.Yielded): a file that changes does not block a session over a value that was set in
+// it, and does not change it silently. The engine replays the evaluation until nothing yields any
+// more. What stays invalid — a default that does not hold, an error of the whole form — is the
+// file's fault. No rule writes: the graph has no effect, a circular dependency is an error that names
+// its fields, and one evaluation by replay is enough.
 //
 // Accept is the only guard of writes: a value a field does not take, or that would leave the form
 // invalid, changes nothing. Keeping and Following say, on the form being applied, what to keep and

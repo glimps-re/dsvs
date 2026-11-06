@@ -579,8 +579,8 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 	})
 	session.SetRenewal(renewal(session, attachers, network))
 	if taken == nil {
-		// A handover already said what yields, in the log it carries.
-		for _, said := range form.Yields() {
+		// A handover already said what the form says, in the log it carries.
+		for _, said := range form.Said() {
 			session.Log.Add("-- " + said)
 		}
 	}
