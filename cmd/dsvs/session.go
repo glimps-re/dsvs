@@ -26,8 +26,8 @@ const settling = 300 * time.Millisecond
 // box: beyond it, the session no longer decides.
 const stopping = 30 * time.Second
 
-// bare is dsvs with no command: the session of the configuration here is there, or it is born, and
-// its state is written. Nothing is ordered; --tui opens the interface on it
+// bare is dsvs with no command: the session of the configuration here is there, or it is born — the
+// service with it — and its state is written. Nothing is ordered; --tui opens the interface on it
 // instead of returning.
 func bare(s *shape) error {
 	if s.tui {
@@ -42,7 +42,7 @@ func bare(s *shape) error {
 }
 
 // order carries an order to the session here and writes what it says about it. start ensures it — it
-// is born if need be; the others require it alive, since there is nothing to stop
+// is born if need be, the service with it; the others require it alive, since there is nothing to stop
 // or reload in a session that is not there. An empty list of names means "every app": the session
 // resolves it, and it is what --all sends.
 func order(s *shape, verb string, names []string) error {
@@ -227,10 +227,14 @@ func watching(s *shape) (*attach.Link, error) {
 	return attach.Watch(config)
 }
 
-// ensure returns the link with the session here, starting it if it is not there.
+// ensure returns the link with the session here, starting it if it is not there — and the service with
+// it, whose lack of a status bar is only a note here: a session serves without an icon.
 func ensure(s *shape) (*attach.Link, error) {
 	config, err := resolve(s.config)
 	if err != nil {
+		return nil, err
+	}
+	if err := serving(); err != nil {
 		return nil, err
 	}
 	return attach.Ensure(config, func() error { return spawn(config, s.args()) })

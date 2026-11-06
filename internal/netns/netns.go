@@ -369,6 +369,7 @@ func (v *Virtual) Dial(ctx context.Context, ep core.Endpoint) (net.Conn, error) 
 func (v *Virtual) Mode() core.Mode {
 	return core.Mode{
 		Name:     "netns",
+		Detail:   v.subnet.String() + ", one address per app",
 		Isolated: true,
 	}
 }

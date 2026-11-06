@@ -52,4 +52,6 @@ if [ -n "$install" ]; then
     # install, not cp: cp fails with ETXTBSY on a running binary.
     install -m 755 "bin/$name" "$target"
     echo "installed: $target"
+    # The unit carries the binary's path: it is rewritten at every install, and targets this binary.
+    "$target" --install-unit
 fi

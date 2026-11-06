@@ -1,11 +1,18 @@
 package main
 
 import (
+	"cmp"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
+	"time"
 )
 
 // boxEnv says whether the box question is settled, and how: inBox when inside it, otherwise the
@@ -86,4 +93,82 @@ func nofile() string {
 		return "524288"
 	}
 	return fmt.Sprintf("%d:%d", l.Cur, l.Max)
+}
+
+// takeLoginEnv puts the service in the environment a terminal of the user would have, and everything
+// it starts afterwards inherits it — the session, its apps, the update. A shell that fails leaves the
+// manager's environment, and the service log says so once.
+func takeLoginEnv() {
+	env, err := loginEnv(loginShellDelay)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "-- keeping the environment of the service manager: "+err.Error())
+		return
+	}
+	os.Clearenv()
+	for _, kv := range env {
+		key, value, _ := strings.Cut(kv, "=")
+		_ = os.Setenv(key, value)
+	}
+}
+
+// loginShellDelay bounds the wait for the login shell: an rc waiting for input does not hold the
+// icon back.
+const loginShellDelay = 10 * time.Second
+
+// loginEnv returns the environment given by the user's interactive login shell. The user's systemd
+// manager only has the system PATH, and ~/.bashrc — where nvm, pnpm and the others set theirs —
+// returns early unless read by an interactive shell: a service born from the unit would not find
+// node. The shell returns its environment on descriptor 3, because stdout belongs to its rc files
+// (motd, fastfetch) and stderr to bash, which complains about the missing terminal.
+func loginEnv(delay time.Duration) ([]string, error) {
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/sh"
+	}
+	read, write, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	defer read.Close()
+	null, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer null.Close()
+
+	ctx, done := context.WithTimeout(context.Background(), delay)
+	defer done()
+	login := exec.CommandContext(ctx, shell, "-ilc", "exec env -0 >&3")
+	login.Stdin, login.Stdout, login.Stderr = null, null, null
+	login.ExtraFiles = []*os.File{write}
+	// A lingering shell must not outlive the tool, just like the configuration's node.
+	login.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	if err := login.Start(); err != nil {
+		write.Close()
+		return nil, err
+	}
+	// Our end of the pipe closes before reading: otherwise the read would wait for an end nobody writes
+	// anymore. An rc that leaves a daemon behind, inheriting descriptor 3, would hold it the same way —
+	// hence the same deadline on the read as on the shell.
+	write.Close()
+	deadline, _ := ctx.Deadline()
+	_ = read.SetReadDeadline(deadline)
+	said, err := io.ReadAll(read)
+	if waited := login.Wait(); waited != nil {
+		return nil, fmt.Errorf("%s: %w", shell, cmp.Or(ctx.Err(), waited))
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	var env []string
+	for _, kv := range strings.Split(string(said), "\x00") {
+		if key, _, ok := strings.Cut(kv, "="); ok && key != "" {
+			env = append(env, kv)
+		}
+	}
+	if !slices.ContainsFunc(env, func(kv string) bool { return strings.HasPrefix(kv, "PATH=") }) {
+		return nil, errors.New(shell + " gave an environment without PATH")
+	}
+	return env, nil
 }

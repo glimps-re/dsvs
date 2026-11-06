@@ -6,7 +6,8 @@
 // # A session lives without a terminal
 //
 // What keeps detaching small is SCM_RIGHTS: the session runs in its systemd box and renders the TUI on
-// the terminal it is lent, with no second renderer to write.
+// the terminal it is lent, with no second renderer to write. The background service holds only the
+// icon and the panel; the ports stay with the hub, which it does not own.
 //
 // A session's identity is the absolute path of its configuration: whoever knows which configuration
 // they want knows where to knock, with no directory to look up.

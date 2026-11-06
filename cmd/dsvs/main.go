@@ -1,16 +1,20 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"image"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -23,17 +27,22 @@ import (
 	"dsvs/internal/gateway"
 	"dsvs/internal/hub"
 	"dsvs/internal/netns"
+	"dsvs/internal/projects"
+	"dsvs/internal/ui/panel"
 	"dsvs/internal/ui/plain"
+	"dsvs/internal/ui/tray"
 )
 
 func main() {
-	s := &shape{net: "auto"}
+	s := &shape{net: "auto", shift: portShift()}
 	fs := newFlagSet("dsvs")
 	s.declare(fs)
-	// The plumbing the binary addresses to itself stays as flags, and is not a command: the hub, spawn
-	// and build.sh type them.
+	// The plumbing the binary addresses to itself stays as flags, and is not a command: the installed
+	// unit, the hub, spawn and build.sh type them.
 	ports := fs.Bool("hub", false, "hold the ports for the sessions, without serving anything")
 	headless := fs.Bool("session", false, "hold the session without an interface, for the clients that attach to it")
+	icon := fs.Bool("tray", false, "hold the status bar icon, which opens the panel on a click")
+	unit := fs.Bool("install-unit", false, "install the systemd --user unit that starts the service at session start")
 	tell := fs.Bool("version", false, "write the version of the binary and quit")
 	switch err := fs.Parse(os.Args[1:]); {
 	case errors.Is(err, flag.ErrHelp):
@@ -44,10 +53,13 @@ func main() {
 	}
 
 	// The role is a single decision point: one flag names it, two are refused, and none lets the
-	// command line decide.
+	// command line decide. None of these roles needs a configuration or a running service: the hub is
+	// already in its unit, the icon holds the display, and the unit is installed once and for all.
 	chosen, err := only([]role{
 		{"version", *tell, func() error { fmt.Println(build.Version); return nil }},
 		{"hub", *ports, hub.Serve},
+		{"tray", *icon, hold},
+		{"install-unit", *unit, func() error { return installUnit(s.shift) }},
 		{"session", *headless, func() error { return serve(true, s, fs.Args()) }},
 	}, func() error { return dispatch(s, fs.Args()) })
 	if err != nil {
@@ -90,17 +102,74 @@ func serve(headless bool, s *shape, names []string) error {
 	return run(s, headless, ctl, fallback, names)
 }
 
-// machine is what runs here: this binary, the sessions whose port it holds, and the other
+// hold holds the status bar icon. Only one at a time, and the socket says so: taking it fails when
+// another one holds it, as for the hub. This socket is also the voice of the service: it is through it
+// that the panel asks the service to go away.
+func hold() error {
+	// The service is born from the systemd manager and not from a shell: it takes the environment of
+	// one of the user's terminals itself, once, before anything descends from it.
+	takeLoginEnv()
+	sock, err := hub.Bind(hub.TrayAddr())
+	if errors.Is(err, hub.ErrTaken) {
+		return nil // an icon is already up: nothing to do, and nothing to say
+	}
+	if err != nil {
+		return err
+	}
+	defer sock.Close()
+	go listen(sock)
+	return tray.Run(panel.Open)
+}
+
+// listen listens to what is asked of the service. One word, "quit", and it goes away: the icon has
+// nothing to save, and the panel that asked may live in this very process — waiting for it would lead
+// nowhere.
+func listen(sock net.Listener) {
+	for {
+		conn, err := sock.Accept()
+		if err != nil {
+			return
+		}
+		asked, _ := bufio.NewReader(conn).ReadString('\n')
+		switch strings.TrimSpace(asked) {
+		case "quit":
+			conn.Close()
+			os.Exit(0)
+		case "restart":
+			// The service replaces itself with the binary on disk, the one the update just put there:
+			// same PID, so the systemd unit that holds it sees nothing happen, and the socket closes at
+			// the exec to be taken again right away. An exec that succeeds never returns: what follows
+			// only happens on failure, and that is what the update waits for — without it, it would
+			// only have the service's word that it moved to the new binary.
+			if err := relaunch(); err != nil {
+				fmt.Fprintln(conn, err)
+			}
+		}
+		conn.Close()
+	}
+}
+
+// relaunch replaces this process with the binary on disk, and only returns the reason it could not.
+func relaunch() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(exe, []string{exe, "--tray"}, os.Environ())
+}
+
+// machine is what runs here: this binary, its service, the sessions whose port it holds, and the other
 // dsvs binaries with theirs. A single read, two renderings — the text and the JSON say the same thing.
 type machine struct {
 	Binary   string        `json:"binary"`
 	Version  string        `json:"version"`
+	Service  bool          `json:"service"`
 	Sessions []hub.Session `json:"sessions,omitempty"`
 	Peers    []hub.Peer    `json:"peers,omitempty"`
 }
 
-// status writes what runs. It is the answer to "what holds my ports", and it needs no
-// configuration.
+// status writes what runs. It is the answer to "what holds my ports", and it needs neither a
+// configuration nor a running service.
 func status(asJSON bool) error {
 	sessions, err := hub.Sessions()
 	if err != nil {
@@ -109,6 +178,7 @@ func status(asJSON bool) error {
 	here := machine{
 		Binary:   build.Name(),
 		Version:  build.Version,
+		Service:  hub.Answers(hub.TrayAddr()),
 		Sessions: sessions,
 		Peers:    hub.Peers(),
 	}
@@ -122,6 +192,11 @@ func status(asJSON bool) error {
 // writeStatus writes what runs for a human. It is a rendering and nothing else.
 func writeStatus(out io.Writer, here machine) {
 	fmt.Fprintf(out, "%s %s\n", here.Binary, here.Version)
+	if here.Service {
+		fmt.Fprintln(out, "  service: running, icon in the status bar")
+	} else {
+		fmt.Fprintln(out, "  service: not running")
+	}
 	if len(here.Sessions) == 0 {
 		fmt.Fprintln(out, "  sessions: none, no port held")
 	}
@@ -163,14 +238,122 @@ func held(port int) string {
 	return fmt.Sprintf("; %s%s holds it for %s", peer.Name, since(peer), session.Config)
 }
 
+// service is the command: without an argument it ensures the background service and its icon, so a
+// missing status bar is a failure here; stop and restart go through the icon's socket, which is the
+// voice of the service and hears them wherever they come from.
+func service(args []string) error {
+	switch {
+	case len(args) == 0:
+		started, err := raise()
+		switch {
+		case err != nil:
+			return err
+		case started:
+			_, err = fmt.Println("service started")
+		default:
+			_, err = fmt.Println("service already running")
+		}
+		return err
+	case len(args) == 1 && args[0] == "stop":
+		if err := say("quit"); err != nil {
+			return err
+		}
+		_, err := fmt.Println("service stopped")
+		return err
+	case len(args) == 1 && args[0] == "restart":
+		if err := say("restart"); err != nil {
+			return err
+		}
+		if !hub.Awaits(hub.TrayAddr()) {
+			return errors.New("the service did not put its icon back in the status bar")
+		}
+		_, err := fmt.Println("service restarted on " + build.Label())
+		return err
+	}
+	return fmt.Errorf("service takes stop, restart, or nothing, got %q", strings.Join(args, " "))
+}
+
+// say carries a word to the icon's socket and returns what it had to answer: nothing when the word
+// was obeyed — the service goes away or execs, and the socket closes on its silence.
+func say(word string) error {
+	conn, err := net.Dial("unix", hub.TrayAddr())
+	if err != nil {
+		return errors.New("no service running")
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintln(conn, word); err != nil {
+		return err
+	}
+	answer, _ := bufio.NewReader(conn).ReadString('\n')
+	if answer = strings.TrimSpace(answer); answer != "" {
+		return errors.New(answer)
+	}
+	return nil
+}
+
+// openPanel opens the projects panel without going through the icon. The null rectangle says no icon
+// anchors it: it places itself.
+func openPanel() error {
+	return panel.Open(image.Rect(-1, -1, -1, -1), nil, func() {})
+}
+
+// raise makes sure the service runs, and says whether it started it: the hub of the ports is born on
+// demand from the sessions, the status bar icon is what remains to hold. The gesture can be repeated
+// harmlessly — what to say about it belongs to whoever asked.
+func raise() (bool, error) {
+	if hub.Answers(hub.TrayAddr()) {
+		return false, nil
+	}
+	if !tray.Available() {
+		return false, errNoStatusBar
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return false, err
+	}
+	// The service does not belong to the terminal that asked for it: it lives until the X session ends.
+	holder := exec.Command(exe, "--tray")
+	holder.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := holder.Start(); err != nil {
+		return false, err
+	}
+	// A started service implies the icon is up: wait for it to answer rather than promise it.
+	if !hub.Awaits(hub.TrayAddr()) {
+		return false, errors.New("the service did not put its icon in the status bar")
+	}
+	return true, nil
+}
+
+// errNoStatusBar says there is no icon to put up on this display. It is a failure for whoever asked
+// only for the service, a mere note for the session that does without it.
+var errNoStatusBar = errors.New("no status bar on this display; the panel opens with: " + build.Name() + " panel")
+
 // lend lends the terminal of this process to the session of the configuration here, starting it if it
-// is not there yet. names are the apps to start, ordered after attaching.
+// is not there yet, and the service with it. names are the apps to start, ordered after attaching.
 func lend(s *shape, names []string) error {
 	config, err := resolve(s.config)
 	if err != nil {
 		return err
 	}
+	if err := serving(); err != nil {
+		return err
+	}
 	return attach.Attach(config, ui(), names, func() error { return spawn(config, s.args()) })
+}
+
+// serving ensures the service for whoever wants a session: what it changed is said, and a missing
+// status bar is only a note here — a session serves without an icon.
+func serving() error {
+	started, err := raise()
+	switch {
+	case errors.Is(err, errNoStatusBar):
+		fmt.Println(err)
+	case err != nil:
+		return err
+	case started:
+		fmt.Println("service started")
+	}
+	return nil
 }
 
 // ui is the interface this terminal can render: the TUI needs a real one, the log stream makes do with
@@ -217,6 +400,9 @@ func run(s *shape, headless bool, ctl, fallback string, names []string) error {
 	if err != nil {
 		return err
 	}
+	// The project is remembered as soon as a session opens for it: that is what makes it appear in the
+	// panel, cold, at the next start. Failing to write it does not prevent serving.
+	_ = projects.Remember(path)
 
 	// The session's socket opens before anything is read: it is named by the configuration, which is
 	// the identity of the session, and it is through it that a client will learn the session did not
@@ -240,7 +426,7 @@ func run(s *shape, headless bool, ctl, fallback string, names []string) error {
 		return err
 	}
 
-	cfg, err := load(path, s.port, s.watch)
+	cfg, err := load(path, s.port, s.shift, s.watch)
 	if err != nil {
 		return failed(err)
 	}
@@ -343,18 +529,34 @@ func resolve(path string) (string, error) {
 }
 
 // load reads the configuration and applies the session's choices: the port, and the paths to watch on
-// top of its own.
-func load(path string, port int, watch paths) (config.Config, error) {
+// top of its own. The two ways of choosing the port exclude each other — a typed port is absolute, a
+// shift applies to the one the file declares — and either one forces it, which makes it hold across
+// reloads.
+func load(path string, port, shift int, watch paths) (config.Config, error) {
 	cfg, err := config.Load(path, watch)
 	if err != nil {
 		return config.Config{}, err
 	}
-	if port > 0 {
-		// A choice of the session: it wins over the file at every read, reloads included.
+	switch {
+	case port > 0:
 		cfg.Port, cfg.ForcedPort = port, port
+	case shift != 0:
+		cfg.Port, cfg.ForcedPort = cfg.Port+shift, cfg.Port+shift
 	}
 	return cfg, nil
 }
+
+// portShift is the port shift of this instance, as its environment carries it: the service's unit sets
+// it, and everything the service starts inherits it — sessions, terminal, update. It is the only reader
+// of the variable; --port-shift is only its command-line form, and a value that is not an integer
+// shifts nothing.
+func portShift() int {
+	shift, _ := strconv.Atoi(os.Getenv(shiftEnv))
+	return shift
+}
+
+// shiftEnv carries the port shift to everything an instance starts.
+const shiftEnv = "DSVS_PORT_SHIFT"
 
 // role is what a process does with its life: the flag that asks for it, and what it runs. They all
 // exclude each other.
@@ -387,7 +589,7 @@ func printConfig(s *shape) error {
 	if err != nil {
 		return err
 	}
-	cfg, err := load(path, s.port, s.watch)
+	cfg, err := load(path, s.port, s.shift, s.watch)
 	if err != nil {
 		return err
 	}

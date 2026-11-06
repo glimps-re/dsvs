@@ -34,7 +34,8 @@ func commands(s *shape) []command {
 		args:    "[--all] <name...>",
 		summary: "start the apps these names pull in",
 		long: `start starts the apps these names pull in, in the session of the configuration found here. That
-session is started if it is not running yet. The state of the session is written as soon as the order is placed and the prompt returns: the session lives
+session is started if it is not running yet, and the background service with it. The state of
+the session is written as soon as the order is placed and the prompt returns: the session lives
 without a terminal, and keeps running. --all takes every app of the configuration instead of names.
 --tui opens the interface on it instead of returning.`,
 		declare: ordering(s, "start"),
@@ -65,7 +66,8 @@ session must be running.`,
 		name:    "quit",
 		summary: "stop the apps of the session and close it",
 		long: `quit stops the apps of the session, releases its port and closes it. The attached interfaces
-watch it go.`,
+watch it go. The background service and its icon stay: dsvs service stop is what sends them
+away.`,
 		declare: direct(closing(s)),
 	}, {
 		name:    "state",
@@ -100,10 +102,24 @@ survive the command. The apps these names pull in are started with it.`,
 		name:    "status",
 		args:    "[--json]",
 		summary: "write what runs on this machine, and who holds the ports",
-		long: `status writes what runs: this binary and its version, the sessions it holds a port for, and the
-other dsvs binaries with theirs. It is the answer to "what holds my port", and it needs no
-configuration.`,
+		long: `status writes what runs: this binary and its version, its background service, the sessions it
+holds a port for, and the other dsvs binaries with theirs. It is the answer to "what holds my
+port", and it needs neither a configuration nor a service.`,
 		declare: reading(func(asJSON bool) error { return status(asJSON) }),
+	}, {
+		name:    "service",
+		args:    "[stop|restart]",
+		summary: "start the background service and its icon, or stop it",
+		long: `service starts the background service and its status bar icon, then returns; it is what the
+installed systemd unit does at session start, and any command needing it does it on demand. stop
+sends it away, icon included, and restart makes it take the binary on disk.`,
+		declare: direct(service),
+	}, {
+		name:    "panel",
+		summary: "open the panel of the running sessions",
+		long: `panel opens the panel of the projects and their sessions, without going through the status bar
+icon, and returns when it closes.`,
+		declare: direct(func([]string) error { return openPanel() }),
 	}, {
 		name:    "config",
 		summary: "write the resolved configuration as JSON",
@@ -195,14 +211,16 @@ configuration. The session port is taken when it starts and released when it sto
 answers on it, and a path leading to a stopped app answers 502.
 
 dsvs needs a configuration: the one named by --config, or the first one found searching up from the
-current directory. Everything it needs around it starts on demand and says so — the session lives
-without a terminal and survives the commands and interfaces that watch it.
+current directory. Everything it needs around it starts on demand and says so — the background
+service and its icon, then the session, which lives without a terminal and survives the commands and
+interfaces that watch it.
 
 dsvs with no command starts what the configuration found here needs, writes the state of its session
 and returns; --tui opens the interface on that session instead. A configuration runs only once, and
 two sessions never fight over a host: the second one is refused, and says so.
 
-A few flags are the binary talking to itself — --hub, --session, --version — and are not commands.
+A few flags are the binary talking to itself — --tray, --hub, --session, --install-unit, --version —
+and are not commands.
 `
 
 // list writes the table: each command with the usage of its arguments and its summary, in columns.
@@ -263,6 +281,7 @@ func options(out io.Writer, fs *flag.FlagSet) {
 type shape struct {
 	config string
 	port   int
+	shift  int
 	net    string
 	tui    bool
 	watch  paths
@@ -273,6 +292,8 @@ func (s *shape) declare(fs *flag.FlagSet) {
 	fs.StringVar(&s.config, "config", s.config,
 		"path of the configuration `file` (default: the first "+config.FileName+" found searching up)")
 	fs.IntVar(&s.port, "port", s.port, "session `port`, instead of the one in the configuration")
+	fs.IntVar(&s.shift, "port-shift", s.shift,
+		"`offset` added to the port the configuration declares, so that a second binary can serve the same projects")
 	fs.StringVar(&s.net, "net", s.net, "apps `network`: \"auto\", \"netns\" to require it, \"loopback\" to do without")
 	fs.BoolVar(&s.tui, "tui", s.tui, "open the interface on the session, instead of returning")
 	fs.Var(&s.watch, "watch",
@@ -282,7 +303,7 @@ func (s *shape) declare(fs *flag.FlagSet) {
 // globals returns a FlagSet holding only the global options, to write them in the help.
 func globals(s *shape) *flag.FlagSet {
 	fs := newFlagSet("dsvs")
-	(&shape{net: s.net}).declare(fs)
+	(&shape{net: s.net, shift: s.shift}).declare(fs)
 	return fs
 }
 
@@ -291,6 +312,11 @@ func (s *shape) args() []string {
 	var out []string
 	if s.port > 0 {
 		out = append(out, "--port", strconv.Itoa(s.port))
+	}
+	// The shift travels through the environment when the service unit sets it; typed by hand, this is
+	// its only route to the session being started.
+	if s.shift != 0 {
+		out = append(out, "--port-shift", strconv.Itoa(s.shift))
 	}
 	if s.net != "auto" {
 		out = append(out, "--net", s.net)

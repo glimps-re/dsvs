@@ -23,6 +23,8 @@ func TestGlobalOptionsAreTakenBeforeAsAfterTheCommand(t *testing.T) {
 		{"on both sides, the last one wins",
 			[]string{"--config", "/one/dsvs.json", "state", "--config", "/two/dsvs.json"},
 			shape{config: "/two/dsvs.json"}},
+		{"the port before, the shift after", []string{"--port", "4999", "state", "--port-shift", "100"},
+			shape{port: 4999, shift: 100}},
 		{"repeatable on both sides", []string{"--watch", "one", "state", "--watch", "two"},
 			shape{watch: paths{"one", "two"}}},
 		{"after an argument", []string{"logs", "api", "--port", "4999"}, shape{port: 4999}},
@@ -31,7 +33,7 @@ func TestGlobalOptionsAreTakenBeforeAsAfterTheCommand(t *testing.T) {
 	} {
 		t.Run(tc.what, func(t *testing.T) {
 			got := parsed(t, tc.line)
-			if got.config != tc.wanted.config || got.port != tc.wanted.port {
+			if got.config != tc.wanted.config || got.port != tc.wanted.port || got.shift != tc.wanted.shift {
 				t.Errorf("shape = %+v; want %+v", got, tc.wanted)
 			}
 			if strings.Join(got.watch, ",") != strings.Join(tc.wanted.watch, ",") {
@@ -81,7 +83,7 @@ func TestTheGeneralHelpComesFromTheTable(t *testing.T) {
 		}
 	}
 	// Global options apply to every command: the general help is the only place that carries them.
-	for _, option := range []string{"--config", "--port", "--net", "--tui", "--watch"} {
+	for _, option := range []string{"--config", "--port", "--port-shift", "--net", "--tui", "--watch"} {
 		if !strings.Contains(text, option) {
 			t.Errorf("the help does not show %s", option)
 		}

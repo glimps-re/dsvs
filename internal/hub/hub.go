@@ -51,6 +51,12 @@ func SessionAddr(config string) string {
 	return filepath.Join(runtimeDir(), fmt.Sprintf("%s-%x.sock", exeName(), sum[:8]))
 }
 
+// TrayAddr names the status bar icon's socket. It only serves to ensure there is just one: taking
+// it fails when another one holds it.
+func TrayAddr() string {
+	return filepath.Join(runtimeDir(), exeName()+"-tray.sock")
+}
+
 // Answers says whether someone answers behind this socket. A file left over by a dead process does
 // not answer: it is the only question that matters.
 func Answers(addr string) bool {
