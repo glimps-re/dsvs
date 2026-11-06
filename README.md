@@ -105,8 +105,12 @@ Commands:
   help [command]                 write what a command does, or the list of them
 
 A name is an app, a facade — which pulls in the apps of its routes — or a group declared in the
-configuration. The session port is taken when it starts and released when it stops; every facade
-answers on it, and a path leading to a stopped app answers 502.
+configuration. The session port is taken when it starts, follows the configuration, and is released
+when it stops; every facade answers on it, and a path leading to a stopped app answers 502. A
+browser opening the path of an app that is starting gets a page that reloads by itself when the app
+answers, or says why it fell. An applied configuration reloads nothing but what an app declares with
+its reload key: "page" reloads the pages it serves, { stdin: "…" } types exactly that text in its
+terminal.
 
 dsvs needs a configuration: the one named by --config, or the first one found searching up from the
 current directory. Everything it needs around it starts on demand and says so — the background
@@ -223,7 +227,7 @@ The specifier is a `git+ssh` URL on this repository, so it needs an SSH key that
 |---|---|---|
 | `app` | string | The app that receives these paths. |
 | `proxy` | `{ target, secure?, changeOrigin? }` | A remote target, written as an entry of Angular's `proxy.conf.json`, same words, same defaults. `target` is an http or https URL whose path prefixes the request's. `secure: false` accepts a certificate that cannot be verified. `changeOrigin: true` sends the target's host instead of the browser's, which any remote vhost wants. |
-| `redirect` | string | A 302 to this path. It does not carry the rest of the requested path. |
+| `redirect` | string | A 302 to this path, followed by what comes after `path` in the request and its query: with `{ path: "/", redirect: "/shop" }`, `/products/12?color=red` leads to `/shop/products/12?color=red`. Another route must take the target. |
 
 `App`:
 
@@ -235,8 +239,11 @@ The specifier is a `git+ssh` URL on this repository, so it needs an SSH key that
 | `dir` | string | Working directory, absolute or relative to the configuration. Default: its folder. |
 | `color` | string | Its color in the logs: `red`, `green`, `yellow`, `blue`, `magenta` or `cyan`. Default: drawn from its name. |
 | `ready` | `{ http } \| { log }` | What says the app is ready, when the default signal says nothing. See below. |
+| `reload` | `"page" \| { stdin }` | What an applied configuration does for this app. See below. |
 
-An app is **ready** when a real request through its route gets an answer; when its port opens if no route serves it; as soon as it is launched if it takes no port. When that signal means nothing for it, `ready` replaces it: `{ "http": "/health" }` is ready at the first 2xx on that path, `{ "log": "Watching for file changes" }` when a line of its output contains that text — in TypeScript, a RegExp too (`log: /compiled successfully/i`), read by Go's RE2.
+An app is **ready** when a real request through its route gets an answer; when its port opens if no route serves it; as soon as it is launched if it takes no port. When that signal means nothing for it, `ready` replaces it: `{ "http": "/health" }` is ready at the first 2xx on that path, `{ "log": "Watching for file changes" }` when a line of its output contains that text — in TypeScript, a RegExp too (`log: /compiled successfully/i`), read by Go's RE2. A browser opening the path of an app that is starting gets a page that reloads by itself once the app answers, or says why it fell.
+
+An applied configuration — a save, `dsvs set`, a change of network — **reloads** nothing, except what an app declares with `reload`: `"page"` reloads the HTML pages it serves, through the proxy, and `{ "stdin": "r\n" }` types exactly that text in its terminal, here the "force reload browser" of `ng serve`.
 
 ### Parameters: a form
 
@@ -352,7 +359,7 @@ Node is one implementation of a contract that any executable can fulfil, passed 
 
 ### Saving is enough
 
-Facades, routes, proxy targets and groups are read again without restarting anything. What is alive — the port, the subnet, the processes — stays as it is, and the log says so. dsvs watches the configuration file itself, whatever its name, the paths it declares (`watch`), those of the command line (`--watch`), and otherwise its folder: an import that lives elsewhere must be declared, or saving it reloads nothing.
+Facades, routes, proxy targets and groups are read again without restarting anything. So is the port: the session moves to the new one and leaves the old one, or, if it is taken, refuses the configuration and says who holds it. What is alive — the subnet, the processes — stays as it is, and the log says so. dsvs watches the configuration file itself, whatever its name, the paths it declares (`watch`), those of the command line (`--watch`), and otherwise its folder: an import that lives elsewhere must be declared, or saving it reloads nothing.
 
 The apps follow the declaration, and no process is cut from under whoever uses it. An app declared during a session appears, ready to start. An app whose command changed is marked `↻ restart pending`: it runs with the previous one, and its restart takes the new one. An app removed from the configuration is marked `⊘ gone from the configuration`: it runs as long as you let it, restarts with what it had, and leaves the list once stopped. Its log can be read until the session ends: `dsvs logs worker` shows it, ending with its departure. Putting it back makes it an ordinary app again, to restart, which takes up that log.
 

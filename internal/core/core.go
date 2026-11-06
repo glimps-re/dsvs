@@ -1,6 +1,7 @@
 package core
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -204,7 +205,10 @@ type Network interface {
 // connections of the hosts it declares. The hub is its implementation.
 type Front interface {
 	// Listen returns the connections of the session's port.
-	Listen(port int) (net.Listener, error)
+	Listen() (net.Listener, error)
+	// Move switches the session to another port, and leaves the old one; refused, it stays where it
+	// is, and the error says why.
+	Move(port int) error
 	// Hosts tells the hosts that must come back to us, the whole list every time — it is a
 	// declaration, not a difference to apply.
 	Hosts(hosts []string) error
@@ -415,8 +419,8 @@ func (s *App) Resize(cols, rows int) {
 }
 
 // Ingress is a facade of the session: a host and its routes. It is not a process and it does not
-// start — the port is held for the whole session, and every facade answers as soon as it opens. A
-// route to a stopped app answers 502; that is all that is missing.
+// start — the port is held as long as the session lives, and every facade answers as soon as it
+// opens. A route to a stopped app answers 502; that is all that is missing.
 type Ingress struct {
 	Cfg config.Ingress
 	Log *Journal
@@ -563,13 +567,22 @@ func (s *Session) Watch() (<-chan Event, func()) {
 	}
 }
 
-// Backend returns how to reach an app, or nil if it does not listen: it is the only thing an ingress
-// asks the session.
+// Backend returns how to reach an app, or nil if it does not listen: it is what an ingress asks the
+// session.
 func (s *Session) Backend(name string) Backend {
 	if app := s.App(name); app != nil {
 		return app.Backend()
 	}
 	return nil
+}
+
+// Snapshot returns an app's state, that of a stopped app that never ran when the session does not
+// know it: it is what an ingress says of an app that does not answer.
+func (s *Session) Snapshot(name string) Snapshot {
+	if app := s.App(name); app != nil {
+		return app.Snapshot()
+	}
+	return Snapshot{}
 }
 
 // Facade returns the facade that answers for this host: the one that declares it, or failing that
@@ -593,13 +606,15 @@ func (s *Session) Facades() []*Ingress {
 }
 
 // Reload replays the configuration with the session's intents, what the project keeps and the last
-// observation: it is what replaces what is declarative — the facades, their routes, their targets, the
-// groups, and the list of apps. What is alive does not reload — the port is taken, the subnet is carved
-// out, a process does not change command midway: an app whose declaration moved says so and waits for
-// its restart, a removed app runs until it is stopped. An unreadable or invalid configuration changes
-// nothing: the session carries on with the running one. Neither does an invalid form, but it is the
-// one the session shows from then on, with its errors. In every case it says why (NotApplied), until
-// the evaluation that applies the file again — a save, a gesture, a network — and which the log tells.
+// observation: it is what replaces what is declarative — the facades, their routes, their targets,
+// the groups, the list of apps, and the port, which the session leaves for the new one. What is
+// alive does not reload — the subnet is carved out, a process does not change command midway: an
+// app whose declaration moved says so and waits for its restart, a removed app runs until it is
+// stopped. An unreadable or invalid configuration changes nothing, nor does a port that cannot be
+// taken: the session carries on with the running one. Neither does an invalid form, but it is the
+// one the session shows from then on, with its errors. In every case it says why (NotApplied),
+// until the evaluation that applies the file again — a save, a gesture, a network — and which the
+// log tells.
 func (s *Session) Reload() error { return s.replay(nil, "", config.Form.Accept) }
 
 // Set replays the configuration with these requested values, on top of everything chosen or kept.
@@ -728,6 +743,17 @@ func (s *Session) replay(asked map[string]string, by string, takes func(config.F
 		if err := takes(form, asked); err != nil {
 			return s.refused(err)
 		}
+	}
+	// The port is followed before anything else changes, and before the gesture is taken: refused,
+	// the whole configuration is, and the session keeps the previous one.
+	if err := s.followPort(current, built); err != nil {
+		if len(asked) == 0 {
+			s.lags(err.Error())
+		}
+		s.LogSink(s.Log)("!! " + err.Error())
+		return err
+	}
+	if len(asked) > 0 {
 		s.LogSink(s.Log)("-- set " + config.Pairs(asked) + " (" + by + ")")
 		s.take(asked)
 	}
@@ -759,14 +785,9 @@ func (s *Session) replay(asked map[string]string, by string, takes func(config.F
 		s.LogSink(s.Log)("-- configuration applied again")
 	}
 	next := *built
-	// The command line's port prevails at every read: the file cannot take back a session choice, so
-	// there is nothing to announce on that side.
-	next.ForcedPort = current.ForcedPort
-	if next.ForcedPort > 0 {
-		next.Port = next.ForcedPort
-	}
+	next.ForcedPort, next.Port = current.ForcedPort, port(current, built)
 	stuck := frozen(current, next)
-	next.Port, next.Subnet = current.Port, current.Subnet
+	next.Subnet = current.Subnet
 	// The script's echo, the observation and the response are not declarations: they do not count
 	// in "nothing changed". What changed without the output moving reloads nothing, but the
 	// configuration in force keeps the observation and the response it is made of.
@@ -814,7 +835,7 @@ func (s *Session) replay(asked map[string]string, by string, takes func(config.F
 			s.Log.Addf("-- %s runs with the previous declaration: restart pending", app.Name)
 		}
 	}
-	s.reloadBrowsers()
+	s.reload(next)
 	s.emit(Event{Source: s.Log.Name(), Kind: Reloaded})
 	return nil
 }
@@ -1060,32 +1081,57 @@ func dirsOf(paths []string) []string {
 	return dirs
 }
 
-// reloadBrowsers asks the dev-servers to reload the page: "r" followed by enter, what their help calls
-// "force reload browser". Measured: no recompilation, the page comes back as it is served — that is
-// what is needed when the targets have changed, the app holding the other backend's data in memory.
-func (s *Session) reloadBrowsers() {
+// reload does to each ready app what its reload key declares, now that this configuration applies:
+// type its text into its terminal, as is — "r" and enter, which is what ng serve calls "force
+// reload browser" —, or reload its pages, which the proxy does when it sees the generation change.
+// Without a key, nothing: an app does not have to receive what it does not understand.
+func (s *Session) reload(cfg config.Config) {
 	for _, app := range s.Apps() {
-		if !app.IsReady() {
-			continue
+		declared, _ := cfg.App(app.Name)
+		switch {
+		case !app.IsReady():
+		case declared.Reload.Page:
+			s.Log.Addf("-- %s: its open pages reload", app.Name)
+		case declared.Reload.Stdin != "":
+			if err := app.Send(declared.Reload.Stdin); err != nil {
+				s.Log.Addf("!! %s: %v", app.Name, err)
+				continue
+			}
+			s.Log.Addf("-- %s: %q typed", app.Name, declared.Reload.Stdin)
 		}
-		if err := app.Send("r\r"); err != nil {
-			s.Log.Addf("!! %s : %v", app.Name, err)
-			continue
-		}
-		s.Log.Addf("-- %s: reloading the browser", app.Name)
 	}
 }
 
 // frozen names what a re-read configuration would like to change and the session cannot follow.
 func frozen(current, next config.Config) string {
-	var stuck []string
-	if next.Port != current.Port {
-		stuck = append(stuck, fmt.Sprintf("port %d is taken", current.Port))
-	}
 	if next.Subnet != current.Subnet {
-		stuck = append(stuck, "the subnet is carved out")
+		return "the subnet is carved out"
 	}
-	return strings.Join(stuck, ", ")
+	return ""
+}
+
+// followPort switches the session to the port the built configuration declares: dsvs follows its
+// configuration, and it is not an app one would have to restart. Refused, the session stays where
+// it is and the error says so; without a built configuration, there is nothing to follow.
+func (s *Session) followPort(current config.Config, built *config.Config) error {
+	if built == nil {
+		return nil
+	}
+	next := port(current, built)
+	if next == current.Port {
+		return nil
+	}
+	if err := s.front.Move(next); err != nil {
+		return fmt.Errorf("port %d: %w; the session stays on port %d", next, err, current.Port)
+	}
+	s.Log.Addf("-- listening on port %d instead of %d", next, current.Port)
+	return nil
+}
+
+// port is the one the session must serve with this configuration: the command line's, which wins on
+// every read — a session choice the file cannot take back —, and otherwise the file's.
+func port(current config.Config, built *config.Config) int {
+	return cmp.Or(current.ForcedPort, built.Port)
 }
 
 // plural writes a count and its word in the plural.
@@ -1116,7 +1162,7 @@ func (s *Session) Mode() Mode { return s.net.Mode() }
 
 // Listen returns the connections of the session's port. It is the hub that holds it: nothing is
 // taken here, and two sessions can therefore serve their respective hosts on the same port.
-func (s *Session) Listen(port int) (net.Listener, error) { return s.front.Listen(port) }
+func (s *Session) Listen() (net.Listener, error) { return s.front.Listen() }
 
 // Apps returns the session's supervisors: the declared apps, in configuration order, then those it
 // no longer declares and that still run. The returned list no longer changes: a reload or a removal
@@ -1373,9 +1419,9 @@ func (s *Session) LogSink(log *Journal) func(string) {
 	}
 }
 
-// Open takes the session's port, before any interface: failing here is fatal, and it is the only
-// moment it can happen. The port is then held until exit, whatever the apps do — releasing it in
-// between would help nobody, and it would have to be taken again for nothing.
+// Open takes the session's port, before any interface: failing here is fatal. The port is then held
+// until exit, whatever the apps do — releasing it in between would help nobody, and it would have
+// to be taken again for nothing —, and only changes with the configuration.
 func (s *Session) Open(ctx context.Context) error {
 	if err := s.gw.Start(ctx); err != nil {
 		return err

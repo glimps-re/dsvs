@@ -164,7 +164,7 @@ Le spécificateur est une URL `git+ssh` sur ce dépôt : il faut donc une clé S
 |---|---|---|
 | `app` | string | L'app qui reçoit ces chemins. |
 | `proxy` | `{ target, secure?, changeOrigin? }` | Une cible distante, écrite comme une entrée du `proxy.conf.json` d'Angular, mêmes mots, mêmes défauts. `target` est une URL http ou https dont le chemin préfixe celui de la requête. `secure: false` accepte un certificat qu'on ne peut pas vérifier. `changeOrigin: true` envoie l'hôte de la cible au lieu de celui du navigateur, ce que veut tout vhost distant. |
-| `redirect` | string | Une 302 vers ce chemin. Elle ne reporte pas la suite du chemin demandé. |
+| `redirect` | string | Une 302 vers ce chemin, suivi de ce qui suit `path` dans la requête et de sa query : avec `{ path: "/", redirect: "/shop" }`, `/products/12?color=red` mène à `/shop/products/12?color=red`. Une autre route doit prendre la cible. |
 
 `App` :
 
@@ -176,8 +176,11 @@ Le spécificateur est une URL `git+ssh` sur ce dépôt : il faut donc une clé S
 | `dir` | string | Le dossier de travail, absolu ou relatif à la configuration. Défaut : son dossier. |
 | `color` | string | Sa couleur dans les journaux : `red`, `green`, `yellow`, `blue`, `magenta` ou `cyan`. Défaut : tirée de son nom. |
 | `ready` | `{ http } \| { log }` | Ce qui dit que l'app est prête, quand le signal par défaut ne dit rien. Voir plus bas. |
+| `reload` | `"page" \| { stdin }` | Ce que fait une configuration appliquée pour cette app. Voir plus bas. |
 
-Une app est **prête** quand une vraie requête par sa route obtient une réponse ; quand son port s'ouvre si aucune route ne la sert ; dès qu'elle est lancée si elle ne reçoit pas de port. Quand ce signal ne vaut rien pour elle, `ready` le remplace : `{ "http": "/health" }` la dit prête au premier 2xx sur ce chemin, `{ "log": "Watching for file changes" }` quand une ligne de sa sortie contient ce texte — en TypeScript, une RegExp aussi (`log: /compiled successfully/i`), lue par le RE2 de Go.
+Une app est **prête** quand une vraie requête par sa route obtient une réponse ; quand son port s'ouvre si aucune route ne la sert ; dès qu'elle est lancée si elle ne reçoit pas de port. Quand ce signal ne vaut rien pour elle, `ready` le remplace : `{ "http": "/health" }` la dit prête au premier 2xx sur ce chemin, `{ "log": "Watching for file changes" }` quand une ligne de sa sortie contient ce texte — en TypeScript, une RegExp aussi (`log: /compiled successfully/i`), lue par le RE2 de Go. Un navigateur qui ouvre le chemin d'une app en train de démarrer reçoit une page qui se recharge seule quand l'app répond, ou qui dit pourquoi elle est tombée.
+
+Une configuration appliquée — une sauvegarde, `dsvs set`, un changement de réseau — ne **recharge** rien, sauf ce qu'une app déclare avec `reload` : `"page"` recharge les pages HTML qu'elle sert, par le proxy, et `{ "stdin": "r\n" }` tape exactement ce texte dans son terminal, ici le « force reload browser » de `ng serve`.
 
 ### Les paramètres : un formulaire
 
@@ -295,7 +298,7 @@ Node n'est qu'une implémentation d'un contrat que tout exécutable peut remplir
 
 ### Sauvegarder suffit
 
-Les façades, les routes, les cibles de proxy et les groupes sont relus sans rien redémarrer. Ce qui est vivant — le port, le sous-réseau, les processus — reste tel quel, et le journal le dit. dsvs surveille le fichier de configuration lui-même, quel que soit son nom, les chemins qu'il déclare (`watch`), ceux de la ligne de commande (`--watch`), et à défaut son dossier : un import qui vit ailleurs doit être déclaré, sinon le sauvegarder ne recharge rien.
+Les façades, les routes, les cibles de proxy et les groupes sont relus sans rien redémarrer. Le port aussi : la session passe sur le nouveau et quitte l'ancien, ou, s'il est pris, refuse la configuration et dit qui le tient. Ce qui est vivant — le sous-réseau, les processus — reste tel quel, et le journal le dit. dsvs surveille le fichier de configuration lui-même, quel que soit son nom, les chemins qu'il déclare (`watch`), ceux de la ligne de commande (`--watch`), et à défaut son dossier : un import qui vit ailleurs doit être déclaré, sinon le sauvegarder ne recharge rien.
 
 Les apps suivent la déclaration, sans qu'aucun processus ne soit coupé sous les pieds de qui s'en sert. Une app déclarée en cours de session apparaît, prête à démarrer. Une app dont la commande a changé se marque `↻ restart pending` : elle tourne avec la précédente, et c'est son redémarrage qui prend la nouvelle. Une app retirée de la configuration se marque `⊘ gone from the configuration` : elle tourne tant qu'on la laisse tourner, repart avec ce qu'elle avait, et quitte la liste une fois arrêtée. Son journal se lit jusqu'à la fin de la session : `dsvs logs worker` le montre, terminé par son départ. La remettre en fait de nouveau une app ordinaire, à redémarrer, qui reprend ce journal.
 

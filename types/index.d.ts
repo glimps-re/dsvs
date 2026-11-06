@@ -61,7 +61,12 @@ export interface Route {
   app?: string;
   /** The remote target of these paths. This file is the only place where it changes. */
   proxy?: Target;
-  /** The path to redirect to, with a 302. It does not carry over the rest of the requested path. */
+  /**
+   * The path to redirect to, with a 302, followed by what follows `path` in the requested path and by
+   * its query: with `{ path: "/", redirect: "/shop" }`, `/products/12?color=red` leads to
+   * `/shop/products/12?color=red`, and `/` to `/shop`. Another route must take the target: this one
+   * would send it back under itself.
+   */
   redirect?: string;
 }
 
@@ -107,6 +112,14 @@ export interface App {
    * goes back to "starting".
    */
   ready?: Ready;
+  /**
+   * What an applied configuration — a save, `dsvs set`, a network change — does so that what it
+   * changes is seen. Without this key, nothing. `"page"`: the HTML pages the app serves, open in a
+   * browser, reload; a route must lead to the app. `{ stdin }`: this text is typed into the terminal of
+   * the ready app, as is — nothing is added, not even a newline — like `{ stdin: "r\n" }` for
+   * `ng serve`, where it is the "force reload browser".
+   */
+  reload?: "page" | { stdin: string };
 }
 
 /**
