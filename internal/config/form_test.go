@@ -256,6 +256,54 @@ validateTree(p, ({ valueOf }) => valueOf(p.via) === "office" && valueOf(p.locale
 	}
 }
 
+// A retained value that the rules of its field no longer accept does not invalidate the form: it yields to
+// the bound it crosses, to the default otherwise, and the field says so. An asked value, on the other
+// hand, remains an error, and so does a default that does not hold.
+func TestARetainedValueThatNoLongerHoldsYields(t *testing.T) {
+	t.Parallel()
+	const model = `{ api: ["local", "staging"], discount: 0, client: "" }`
+	const schema = `keep(p.discount); min(p.discount, 0); max(p.discount, 15, { message: "the shop would sell at a loss" });
+validate(p.client, ({ value }) => value() === "al" && "not an account"); required(p.client, { when: ({ valueOf }) => valueOf(p.api) === "staging" });
+validateTree(p, ({ valueOf }) => valueOf(p.api) === "staging" && valueOf(p.discount) > 5 ? { field: p.discount, message: "no discount on staging" } : null);`
+	cases := []struct {
+		name          string
+		in            Input
+		field, value  string
+		yielded, said string
+		built         bool
+	}{
+		{"above the ceiling", Input{Kept: map[string]string{"discount": "20"}}, "discount", "15", "20",
+			"discount=20 no longer holds (the shop would sell at a loss): discount=15 until it does", true},
+		{"below the floor", Input{Session: map[string]string{"discount": "-3"}}, "discount", "0", "-3",
+			"discount=-3 no longer holds (at least 0): discount=0 until it does", true},
+		{"a tree rule, to the default, under a gesture", Input{Kept: map[string]string{"discount": "10"}, Asked: map[string]string{"api": "staging", "client": "alice"}},
+			"discount", "0", "10", "discount=10 no longer holds (no discount on staging): discount=0 until it does", true},
+		{"holds again", Input{Kept: map[string]string{"discount": "10"}}, "discount", "10", "", "", true},
+		{"asked, it remains an error", Input{Asked: map[string]string{"discount": "20"}}, "discount", "20", "", "", false},
+		{"the default does not hold either", Input{Session: map[string]string{"api": "staging", "client": "al"}}, "client", "", "al",
+			"client=al no longer holds (not an account): client= until it does", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			form, values, err := resolved(t, model, schema, c.in)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := field(t, form, c.field)
+			if got.Value != c.value || got.Yields() != c.said {
+				t.Errorf("%s = %q, %q; want %q, %q", c.field, got.Value, got.Yields(), c.value, c.said)
+			}
+			if got.Yielded != nil && (got.Yielded.Value != c.yielded || got.From != "default") {
+				t.Errorf("%s: yielded %+v from %q, want %q, and default", c.field, got.Yielded, got.From, c.yielded)
+			}
+			if built := values != nil; built != c.built {
+				t.Errorf("configuration built: %v, want %v (%q)", built, c.built, form.Problems())
+			}
+		})
+	}
+}
+
 // What a schema cannot mean is an evaluation error, which changes nothing: a cycle is named by the fields
 // it goes through.
 func TestAnImpossibleSchemaIsAnError(t *testing.T) {
@@ -286,7 +334,8 @@ disabled(p.api.mirror, { when: () => !office && "the mirror is only reachable fr
 choices(p.api.deployment, office ? ["alpha", "beta", "gamma"] : ["alpha", "beta"]);
 readonly(p.delay, { when: ({ valueOf }) => valueOf(p.locale) === "fr" });
 max(p.delay, 10000);
-validateTree(p, ({ valueOf }) => valueOf(p.locale) === "fr" && valueOf(p.api.deployment) === "beta" ? { field: p.locale, message: "beta has no fr build" } : null);`
+validateTree(p, ({ valueOf }) => valueOf(p.locale) === "fr" && valueOf(p.api.deployment) === "beta" ? { field: p.locale, message: "beta has no fr build" } : null);
+validateTree(p, ({ valueOf }) => valueOf(p.env) === "staging" && valueOf(p.delay) > 5000 ? "staging answers within 5 s" : null);`
 
 // Accept is the only guard of writes: each refusal is said as set writes it, and fields asked
 // together are evaluated together.
@@ -307,8 +356,10 @@ func TestAcceptSaysWhyAValueIsNotTaken(t *testing.T) {
 			`api.deployment: "gamma" is not one of alpha, beta`},
 		{"unreadable", Input{Asked: map[string]string{"delay": "abc"}}, `delay: "abc" is not a number`},
 		{"invalid", Input{Asked: map[string]string{"delay": "20000"}}, "delay: at most 10000"},
-		{"the form", Input{Session: map[string]string{"env": "staging", "locale": "fr"}, Asked: map[string]string{"api.deployment": "beta"}},
-			"the form refuses it: locale: beta has no fr build"},
+		{"the form", Input{Session: map[string]string{"env": "staging"}, Asked: map[string]string{"delay": "6000"}},
+			"the form refuses it: staging answers within 5 s"},
+		// What the session had chosen yields to the gesture: locale falls back to en.
+		{"a retained value that no longer holds", Input{Session: map[string]string{"env": "staging", "locale": "fr"}, Asked: map[string]string{"api.deployment": "beta"}}, ""},
 		{"the asked field", Input{Session: map[string]string{"env": "staging", "api.deployment": "beta"}, Asked: map[string]string{"locale": "fr"}},
 			"locale: beta has no fr build"},
 		{"the pair together", Input{Asked: map[string]string{"env": "staging", "api.deployment": "beta"}}, ""},

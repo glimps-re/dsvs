@@ -69,7 +69,38 @@ const checks = {
   pattern: (value, bound) => !new RegExp(bound.source, bound.flags.replace(/[gy]/g, "")).test(value) && `does not match ${bound}`,
 };
 
+// A retained intent — anything but the gesture in progress — that the rules of its field no longer
+// accept does not invalidate the form: it yields, to the bound it crosses for min and max, to the default
+// otherwise, and the field says so. Yielding changes other values: the evaluation replays until nothing
+// yields any more, and each field yields at most twice, to the bound then to the default. A default or a
+// gesture that does not hold remains an error.
 async function resolve(built, build, input) {
+  const yielded = new Map();
+  for (;;) {
+    const { fields, problems, valueAt } = await evaluate(built, input, yielded);
+    let moved = false;
+    for (const field of fields.filter((one) => one.errors.length > 0)) {
+      const already = yielded.get(field.name);
+      if (!already && retained.includes(field.from)) {
+        yielded.set(field.name, { yielded: { value: field.value, from: field.from, errors: field.errors }, edge: field.edge });
+        moved = true;
+      } else if (already?.edge !== undefined) {
+        already.edge = undefined;
+        moved = true;
+      }
+    }
+    if (moved) continue;
+    const valid = problems.length === 0 && fields.every((field) => field.errors.length === 0);
+    const said = fields.map(({ edge, ...field }) => compact({ ...field, yielded: yielded.get(field.name)?.yielded }));
+    return { form: { fields: said, errors: problems }, config: valid ? await build(valueAt(""), input.observed) : null };
+  }
+}
+
+const retained = ["network", "session", "kept"];
+
+// evaluate declares the rules and resolves each field once, those that yielded taking their bound or
+// their default.
+async function evaluate(built, input, yielded) {
   const names = new Set([""]);
   for (const { name } of built.leaves) {
     for (let at = name; at; at = at.slice(0, Math.max(0, at.lastIndexOf(".")))) names.add(at);
@@ -145,6 +176,7 @@ async function resolve(built, build, input) {
   // default is never an intent.
   const intentOf = (name) => {
     if (Object.hasOwn(input.asked, name)) return [input.asked[name], "asked"];
+    if (yielded.has(name)) return [yielded.get(name).edge, "default"];
     if (Object.hasOwn(input.network, name) && flag("network", name)) return [input.network[name], "network"];
     if (Object.hasOwn(input.session, name)) return [input.session[name], "session"];
     if (Object.hasOwn(input.kept, name) && flag("keep", name)) return [input.kept[name], "kept"];
@@ -185,6 +217,7 @@ async function resolve(built, build, input) {
     const { hidden, disabled, readonly } = stateOf(name);
     const requiring = matching("required", name, true).find((rule) => Boolean(said(rule, "when")));
     const errors = [];
+    let edge;
     // A field nobody can set is not validated: nobody could fix its error.
     if (!hidden && !disabled && !readonly) {
       const current = typed(name);
@@ -193,6 +226,7 @@ async function resolve(built, build, input) {
         const rule = last(kind, name);
         const failed = rule && checks[kind](current, bound(kind, name));
         if (failed) errors.push(rule.message ?? failed);
+        if (failed && (kind === "min" || kind === "max")) edge ??= String(bound(kind, name));
       }
       for (const rule of matching("validate", name, true)) {
         const message = await rule.logic(context(name));
@@ -202,7 +236,7 @@ async function resolve(built, build, input) {
     fields.push({
       name, type, choices: choicesOf(name) ?? undefined, value, from, hidden, disabled, reasons: reasons(name).filter(Boolean), readonly,
       required: Boolean(requiring), min: bound("min", name), max: bound("max", name), minLength: bound("minLength", name), maxLength: bound("maxLength", name),
-      pattern: bound("pattern", name)?.source, keep: flag("keep", name), network: flag("network", name), errors,
+      pattern: bound("pattern", name)?.source, keep: flag("keep", name), network: flag("network", name), errors, edge,
     });
   }
   // A tree error attached to a field nobody can set is dropped, as in Angular: no gesture could fix it.
@@ -216,8 +250,7 @@ async function resolve(built, build, input) {
       else if (!target.hidden && !target.disabled && !target.readonly) target.errors.push(one.message);
     }
   }
-  const valid = problems.length === 0 && fields.every((field) => field.errors.length === 0);
-  return { form: { fields: fields.map(compact), errors: problems }, config: valid ? await build(valueAt(""), input.observed) : null };
+  return { fields, problems, valueAt };
 }
 
 // compact keeps only what a field has to say: a false state or an empty list is not written.

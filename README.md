@@ -171,6 +171,8 @@ Commands:
   service [stop|restart]       start the background service and its icon, or stop it
   update                       take a newer version of this binary, and restart the service
   panel                        open the panel of the running sessions
+  remember                     remember the project here, so that the panel lists it cold
+  forget                       forget the project here, which the panel stops listing
   config                       write the resolved configuration as JSON
   types                        write the package specifier of the TypeScript types matching this binary
   skill                        write a skill that teaches this tool to a coding agent

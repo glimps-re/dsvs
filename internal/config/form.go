@@ -46,6 +46,27 @@ type Field struct {
 	Keep      bool     `json:"keep,omitzero"`
 	Network   bool     `json:"network,omitzero"`
 	Errors    []string `json:"errors,omitzero"`
+	// Yielded is the kept intention that the field's rules no longer take. Value replaces it as long as
+	// it does not hold — the bound it exceeds, otherwise the default, and From says default — and it
+	// comes back as soon as it holds: nothing erases it from memory.
+	Yielded *Yield `json:"yielded,omitzero"`
+}
+
+// Yield is a kept intention that no longer holds: its value, the layer it comes from — network,
+// session or kept — and what the field's rules said about it.
+type Yield struct {
+	Value  string   `json:"value"`
+	From   string   `json:"from"`
+	Errors []string `json:"errors"`
+}
+
+// Yields says in one line the kept intention the field no longer takes, and what replaces it: the
+// sentence of the log, the state and the interfaces. Nothing when it holds.
+func (f Field) Yields() string {
+	if f.Yielded == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s=%s no longer holds (%s): %s=%s until it does", f.Name, f.Yielded.Value, strings.Join(f.Yielded.Errors, "; "), f.Name, f.Value)
 }
 
 // Next returns the choice after the value, wrapping around: the panel's and the TUI's gesture on a
@@ -140,6 +161,18 @@ func (f Form) Problems() []string {
 	return append(out, f.Errors...)
 }
 
+// Yields returns the sentence of each field whose kept intention no longer holds, in the model's
+// order.
+func (f Form) Yields() []string {
+	var said []string
+	for _, field := range f.Fields {
+		if yields := field.Yields(); yields != "" {
+			said = append(said, yields)
+		}
+	}
+	return said
+}
+
 // Keeping and Following return those of these values that the form keeps for the project, or for the
 // network: what an accepted gesture writes, and nowhere else.
 func (f Form) Keeping(values map[string]string) map[string]string {
@@ -186,6 +219,7 @@ var (
 	fieldName = regexp.MustCompile(`^[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]+)*$`)
 	types     = []string{"choice", "flag", "text", "number"}
 	origins   = []string{"asked", "network", "session", "kept", "default"}
+	retained  = []string{"network", "session", "kept"}
 )
 
 // validate guards the invariant of what a program writes: well-formed and unique names, a known type,
@@ -227,7 +261,14 @@ func (f Form) validate() []string {
 		if !slices.Contains(origins, field.From) {
 			fail("%s: unknown origin %q (%s)", field.Name, field.From, strings.Join(origins, ", "))
 		}
-		for _, text := range append(append([]string{field.Value}, field.Reasons...), field.Errors...) {
+		texts := append(append([]string{field.Value}, field.Reasons...), field.Errors...)
+		if field.Yielded != nil {
+			if !slices.Contains(retained, field.Yielded.From) {
+				fail("%s: a value that yields comes from %s, not %q", field.Name, strings.Join(retained, ", "), field.Yielded.From)
+			}
+			texts = append(append(texts, field.Yielded.Value), field.Yielded.Errors...)
+		}
+		for _, text := range texts {
 			if strings.ContainsAny(text, "\r\n") {
 				fail("%s: %q holds a line break", field.Name, text)
 			}

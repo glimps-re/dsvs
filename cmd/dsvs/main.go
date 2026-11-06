@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -221,36 +222,92 @@ func release(version string) (tag string, exact bool, err error) {
 	return parts[1], parts[2] == "" && parts[3] == "", nil
 }
 
-// machine is what runs here: this binary, its service, the sessions whose port it holds, and the other
-// dsvs binaries with theirs. A single read, two renderings — the text and the JSON say the same thing.
+// machine is what runs here: this binary, its service, the sessions whose port it holds, the projects
+// it remembers, and the other dsvs binaries with theirs. A single read, two renderings — the text and
 // the JSON say the same thing.
 type machine struct {
-	Binary   string        `json:"binary"`
-	Version  string        `json:"version"`
-	Service  bool          `json:"service"`
-	Sessions []hub.Session `json:"sessions,omitempty"`
-	Peers    []hub.Peer    `json:"peers,omitempty"`
+	Binary     string        `json:"binary"`
+	Version    string        `json:"version"`
+	Service    bool          `json:"service"`
+	Sessions   []hub.Session `json:"sessions,omitempty"`
+	Remembered []string      `json:"remembered,omitempty"`
+	Peers      []hub.Peer    `json:"peers,omitempty"`
 }
 
 // status writes what runs. It is the answer to "what holds my ports", and it needs neither a
 // configuration nor a running service.
-func status(asJSON bool) error {
+func status(out io.Writer, asJSON bool) error {
 	sessions, err := hub.Sessions()
 	if err != nil {
 		return err
 	}
 	here := machine{
-		Binary:   build.Name(),
-		Version:  build.Version,
-		Service:  hub.Answers(hub.TrayAddr()),
-		Sessions: sessions,
-		Peers:    hub.Peers(),
+		Binary:     build.Name(),
+		Version:    build.Version,
+		Service:    hub.Answers(hub.TrayAddr()),
+		Sessions:   sessions,
+		Remembered: projects.List(),
+		Peers:      hub.Peers(),
 	}
 	if asJSON {
-		return write(os.Stdout, here)
+		return write(out, here)
 	}
-	writeStatus(os.Stdout, here)
+	writeStatus(out, here)
 	return nil
+}
+
+// remembering remembers the project of the configuration here, without opening a session.
+func remembering(out io.Writer, s *shape, names []string) error {
+	config, err := projectHere("remember", s, names)
+	if err != nil {
+		return err
+	}
+	if slices.Contains(projects.List(), config) {
+		fmt.Fprintf(out, "%s is already remembered\n", config)
+		return nil
+	}
+	if err := projects.Remember(config); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "remembered %s\n", config)
+	return nil
+}
+
+// forgetting forgets the project of the configuration here, once its apps are off. A session open for
+// it with no app running stays open: this is said, since the panel will no longer list the project once
+// the session is gone from it, and quit is then the only way to close the session.
+func forgetting(out io.Writer, s *shape, names []string) error {
+	config, err := projectHere("forget", s, names)
+	if err != nil {
+		return err
+	}
+	listed, valued, err := attach.Forget(config)
+	switch {
+	case err != nil:
+		return err
+	case listed && valued:
+		fmt.Fprintf(out, "forgot %s and the values kept for it", config)
+	case listed:
+		fmt.Fprintf(out, "forgot %s", config)
+	default:
+		fmt.Fprintf(out, "%s was not remembered; %s status lists what is\n", config, build.Name())
+		return nil
+	}
+	if living, err := hub.Sessions(); err == nil &&
+		slices.ContainsFunc(living, func(session hub.Session) bool { return session.Config == config }) {
+		fmt.Fprintf(out, "; its session stays open on the values chosen in it, %s quit closes it", build.Name())
+	}
+	fmt.Fprintln(out)
+	return nil
+}
+
+// projectHere is the project that --config names, or that the configuration found here identifies: the
+// only way to name a project, hence no argument.
+func projectHere(verb string, s *shape, names []string) (string, error) {
+	if len(names) > 0 {
+		return "", fmt.Errorf("%s takes no argument, got %q; name the project with --config", verb, strings.Join(names, " "))
+	}
+	return resolve(s.config)
 }
 
 // writeStatus writes what runs for a human. It is a rendering and nothing else.
@@ -266,6 +323,12 @@ func writeStatus(out io.Writer, here machine) {
 	}
 	for _, session := range here.Sessions {
 		fmt.Fprintf(out, "  port %d  %s\n", session.Port, session.Config)
+	}
+	if len(here.Remembered) == 0 {
+		fmt.Fprintln(out, "  remembered: none")
+	}
+	for _, config := range here.Remembered {
+		fmt.Fprintf(out, "  remembered  %s\n", config)
 	}
 	for _, peer := range here.Peers {
 		fmt.Fprintf(out, "%s%s\n", peer.Name, since(peer))
@@ -464,10 +527,6 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 	if err != nil {
 		return err
 	}
-	// The project is remembered as soon as a session opens for it: that is what makes it appear in the
-	// panel, cold, at the next start. Failing to write it does not prevent serving.
-	_ = projects.Remember(path)
-
 	// The session's socket opens before anything is read: it is named by the configuration, which is
 	// the identity of the session, and it is through it that a client will learn the session did not
 	// start — otherwise it would only have a silent wait.
@@ -519,6 +578,12 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 		return gateway.NewProxy(cfg.Port, s, s.Sink())
 	})
 	session.SetRenewal(renewal(session, attachers, network))
+	if taken == nil {
+		// A handover already said what yields, in the log it carries.
+		for _, said := range form.Yields() {
+			session.Log.Add("-- " + said)
+		}
+	}
 
 	// The apps of the handover become this session's own again before the proxy opens: those that
 	// answered still answer, and no request hits a 502 for the time of a probe. Failing the adoption
@@ -557,6 +622,10 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 	if err := session.Open(serving); err != nil {
 		return failed(fmt.Errorf("port %d: %w%s", cfg.Port, err, held(cfg.Port)))
 	}
+	// The project is remembered as soon as its session has started: that is what makes it appear in
+	// the panel, cold, at the next start. A refused session remembers nothing. Failing to write it does
+	// not prevent serving.
+	_ = projects.Remember(path)
 
 	done := make(chan struct{})
 	go func() {
@@ -590,22 +659,22 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 	return nil
 }
 
-// opened reads the configuration for the first time, on what the handover had chosen: a new session
-// thus starts on what had been chosen in it, with nothing to restart. An invalid form builds nothing,
-// and there is no configuration in effect to fall back on: the error says so. A handover does have
-// one, and resumes from it without evaluating anything: an update therefore does not lose a session
-// over a file the new binary refuses.
+// opened reads the configuration for the first time, under the rule of every replay: what the handover
+// had chosen, and what the project keeps. A new session thus starts on what had been chosen in it,
+// with nothing to restart. An invalid form builds nothing, and there is no configuration in effect to
+// fall back on: the error says how to start. A handover does have one, and resumes from it without
+// evaluating anything: an update therefore does not lose a session over a file the new binary refuses.
 func opened(path string, s *shape, taken *core.Handover) (config.Form, config.Config, error) {
 	var intents map[string]string
 	if taken != nil {
 		intents = taken.Params
 	}
-	form, cfg, err := load(taken.Load, path, s.port, s.shift, s.watch, config.Input{Session: intents})
+	form, cfg, err := load(taken.Load, path, s.port, s.shift, s.watch, core.InputFor(path, intents, nil))
 	if err != nil {
 		return form, config.Config{}, err
 	}
 	if err := form.Accept(nil); err != nil {
-		return form, config.Config{}, fmt.Errorf("%s: %w", path, err)
+		return form, config.Config{}, fmt.Errorf("%s: %w; %s forget clears what the project keeps", path, err, build.Name())
 	}
 	return form, *cfg, nil
 }

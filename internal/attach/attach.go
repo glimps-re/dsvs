@@ -14,8 +14,10 @@ import (
 
 	"github.com/charmbracelet/x/term"
 
+	"dsvs/internal/build"
 	"dsvs/internal/fdpass"
 	"dsvs/internal/hub"
+	"dsvs/internal/projects"
 )
 
 // patience is the time a session is given to open its socket. It opens it before reading its
@@ -189,6 +191,34 @@ func Tail(config string, n int, names []string) ([]Log, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// Forget forgets the project of this configuration and everything dsvs keeps for it — its values, for
+// itself and on each network —, once its apps are off: it is refused while an app of the project runs,
+// with what to do. An open session with no running app stays open, and replays its configuration
+// without what the project kept: it keeps the values chosen in it, which were never kept, and the rest
+// returns to its default. It returns what it forgot — its place in the list, its values.
+func Forget(config string) (listed, valued bool, err error) {
+	link, err := Watch(config)
+	if err != nil {
+		return projects.Forget(config) // no session serves the project: nothing runs
+	}
+	defer link.Close()
+	var running []string
+	for _, app := range (<-link.States()).Apps {
+		if app.Status != "idle" {
+			running = append(running, app.Name)
+		}
+	}
+	if len(running) > 0 {
+		return false, false, fmt.Errorf("%s still running for %s: forget it once they are stopped, by %s stop --all or %[3]s quit",
+			strings.Join(running, ", "), config, build.Name())
+	}
+	if listed, valued, err = projects.Forget(config); err != nil {
+		return listed, valued, err
+	}
+	_ = link.Order("reload") // a file the session does not apply is reported in its log and its state
+	return listed, valued, nil
 }
 
 func (l *Link) follow(lines *bufio.Scanner) {

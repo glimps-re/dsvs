@@ -27,9 +27,13 @@
 // parses in the field's type and is among its current choices; otherwise it is the current default.
 // The cascade is the engine's, because keep and network are rules: Go only lays the layers into the
 // input. A stale intention thus falls back to the default without an error, and comes back when the
-// file makes it possible again. What stays invalid — a default that does not hold, an error of the
-// whole form — is the file's fault. No rule writes: the graph has no effect, a circular dependency
-// is an error that names its fields, and one evaluation by replay is enough.
+// file makes it possible again. A kept intention — anything that is not the gesture in progress —
+// that its field's rules refuse yields likewise, to the bound it exceeds for min and max, to the
+// default otherwise, and the field says so (Field.Yielded): a file that changes does not block a
+// session over a value that was set in it, and does not change it silently. The engine replays the
+// evaluation until nothing yields any more. What stays invalid — a default that does not hold, an
+// error of the whole form — is the file's fault. No rule writes: the graph has no effect, a
+// circular dependency is an error that names its fields, and one evaluation by replay is enough.
 //
 // Accept is the only guard of writes: a value a field does not take, or that would leave the form
 // invalid, changes nothing. Keeping and Following say, on the form being applied, what to keep and
@@ -79,7 +83,8 @@
 // every home-made program would have two modes.
 //
 // Values written in the configuration, or a values file it would read: that is state that outlives
-// the session, and that is what the configuration does not have to carry.
+// the session, and that is what the configuration does not have to carry. What outlives it is kept
+// beside it, for the project, where the form says.
 //
 // A static export of the parameters (export const params), beside config(): two ways of saying the
 // same thing, forever. The shim refuses the old one and says what replaces it.
