@@ -142,7 +142,7 @@ sends it away, icon included, and restart makes it take the binary on disk.`,
 		declare: direct(service),
 	}, {
 		name:    "update",
-		summary: "take a newer version of this binary, and restart the service",
+		summary: "take a newer version, the beta for dsvs-beta, and restart the service",
 		long: `update takes a newer version of this binary if there is one, hands the running sessions over to
 it and restarts the service. Where it looks was decided when this binary was built: the clone it
 came out of, or the published releases. A released binary is downloaded over HTTPS and checked
@@ -151,10 +151,20 @@ releases, dsvs-beta the pre-releases too. DSVS_RELEASES points at a mirror of th
 		declare: direct(func([]string) error { return upgrade() }),
 	}, {
 		name:    "panel",
+		args:    "[--png <file>]",
 		summary: "open the panel of the running sessions",
 		long: `panel opens the panel of the projects and their sessions, without going through the status bar
-icon, and returns when it closes.`,
-		declare: direct(func([]string) error { return openPanel() }),
+icon, and returns when it closes. --png draws it into a PNG file instead, as the icon would open it
+now, and opens no window: it needs no display.`,
+		declare: func(fs *flag.FlagSet) func([]string) error {
+			into := fs.String("png", "", "draw the panel into this PNG `file`, without opening it")
+			return func([]string) error {
+				if *into == "" {
+					return openPanel()
+				}
+				return drawPanel(*into)
+			}
+		},
 	}, {
 		name:    "remember",
 		summary: "remember the project here, so that the panel lists it cold",
@@ -325,8 +335,8 @@ dsvs with no command starts what the configuration found here needs, writes the 
 and returns; --tui opens the interface on that session instead. A configuration runs only once, and
 two sessions never fight over a host: the second one is refused, and says so.
 
-A few flags are the binary talking to itself — --tray, --hub, --session, --install-unit, --version —
-and are not commands.
+A few flags are the binary talking to itself — --tray, --hub, --session, --install-unit,
+--remove-unit, --version — and are not commands.
 `
 
 // list writes the table: each command with the usage of its arguments and its summary, in columns.

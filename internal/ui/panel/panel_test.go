@@ -1,10 +1,15 @@
 package panel
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"image"
+	"image/color"
 	"image/png"
+	"math"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -14,13 +19,14 @@ import (
 	"github.com/jezek/xgb/xproto"
 
 	"dsvs/internal/attach"
+	"dsvs/internal/projects"
 )
 
 // What is seen and what can be clicked must coincide: one button per thing the app allows, and never
 // two zones on top of each other — otherwise a click would do something other than what it shows.
 func TestZonesMatchWhatIsOffered(t *testing.T) {
 	shown, with := demo(t)
-	_, zones, _ := paint(shown, looking, with, time.Now(), image.Pt(-1, -1))
+	_, zones, _ := paint(shown, looking, with, time.Now(), aside)
 
 	offered := map[string][]deed{}
 	for _, z := range zones {
@@ -39,7 +45,21 @@ func TestZonesMatchWhatIsOffered(t *testing.T) {
 		count(got, dismiss) != 1 {
 		t.Errorf("the actions without an app are %v", got)
 	}
+	canvas, _, _ := paint(shown, looking, with, time.Now(), aside)
+	checkZones(t, canvas, zones)
+}
+
+// checkZones requires every zone to be clickable — 24 × 24 at least — to fit in the canvas and to
+// overlap no other.
+func checkZones(t *testing.T, canvas *image.RGBA, zones []zone) {
+	t.Helper()
 	for i, a := range zones {
+		if a.at.Dx() < 24 || a.at.Dy() < 24 {
+			t.Errorf("zone %v of %v is under 24 × 24", a.at, a.do)
+		}
+		if !a.at.In(canvas.Bounds()) {
+			t.Errorf("zone %v overflows the canvas %v", a.at, canvas.Bounds())
+		}
 		for _, b := range zones[i+1:] {
 			if a.at.Intersect(b.at) != (image.Rectangle{}) {
 				t.Errorf("two zones overlap: %v and %v", a.at, b.at)
@@ -61,7 +81,7 @@ func TestTheUpdateOffersOneButtonAtATime(t *testing.T) {
 		{doing("building"), nothing},
 	}
 	for _, c := range cases {
-		_, zones, _ := paint(shown, c.news, with, time.Now(), image.Pt(-1, -1))
+		_, zones, _ := paint(shown, c.news, with, time.Now(), aside)
 		var offered []deed
 		for _, z := range zones {
 			if z.do == look || z.do == renew {
@@ -91,16 +111,12 @@ func TestTheBetaIsOfferedOutsideOfWork(t *testing.T) {
 		{doing("downloading v0.6.0-beta.1"), nothing},
 	}
 	for _, c := range cases {
-		_, zones, _ := paint(shown, c.news, with, time.Now(), image.Pt(-1, -1))
+		canvas, zones, _ := paint(shown, c.news, with, time.Now(), aside)
+		checkZones(t, canvas, zones)
 		var offered []deed
-		for i, z := range zones {
+		for _, z := range zones {
 			if z.do == installBeta || z.do == removeBeta {
 				offered = append(offered, z.do)
-			}
-			for _, other := range zones[i+1:] {
-				if z.at.Overlaps(other.at) {
-					t.Errorf("%+v: %v and %v overlap", c.news, z.do, other.do)
-				}
 			}
 		}
 		if c.wanted == nothing && len(offered) > 0 || c.wanted != nothing && !slices.Equal(offered, []deed{c.wanted}) {
@@ -114,7 +130,7 @@ func TestTheBetaIsOfferedOutsideOfWork(t *testing.T) {
 func TestAProjectWakingUpOffersNothing(t *testing.T) {
 	_, with := demo(t)
 	shown := []project{{config: "/one/dsvs.json", waking: true}}
-	_, zones, _ := paint(shown, looking, with, time.Now(), image.Pt(-1, -1))
+	_, zones, _ := paint(shown, looking, with, time.Now(), aside)
 
 	for _, z := range zones {
 		if z.config != "" {
@@ -126,9 +142,9 @@ func TestAProjectWakingUpOffersNothing(t *testing.T) {
 // An app that appears makes the panel taller: the content decides the window.
 func TestThePanelGrowsWithItsContent(t *testing.T) {
 	shown, with := demo(t)
-	short, _, _ := paint(shown, looking, with, time.Now(), image.Pt(-1, -1))
+	short, _, _ := paint(shown, looking, with, time.Now(), aside)
 	shown[1].live.Apps = append(shown[1].live.Apps, attach.App{Name: "second", Status: "idle"})
-	tall, _, _ := paint(shown, looking, with, time.Now(), image.Pt(-1, -1))
+	tall, _, _ := paint(shown, looking, with, time.Now(), aside)
 
 	if tall.Bounds().Dy() <= short.Bounds().Dy() {
 		t.Errorf("height %d with one more app, %d without", tall.Bounds().Dy(), short.Bounds().Dy())
@@ -214,6 +230,13 @@ func demo(t *testing.T) ([]project, faces) {
 	return shown, with
 }
 
+// tall is a screen height that leaves everything unfolded.
+const tall = 10000
+
+// aside is a pointer outside the panel, on a tall enough screen: nothing lights up, nothing is
+// pressed, nothing is folded.
+var aside = view{at: image.Pt(-1, -1), room: tall}
+
 // anchor is the icon the panel opens from in the display tests: a 22 px square near the top of the
 // screen, as in a status bar.
 var anchor = image.Rect(120, 58, 142, 80)
@@ -248,20 +271,55 @@ func onDisplay(t *testing.T) *panel {
 	return p
 }
 
-// LOOK=<folder> drops the full panel's rendering there as PNG, to judge its look without a screen.
+// LOOK=<folder> drops the panel's rendering in each of its states there as PNG, to judge its look
+// without a screen.
 func TestLookLeavesThePanelAsAPNG(t *testing.T) {
 	into := os.Getenv("LOOK")
 	if into == "" {
 		t.Skip("LOOK=<folder> drops the rendering as PNG")
 	}
-	shown, with := demo(t)
-	for name, news := range map[string]renewal{
-		"panel.png":      {stage: found, to: "v0.1.1-rc.1+build.2026", beta: installBeta, betaOut: "v0.2.0-beta.1"},
-		"panel-beta.png": {stage: idle, said: "up to date", beta: removeBeta},
-		"panel-work.png": doing("downloading v0.2.0-beta.1"),
-	} {
-		canvas, _, _ := paint(shown, news, with, time.Now(), image.Pt(292, 52))
-		file, err := os.Create(into + "/" + name)
+	full, with := demo(t)
+	found := renewal{stage: found, to: "v0.1.1-rc.1+build.2026"}
+	upToDate := renewal{stage: idle, said: "up to date"}
+
+	cold := []project{{config: "/home/user/front/dsvs.json"}, {config: "/home/user/shop-api/dsvs.json"},
+		{config: "/home/user/wt/feat-cart/front/dsvs.json", waking: true}}
+
+	failing := append([]project(nil), full...)
+	failing[0].failed = "config.dsvs.ts: the configuration did not load: SyntaxError: Unexpected token '}' (line 41)"
+	failing[0].live = &attach.State{Config: full[0].config, Port: 4200, Apps: []attach.App{
+		{Name: "front", Status: "ready", Ready: true, Since: time.Now().Add(-2 * time.Hour)},
+		{Name: "admin", Status: "idle", Last: "exited (137) · killed"},
+		{Name: "docs", Status: "idle", Last: "no port after 30s"},
+	}}
+	failing[2].failed = "no session: port 4200 is held by another program"
+
+	many := make([]attach.App, 20)
+	for i := range many {
+		many[i] = attach.App{Name: fmt.Sprintf("service-%02d-with-a-rather-long-name", i+1), Status: "ready",
+			Ready: true, Since: time.Now().Add(-time.Duration(3+i) * time.Minute)}
+	}
+	many[4] = attach.App{Name: many[4].Name, Status: "idle", Last: "exited (1)"}
+	many[9] = attach.App{Name: many[9].Name, Status: "starting", Since: time.Now().Add(-8 * time.Second)}
+	overflowing := append([]project(nil), full...)
+	overflowing[0].live = &attach.State{Config: full[0].config, Port: 4400, Apps: many,
+		Facades: []attach.Facade{{Host: "localhost"}, {Host: "api.localhost"}}}
+
+	scenes := []struct {
+		name     string
+		projects []project
+		news     renewal
+		seen     view
+	}{
+		{"full", full, found, view{at: image.Pt(292, 52), room: tall}},
+		{"empty", nil, looking, aside},
+		{"cold", cold, upToDate, aside},
+		{"errors", failing, failure(errors.New("update failed: git fetch: could not resolve host")), aside},
+		{"overflow", overflowing, upToDate, view{at: image.Pt(-1, -1), room: 760}},
+	}
+	for _, scene := range scenes {
+		canvas, _, _ := paint(scene.projects, scene.news, with, time.Now(), scene.seen)
+		file, err := os.Create(filepath.Join(into, "panel-"+scene.name+".png"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -270,6 +328,83 @@ func TestLookLeavesThePanelAsAPNG(t *testing.T) {
 		}
 		file.Close()
 	}
+}
+
+// A configuration the session does not apply is said on one line, whatever the length of its
+// reason, and a folded project keeps its cross.
+func TestAConfigurationNotAppliedTakesOneLine(t *testing.T) {
+	shown, with := demo(t)
+	calm, _, _ := paint(shown, looking, with, time.Now(), aside)
+	for _, why := range []string{"locale: demo has no fr build", strings.Repeat("SyntaxError: Unexpected token ", 20)} {
+		stale := append([]project(nil), shown...)
+		stale[0].live = withState(shown[0].live, func(s *attach.State) { s.NotApplied = why })
+		canvas, zones, _ := paint(stale, looking, with, time.Now(), aside)
+		checkZones(t, canvas, zones)
+		if grown := canvas.Bounds().Dy() - calm.Bounds().Dy(); grown != errorRow+6 {
+			t.Errorf("%d characters of reason grow the panel by %d px, wanted one line (%d)", len(why), grown, errorRow+6)
+		}
+	}
+}
+
+// The panel draws into a file without a display: with nothing known, it says "No project yet", and a
+// remembered project appears there cold, as the icon would open it.
+func TestThePanelDrawsIntoAPNGWithoutADisplay(t *testing.T) {
+	t.Setenv("DISPLAY", ":999")
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	with, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	drawn := func() image.Image {
+		t.Helper()
+		var out bytes.Buffer
+		if err := Render(&out); err != nil {
+			t.Fatal(err)
+		}
+		shown, err := png.Decode(&out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return shown
+	}
+	idle := renewal{stage: idle}
+	empty, _, _ := paint(nil, idle, with, time.Now(), aside)
+	if got := drawn(); !samePixels(got, empty) {
+		t.Error("with neither session nor project, the file is not the empty panel")
+	}
+
+	config := filepath.Join(t.TempDir(), "dsvs.json")
+	if err := os.WriteFile(config, []byte("{}"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := projects.Remember(config); err != nil {
+		t.Fatal(err)
+	}
+	cold, _, _ := paint([]project{{config: config}}, idle, with, time.Now(), aside)
+	if got := drawn(); !samePixels(got, cold) {
+		t.Error("a remembered project is not drawn cold")
+	}
+}
+
+func samePixels(a, b image.Image) bool {
+	if a.Bounds() != b.Bounds() {
+		return false
+	}
+	for y := a.Bounds().Min.Y; y < a.Bounds().Max.Y; y++ {
+		for x := a.Bounds().Min.X; x < a.Bounds().Max.X; x++ {
+			if color.RGBAModel.Convert(a.At(x, y)) != color.RGBAModel.Convert(b.At(x, y)) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func withState(live *attach.State, change func(*attach.State)) *attach.State {
+	copied := *live
+	change(&copied)
+	return &copied
 }
 
 func has(deeds []deed, wanted deed) bool { return count(deeds, wanted) > 0 }
@@ -326,7 +461,7 @@ func TestThePanelNeverHoldsTheInput(t *testing.T) {
 func TestThereIsAlwaysAWayOut(t *testing.T) {
 	full, with := demo(t)
 	for what, shown := range map[string][]project{"full": full, "empty": nil} {
-		_, zones, _ := paint(shown, looking, with, time.Now(), image.Pt(-1, -1))
+		_, zones, _ := paint(shown, looking, with, time.Now(), aside)
 		var offered []deed
 		for _, z := range zones {
 			offered = append(offered, z.do)
@@ -545,7 +680,7 @@ func TestEachGestureGoesToWhoItConcerns(t *testing.T) {
 		order:  []string{one, two, cold},
 		state:  map[string]attach.State{one: {Config: one}, two: {Config: two}},
 		links:  map[string]*attach.Link{one: {}, two: {}},
-		failed: map[string]string{}, waking: map[string]bool{},
+		failed: map[string]string{}, waking: map[string]bool{}, pending: map[string]map[string]time.Time{},
 	}
 	p.ordered = func(config string, do deed, name string) error {
 		said = append(said, heard{config, do, name})
@@ -602,7 +737,7 @@ func TestEachGestureGoesToWhoItConcerns(t *testing.T) {
 // click without the slightest answer.
 func TestAnOrderThatFailsStaysOnTheProjectLine(t *testing.T) {
 	const one = "/one/dsvs.json"
-	p := &panel{failed: map[string]string{}, links: map[string]*attach.Link{one: {}}}
+	p := &panel{failed: map[string]string{}, pending: map[string]map[string]time.Time{}, links: map[string]*attach.Link{one: {}}}
 	p.ordered = func(string, deed, string) error { return errors.New("session is gone") }
 
 	p.act(zone{do: stop, config: one, name: "front"})
@@ -641,8 +776,8 @@ func TestALongReasonTakesSeveralLines(t *testing.T) {
 	long := append([]project(nil), full...)
 	long[2].failed = "config.dsvs.ts: no facade declared; missing port: it is the only open port, and it is declared at the top of the configuration"
 
-	brief, _, _ := paint(short, looking, with, time.Now(), image.Pt(-1, -1))
-	whole, _, _ := paint(long, looking, with, time.Now(), image.Pt(-1, -1))
+	brief, _, _ := paint(short, looking, with, time.Now(), aside)
+	whole, _, _ := paint(long, looking, with, time.Now(), aside)
 	if whole.Bounds().Dy() <= brief.Bounds().Dy() {
 		t.Errorf("the panel is %d pixels high with a long reason, %d with a short one",
 			whole.Bounds().Dy(), brief.Bounds().Dy())
@@ -668,7 +803,7 @@ func TestTheCanvasHoldsTheLastThingPainted(t *testing.T) {
 	}
 	for what, shown := range shows {
 		for when, said := range news {
-			canvas, zones, _ := paint(shown, said, with, time.Now(), image.Pt(-1, -1))
+			canvas, zones, _ := paint(shown, said, with, time.Now(), aside)
 			for _, z := range zones {
 				if !z.at.In(canvas.Bounds()) {
 					t.Errorf("%s, %s: zone %v overflows the canvas %v", what, when, z.at, canvas.Bounds())
@@ -709,7 +844,7 @@ func TestNothingSpillsIntoTheMargin(t *testing.T) {
 	shown := []project{{config: state.Config, live: &state, failed: long}, {config: "/" + long + "/two/dsvs.json"}}
 
 	for what, news := range map[string]renewal{"a step": doing(long), "a version": {stage: found, to: long}} {
-		canvas, _, _ := paint(shown, news, with, time.Now(), image.Pt(-1, -1))
+		canvas, _, _ := paint(shown, news, with, time.Now(), aside)
 		for _, margin := range []struct{ from, to int }{{0, pad}, {width - pad, width}} {
 			for x := margin.from; x < margin.to; x++ {
 				for y := range canvas.Bounds().Dy() {
@@ -726,14 +861,14 @@ func TestNothingSpillsIntoTheMargin(t *testing.T) {
 // panel, and a window that redid their arithmetic would lag by a few pixels.
 func TestTheHoverLightsTheRowUnderThePointer(t *testing.T) {
 	shown, with := demo(t)
-	_, _, rows := paint(shown, looking, with, time.Now(), image.Pt(-1, -1))
+	_, _, rows := paint(shown, looking, with, time.Now(), aside)
 	if len(rows) < 2 {
 		t.Fatalf("%d app rows painted", len(rows))
 	}
 
 	for lit := range rows {
 		at := image.Pt(rows[lit].Min.X+2, rows[lit].Min.Y+rowHeight/2)
-		canvas, _, again := paint(shown, looking, with, time.Now(), at)
+		canvas, _, again := paint(shown, looking, with, time.Now(), view{at: at, room: tall})
 		if !slices.Equal(again, rows) {
 			t.Fatalf("the rows move on hover: %v then %v", rows, again)
 		}
@@ -754,5 +889,391 @@ func TestTheHoverLightsTheRowUnderThePointer(t *testing.T) {
 	// Outside any row, none is lit.
 	if got := rowAt(rows, image.Pt(2, 2)); got != -1 {
 		t.Errorf("the panel's corner is on row %d", got)
+	}
+}
+
+// A color touched up later must not silently break readability: every text/background or
+// glyph/background pair of the palette keeps its WCAG 2.1 AA contrast, 4.5 for a text and 3 for a
+// glyph or a control.
+func TestThePaletteKeepsItsContrasts(t *testing.T) {
+	const text, shape = 4.5, 3.0
+	for _, c := range []struct {
+		what   string
+		on, in color.RGBA
+		least  float64
+	}{
+		{"ink/ground", ink, ground, text},
+		{"ink/rowLit", ink, rowLit, text},
+		{"ink/key", ink, key, text},
+		{"ink/keyLit", ink, keyLit, text},
+		{"ink/keyDown", ink, keyDown, text},
+		{"faint/ground", faint, ground, text},
+		{"faint/rowLit", faint, rowLit, text},
+		{"subdued/key", subdued, key, text},
+		{"brokenText/ground", brokenText, ground, text},
+		{"brokenText/rowLit", brokenText, rowLit, text},
+		{"white/accent", white, accent, text},
+		{"white/accentLit", white, accentLit, text},
+		{"white/accentDown", white, accentDown, text},
+		{"accent/ground", accent, ground, shape},
+		{"ready/ground", ready, ground, shape},
+		{"ready/rowLit", ready, rowLit, shape},
+		{"waking/ground", waking, ground, shape},
+		{"waking/rowLit", waking, rowLit, shape},
+		{"broken/ground", broken, ground, shape},
+		{"broken/rowLit", broken, rowLit, shape},
+		{"asleep/ground", asleep, ground, shape},
+		{"asleep/rowLit", asleep, rowLit, shape},
+		{"branch/ground", branch, ground, shape},
+	} {
+		if got := contrast(c.on, c.in); got < c.least {
+			t.Errorf("%s: contrast %.2f, wanted at least %.1f", c.what, got, c.least)
+		}
+	}
+}
+
+// contrast is the WCAG 2.1 relative luminance ratio between two sRGB colors.
+func contrast(a, b color.RGBA) float64 {
+	high, low := luminance(a), luminance(b)
+	if low > high {
+		high, low = low, high
+	}
+	return (high + 0.05) / (low + 0.05)
+}
+
+func luminance(c color.RGBA) float64 {
+	linear := func(v uint8) float64 {
+		x := float64(v) / 255
+		if x <= 0.04045 {
+			return x / 12.92
+		}
+		return math.Pow((x+0.055)/1.055, 2.4)
+	}
+	return 0.2126*linear(c.R) + 0.7152*linear(c.G) + 0.0722*linear(c.B)
+}
+
+// A glyph says the state by its shape, and the color only repeats it: the four silhouettes must stay
+// distinct once the color is removed, otherwise a theme that swallows a hue erases the state.
+func TestTheFourStatesHaveFourSilhouettes(t *testing.T) {
+	_, with := demo(t)
+	state := attach.State{Config: "/one/dsvs.json", Port: 4200, Apps: []attach.App{
+		{Name: "up", Status: "ready", Ready: true},
+		{Name: "coming", Status: "starting"},
+		{Name: "down", Status: "idle", Last: "exited (2)"},
+		{Name: "off", Status: "idle"},
+	}}
+	canvas, _, rows := paint([]project{{config: state.Config, live: &state}}, looking, with, time.Now(), aside)
+
+	silhouettes := make([][]bool, len(rows))
+	for i, row := range rows {
+		for y := row.Min.Y; y < row.Max.Y; y++ {
+			for x := 0; x < nameX-4; x++ {
+				silhouettes[i] = append(silhouettes[i], canvas.RGBAAt(x, y) != ground)
+			}
+		}
+	}
+	for i := range silhouettes {
+		for j := i + 1; j < len(silhouettes); j++ {
+			differing := 0
+			for k := range silhouettes[i] {
+				if silhouettes[i][k] != silhouettes[j][k] {
+					differing++
+				}
+			}
+			if differing < 10 {
+				t.Errorf("glyphs %d and %d differ by only %d pixels", i, j, differing)
+			}
+		}
+	}
+}
+
+// An app whose order has left offers nothing anymore: the first pictogram changes meaning with the
+// state, and a second click would do the opposite of what one expects. It says so in place of its
+// state.
+func TestAnAppWaitingForItsOrderOffersNothing(t *testing.T) {
+	shown, with := demo(t)
+	shown[0].pending = map[string]time.Time{"front": time.Now().Add(patience)}
+	_, zones, _ := paint(shown, looking, with, time.Now(), aside)
+
+	for _, z := range zones {
+		if z.name == "front" {
+			t.Errorf("a waiting app offers %v", z.do)
+		}
+	}
+	if !has(deedsOf(zones, "docs"), stop) {
+		t.Error("the project's other apps lost their gestures")
+	}
+}
+
+// On a pictogram, the state column writes what the click will do: it is the tooltip the panel does
+// not have. On the row alone, it keeps its state.
+func TestHoveringAPictogramSaysWhatItDoes(t *testing.T) {
+	shown, with := demo(t)
+	_, zones, rows := paint(shown, looking, with, time.Now(), aside)
+	var stopping zone
+	for _, z := range zones {
+		if z.name == "front" && z.do == stop {
+			stopping = z
+		}
+	}
+	row := rows[rowAt(rows, stopping.at.Min)]
+	inkInStatus := func(at image.Point) int {
+		canvas, _, _ := paint(shown, looking, with, time.Now(), view{at: at, room: tall})
+		seen := 0
+		for y := row.Min.Y; y < row.Max.Y; y++ {
+			for x := statusX; x < statusX+60; x++ {
+				if canvas.RGBAAt(x, y) == ink {
+					seen++
+				}
+			}
+		}
+		return seen
+	}
+	if inkInStatus(image.Pt(row.Min.X+2, row.Min.Y+2)) != 0 {
+		t.Error("the state column is in ink without the pointer on a pictogram")
+	}
+	if inkInStatus(stopping.at.Min.Add(image.Pt(3, 3))) == 0 {
+		t.Error("the state column does not write what the click would do")
+	}
+}
+
+// A gesture held on its pictogram presses it; dragged elsewhere, the background comes back.
+func TestAPressedPictogramSinksUntilYouDragAway(t *testing.T) {
+	shown, with := demo(t)
+	_, zones, _ := paint(shown, looking, with, time.Now(), aside)
+	var stopping zone
+	for _, z := range zones {
+		if z.name == "front" && z.do == stop {
+			stopping = z
+		}
+	}
+	sample := func(seen view) color.RGBA {
+		canvas, _, _ := paint(shown, looking, with, time.Now(), seen)
+		return canvas.RGBAAt(stopping.at.Min.X+3, stopping.at.Min.Y+stopping.at.Dy()/2)
+	}
+	on := stopping.at.Min.Add(image.Pt(3, 3))
+	if got := sample(view{at: on, room: tall}); got != keyLit {
+		t.Errorf("hovered: %v, wanted keyLit", got)
+	}
+	if got := sample(view{at: on, room: tall, pressed: stopping}); got != keyDown {
+		t.Errorf("pressed: %v, wanted keyDown", got)
+	}
+	if got := sample(view{at: image.Pt(2, 2), room: tall, pressed: stopping}); got == keyDown {
+		t.Error("dragged elsewhere, the pictogram stays pressed")
+	}
+}
+
+func deedsOf(zones []zone, name string) []deed {
+	var out []deed
+	for _, z := range zones {
+		if z.name == name {
+			out = append(out, z.do)
+		}
+	}
+	return out
+}
+
+// An order that left leaves its app waiting; an order that did not leave does not: its reason is on
+// the project's row, and nothing waits for an answer that will not come.
+func TestAnOrderLeavesItsAppWaitingOnlyIfItWentOut(t *testing.T) {
+	const one = "/one/dsvs.json"
+	p := &panel{order: []string{one}, state: map[string]attach.State{one: {Config: one}},
+		failed: map[string]string{}, waking: map[string]bool{}, pending: map[string]map[string]time.Time{},
+		links: map[string]*attach.Link{one: {}}}
+
+	p.ordered = func(string, deed, string) error { return errors.New("session is gone") }
+	p.act(zone{do: stop, config: one, name: "front"})
+	if p.snapshot()[0].pending["front"].After(time.Now()) {
+		t.Error("a refused order leaves the app waiting")
+	}
+
+	p.ordered = func(string, deed, string) error { return nil }
+	p.act(zone{do: stop, config: one, name: "front"})
+	if !p.snapshot()[0].pending["front"].After(time.Now()) {
+		t.Error("an order that left does not put the app on hold")
+	}
+}
+
+// A folded project hides its failure reason: its summary row carries the fallen state's cross, so
+// that one knows there is something to read by unfolding it.
+func TestAFoldedProjectStillSaysItHasFailed(t *testing.T) {
+	_, with := demo(t)
+	many := make([]attach.App, 20)
+	for i := range many {
+		many[i] = attach.App{Name: fmt.Sprintf("service-%02d", i), Status: "ready", Ready: true}
+	}
+	sessions := []attach.State{
+		{Config: "/a/dsvs.json", Port: 4300, Apps: many},
+		{Config: "/b/dsvs.json", Port: 4310, Apps: []attach.App{{Name: "front", Status: "ready", Ready: true}}},
+	}
+	shown := []project{{config: sessions[0].Config, live: &sessions[0]}, {config: sessions[1].Config, live: &sessions[1]}}
+	folded := view{at: aside.at, room: 760, unfolded: "/b/dsvs.json"}
+
+	summaryRed := func() int {
+		canvas, zones, _ := paint(shown, looking, with, time.Now(), folded)
+		summary := zoneOf(t, zones, unfold)
+		seen := 0
+		for y := summary.Min.Y; y < summary.Max.Y; y++ {
+			for x := summary.Min.X; x < summary.Max.X; x++ {
+				if canvas.RGBAAt(x, y) == broken {
+					seen++
+				}
+			}
+		}
+		return seen
+	}
+	calm := summaryRed()
+	shown[0].failed = "no port after 30s"
+	if summaryRed() <= calm {
+		t.Error("a failing project's summary does not stand out from a calm project")
+	}
+	shown[0].failed, sessions[0].NotApplied = "", "locale: demo has no fr build"
+	if summaryRed() <= calm {
+		t.Error("the summary of a session that does not apply its configuration does not stand out from a calm project")
+	}
+}
+
+// An order that changes nothing causes no new state: the app does not wait forever, and gets its
+// gestures back at the deadline.
+func TestAnAppStopsWaitingWhenNoStateComes(t *testing.T) {
+	const one = "/one/dsvs.json"
+	p := &panel{order: []string{one}, state: map[string]attach.State{one: {Config: one}},
+		failed: map[string]string{}, waking: map[string]bool{}, pending: map[string]map[string]time.Time{},
+		links: map[string]*attach.Link{one: {}}}
+	p.ordered = func(string, deed, string) error { return nil }
+	p.act(zone{do: start, config: one, name: "front"})
+
+	if p.expire(time.Now()) {
+		t.Error("the wait ended before its deadline")
+	}
+	if !p.snapshot()[0].pending["front"].After(time.Now()) {
+		t.Fatal("the app does not wait for its order")
+	}
+	if !p.expire(time.Now().Add(patience + time.Second)) {
+		t.Error("past the deadline, the wait does not say it is over")
+	}
+	if p.snapshot()[0].pending["front"].After(time.Now().Add(patience + time.Second)) {
+		t.Error("the app still waits after the deadline")
+	}
+	if len(p.pending) != 0 {
+		t.Errorf("waits remain: %v", p.pending)
+	}
+}
+
+// A sleeping project fits on one line: start and forget are on its title line, and there is nothing
+// else to say about it.
+func TestAColdProjectFitsOnOneLine(t *testing.T) {
+	_, with := demo(t)
+	cold := []project{{config: "/one/dsvs.json"}}
+	_, zones, _ := paint(cold, looking, with, time.Now(), aside)
+
+	var mine []zone
+	for _, z := range zones {
+		if z.config != "" {
+			mine = append(mine, z)
+		}
+	}
+	if len(mine) != 2 || !has(deedsOf(mine, ""), open) || !has(deedsOf(mine, ""), forget) {
+		t.Fatalf("a cold project offers %v, wanted start and forget", mine)
+	}
+	if mine[0].at.Min.Y != mine[1].at.Min.Y {
+		t.Errorf("start at %v and forget at %v are not on the same row", mine[0].at, mine[1].at)
+	}
+}
+
+// An update's failure reads as an error, not as news: the color is what tells them apart from "up to
+// date".
+func TestAFailedUpdateReadsAsAnError(t *testing.T) {
+	_, with := demo(t)
+	inRed := func(news renewal) bool {
+		canvas, _, _ := paint(nil, news, with, time.Now(), aside)
+		return slices.Contains(colorsOf(canvas), brokenText)
+	}
+	if !inRed(failure(errors.New("git fetch: could not resolve host"))) {
+		t.Error("the update's failure is not written in the error color")
+	}
+	if inRed(renewal{stage: idle, said: "up to date"}) {
+		t.Error("an up-to-date update is written in the error color")
+	}
+}
+
+func colorsOf(canvas *image.RGBA) []color.RGBA {
+	var out []color.RGBA
+	for i := 0; i < len(canvas.Pix); i += 4 {
+		out = append(out, color.RGBA{canvas.Pix[i], canvas.Pix[i+1], canvas.Pix[i+2], canvas.Pix[i+3]})
+	}
+	return out
+}
+
+// When the screen is too short, the panel folds: a single project stays unfolded, and it is the one
+// where something fell — it is the one we came to see. A click on a summary chooses another.
+func TestThePanelFoldsWhenTheScreenIsTooShort(t *testing.T) {
+	_, with := demo(t)
+	many := make([]attach.App, 20)
+	for i := range many {
+		many[i] = attach.App{Name: fmt.Sprintf("service-%02d", i), Status: "ready", Ready: true}
+	}
+	sessions := []attach.State{
+		{Config: "/a/dsvs.json", Port: 4300, Apps: many},
+		{Config: "/b/dsvs.json", Port: 4310, Apps: []attach.App{
+			{Name: "front", Status: "ready", Ready: true}, {Name: "admin", Status: "idle", Last: "exited (2)"}}},
+		{Config: "/c/dsvs.json", Port: 4320, Apps: []attach.App{{Name: "front", Status: "ready", Ready: true}}},
+	}
+	var shown []project
+	for i := range sessions {
+		shown = append(shown, project{config: sessions[i].Config, live: &sessions[i]})
+	}
+	const room = 760
+
+	unfolded := func(seen view) []string {
+		canvas, zones, _ := paint(shown, looking, with, time.Now(), seen)
+		if canvas.Bounds().Dy() > room {
+			t.Errorf("the panel is %d pixels high, the screen leaves %d", canvas.Bounds().Dy(), room)
+		}
+		folded := map[string]bool{}
+		for _, z := range zones {
+			if z.do == unfold {
+				folded[z.config] = true
+			}
+		}
+		var open []string
+		for _, one := range shown {
+			if !folded[one.config] {
+				open = append(open, one.config)
+			}
+		}
+		return open
+	}
+
+	if got := unfolded(view{at: aside.at, room: room}); !slices.Equal(got, []string{"/b/dsvs.json"}) {
+		t.Errorf("unfolded projects: %v, wanted the one with a fallen app", got)
+	}
+	if got := unfolded(view{at: aside.at, room: room, unfolded: "/c/dsvs.json"}); !slices.Equal(got, []string{"/c/dsvs.json"}) {
+		t.Errorf("unfolded projects: %v, wanted the chosen one", got)
+	}
+
+	offered := renewal{stage: idle, said: "up to date", beta: installBeta, betaOut: "v0.2.0-beta.1"}
+	if canvas, _, _ := paint(shown, offered, with, time.Now(), view{at: aside.at, room: room}); canvas.Bounds().Dy() > room {
+		t.Errorf("with the beta's row, the panel is %d pixels high, the screen leaves %d", canvas.Bounds().Dy(), room)
+	}
+
+	_, zones, _ := paint(shown, looking, with, time.Now(), aside)
+	if slices.ContainsFunc(zones, func(z zone) bool { return z.do == unfold }) {
+		t.Error("the panel folds while the screen leaves room")
+	}
+
+	clicked := &panel{}
+	if !clicked.act(zone{do: unfold, config: "/c/dsvs.json"}) || clicked.view().unfolded != "/c/dsvs.json" {
+		t.Error("a click on a summary does not choose the project to unfold")
+	}
+}
+
+// A branch binary is recognized at a glance from the header: the violet square there is that of its
+// icon's bars. The test binary is not called dsvs, so it is one.
+func TestABranchBinaryMarksItsHeader(t *testing.T) {
+	_, with := demo(t)
+	canvas, _, _ := paint(nil, looking, with, time.Now(), aside)
+	if got := canvas.At(pad+5, 18); got != branch {
+		t.Errorf("the header's square is %v, wanted %v", got, branch)
 	}
 }

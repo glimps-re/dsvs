@@ -433,6 +433,20 @@ func openPanel() error {
 	return panel.Open(image.Rect(-1, -1, -1, -1), nil, func() {})
 }
 
+// drawPanel draws the panel into a PNG file, without a window: what an agent, a bug report or an SSH
+// session can see of the panel.
+func drawPanel(path string) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	if err := panel.Render(file); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
+}
+
 // raise makes sure the service runs, and says whether it started it: the hub of the ports is born on
 // demand from the sessions, the status bar icon is what remains to hold. The gesture can be repeated
 // harmlessly — what to say about it belongs to whoever asked.
