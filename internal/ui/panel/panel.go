@@ -54,11 +54,11 @@ const glance = 50 * time.Millisecond
 // facts, and whoever holds the icon needs the first to reopen on the next click.
 //
 // It also closes on a click elsewhere on this machine, which it learns by watching the pointer, not
-// by grabbing it. So it touches nothing shared: no pointer grab, no keyboard grab, no focus request. A
-// grab confiscates the input of whoever is subjected to it — and under Qubes it would not even bring
-// the click beside it, which a VM's X server never sees; a focus request earns us either the
-// keystrokes of someone who thinks they are typing elsewhere, or an immediate FocusOut that closes the
-// panel at random (both measured). An anchor with negative coordinates: at the pointer, where an
+// by grabbing it. So it touches nothing shared: no pointer grab, no keyboard grab, no focus request —
+// except during an entry opened with a click. A grab confiscates the input of whoever is subjected to
+// it — and under Qubes it would not even bring the click beside it, which a VM's X server never sees;
+// a focus request earns us either the keystrokes of someone who thinks they are typing elsewhere, or
+// an immediate FocusOut that closes the panel at random (both measured). An anchor with negative
 // coordinates: at the pointer, where an icon's click would open it.
 func Open(anchor image.Rectangle, until <-chan struct{}, gone func()) error {
 	// xgb tells stderr what it did not find — a missing .Xauthority, for instance, while it connects
@@ -86,9 +86,11 @@ func Open(anchor image.Rectangle, until <-chan struct{}, gone func()) error {
 		limit: int(xproto.Setup(conn).MaximumRequestLength) * 4,
 		msb:   xproto.Setup(conn).ImageByteOrder == xproto.ImageOrderMSBFirst,
 		state: map[string]attach.State{}, links: map[string]*attach.Link{}, failed: map[string]string{},
-		waking: map[string]bool{}, pending: map[string]map[string]time.Time{}, reports: make(chan report, 8), told: make(chan renewal, 8),
+		waking: map[string]bool{}, pending: map[string]map[string]time.Time{}, replaying: map[string]change{}, refused: map[string]string{},
+		replayed: make(chan replay, 8), forgot: make(chan replay, 8), reports: make(chan report, 8), told: make(chan renewal, 8),
 		awake: make(chan woken, 8), done: make(chan struct{}), working: &working}
-	p.ordered = p.through
+	p.ordered, p.setting, p.keys, p.claim = p.through, attach.Set, mapping(conn), p.focus
+	p.setting = func(config string, values map[string]string) error { return attach.Draft(config, values) }
 	defer p.release()
 
 	if err := p.reach(); err != nil {
@@ -136,6 +138,13 @@ type report struct {
 	gone   bool
 }
 
+// replay is the answer to a gesture that waits for a session — a parameter change, a forget: nil if
+// it took.
+type replay struct {
+	config string
+	err    error
+}
+
 // woken is what waking a project gave: the link to its session, or the reason there is none.
 type woken struct {
 	config string
@@ -171,8 +180,35 @@ type panel struct {
 	// unfolded is the project chosen to unfold when the panel overflows the screen: it only lasts one
 	// opening.
 	unfolded string
+	// replaying is, per project, the parameter change its session is replaying, and refused the
+	// reason for the last one it refused: it is cleared on the next change, like the other reasons.
+	replaying map[string]change
+	refused   map[string]string
+	// dropped is the parameter whose list of values is unfolded: only one at a time, and none once a
+	// value is chosen.
+	dropped slot
+	// typing is the entry in progress of a text or a number, and keys the table that translates keys
+	// into what they write. Any other gesture abandons it, like Escape: a single place holds the
+	// keyboard, and it is the one in view. giveBack returns the focus the entry took, and exists only
+	// with it; keyless is the parameter whose entry did not get the focus, and says so until the next
+	// gesture.
+	typing   draft
+	keys     keyboard
+	giveBack func()
+	keyless  slot
+	// claim takes the keyboard focus for an entry, and returns how to give it back; false if the
+	// server did not grant it. A field, so that a test can do both without an X server.
+	claim    func() (giveBack func(), taken bool)
 	reports  chan report
 	awake    chan woken
+	replayed chan replay
+	// forgot carries the answer to a forget: nil if the project is forgotten, the reason for the
+	// refusal otherwise.
+	forgot chan replay
+
+	// setting changes a parameter of a project's session and returns once it has replayed: like
+	// ordered, a field so that a test hears what the panel asks.
+	setting func(config string, values map[string]string) error
 
 	// ordered carries an order to a project's session. It is a field so that a test hears what the
 	// panel orders without real sessions to lend it.
@@ -281,6 +317,7 @@ func (p *panel) follow(config string, states <-chan attach.State) {
 }
 
 func (p *panel) release() {
+	p.end()
 	close(p.done)
 	for _, link := range p.links {
 		link.Close()
@@ -314,7 +351,8 @@ func (p *panel) show(anchor image.Rectangle) error {
 		xproto.CwBackPixel|xproto.CwOverrideRedirect|xproto.CwEventMask,
 		[]uint32{0x1c1d22, 1,
 			xproto.EventMaskExposure | xproto.EventMaskButtonPress | xproto.EventMaskButtonRelease |
-				xproto.EventMaskKeyPress | xproto.EventMaskPointerMotion | xproto.EventMaskLeaveWindow,
+				xproto.EventMaskKeyPress | xproto.EventMaskPointerMotion | xproto.EventMaskLeaveWindow |
+				xproto.EventMaskFocusChange,
 		}).Check(); err != nil {
 		return err
 	}
@@ -386,6 +424,14 @@ func (p *panel) live(until <-chan struct{}) error {
 			}
 			p.render()
 
+		case up := <-p.replayed:
+			p.answered(up)
+			p.render()
+
+		case up := <-p.forgot:
+			p.forgotten(up)
+			p.render()
+
 		case up := <-p.reports:
 			delete(p.pending, up.config)
 			if up.gone {
@@ -409,8 +455,16 @@ func (p *panel) live(until <-chan struct{}) error {
 			case xproto.ExposeEvent:
 				p.render()
 			case xproto.KeyPressEvent:
-				if e.Detail == escape {
+				if !p.pressed(e) {
 					return nil
+				}
+				p.render()
+			case xproto.MappingNotifyEvent:
+				p.keys = mapping(p.conn)
+			case xproto.FocusOutEvent:
+				if e.Mode == xproto.NotifyModeNormal {
+					p.lost()
+					p.render()
 				}
 			case xproto.MotionNotifyEvent:
 				p.follows(int(e.EventX), int(e.EventY))
@@ -531,8 +585,60 @@ func (p *panel) hit(x, y int) (zone, bool) {
 	return zone{}, false
 }
 
+// pressed carries a key to the panel, and says whether it stays open. With no entry in progress, only
+// Escape means something: it closes it. During an entry, Enter sends the value, Escape abandons it,
+// and the rest is written.
+func (p *panel) pressed(e xproto.KeyPressEvent) bool {
+	if p.typing.name == "" {
+		return e.Detail != escape
+	}
+	switch sym := p.keys.symbol(e.Detail, e.State); sym {
+	case xkReturn, xkKPEnter:
+		p.change(p.typing.config, p.typing.name, string(p.typing.text))
+	case xkEscape:
+		p.end()
+	default:
+		p.typing = p.typing.edited(sym)
+	}
+	return true
+}
+
+// end closes the entry in progress, if any, and gives back the focus it took.
+func (p *panel) end() {
+	if p.giveBack != nil {
+		p.giveBack()
+	}
+	p.typing, p.giveBack = draft{}, nil
+}
+
+// lost closes the entry whose focus went elsewhere, without taking it back from whoever has it: keys
+// no longer arrive, and a box that looked like it was writing would lie.
+func (p *panel) lost() {
+	p.giveBack = nil
+	p.end()
+}
+
+// focus takes the keyboard focus for an entry, and says whether the server granted it: asking is not
+// enough, it must be read back. Giving it back restores the previous one, where the typing was before
+// the click.
+func (p *panel) focus() (func(), bool) {
+	before, err := xproto.GetInputFocus(p.conn).Reply()
+	if err != nil {
+		return nil, false
+	}
+	if err := xproto.SetInputFocusChecked(p.conn, xproto.InputFocusParent, p.win, xproto.TimeCurrentTime).Check(); err != nil {
+		return nil, false
+	}
+	if now, err := xproto.GetInputFocus(p.conn).Reply(); err != nil || now.Focus != p.win {
+		return nil, false
+	}
+	return func() { xproto.SetInputFocus(p.conn, before.RevertTo, before.Focus, xproto.TimeCurrentTime) }, true
+}
+
 // act carries the click to whom it concerns, and says whether the panel stays open.
 func (p *panel) act(z zone) bool {
+	p.end()
+	p.keyless = slot{}
 	switch z.do {
 	case dismiss:
 		return false
@@ -542,14 +648,7 @@ func (p *panel) act(z zone) bool {
 		go p.wake(z.config)
 		return true
 	case forget:
-		if _, _, err := projects.Forget(z.config); !p.reported(z.config, err) {
-			return true
-		}
-		// What runs carries on: one forgets an address, one does not stop a session. It therefore keeps
-		// its row as long as it lives.
-		if _, live := p.state[z.config]; !live {
-			p.order = slices.DeleteFunc(p.order, func(other string) bool { return other == z.config })
-		}
+		go p.forgetting(z.config)
 		return true
 	case start, stop, restart:
 		if p.command(z.config, z.do, z.name) {
@@ -561,6 +660,26 @@ func (p *panel) act(z zone) bool {
 		return true
 	case unfold:
 		p.unfolded = z.config
+		return true
+	case drop:
+		if clicked := (slot{z.config, z.name}); p.dropped == clicked {
+			p.dropped = slot{}
+		} else {
+			p.dropped = clicked
+		}
+		return true
+	case choose:
+		p.change(z.config, z.name, z.value)
+		return true
+	case edit:
+		p.dropped = slot{}
+		giveBack, taken := p.claim()
+		if !taken {
+			p.keyless = slot{z.config, z.name}
+			return true
+		}
+		p.giveBack = giveBack
+		p.typing = draft{slot: slot{z.config, z.name}, text: []rune(z.value), at: len([]rune(z.value))}
 		return true
 	case stopEverything:
 		for config := range p.links {
@@ -597,6 +716,52 @@ func (p *panel) act(z zone) bool {
 	}
 	p.command(z.config, z.do, z.name)
 	return true
+}
+
+// change gives a value to a parameter, outside the loop: the session replays its configuration, which
+// can take the time of an evaluation, and a panel that stops responding meanwhile is not one. What it
+// answered comes back through the channel, like the rest.
+func (p *panel) change(config, name, value string) {
+	p.replaying[config] = change{name, value}
+	delete(p.refused, config)
+	p.dropped = slot{}
+	p.end()
+	go func() {
+		err := p.setting(config, map[string]string{name: value})
+		select {
+		case p.replayed <- replay{config, err}:
+		case <-p.done:
+		}
+	}()
+}
+
+// forgetting forgets a project outside the loop: its session, when it has one, replays its
+// configuration before answering.
+func (p *panel) forgetting(config string) {
+	_, _, err := attach.Forget(config)
+	select {
+	case p.forgot <- replay{config, err}:
+	case <-p.done:
+	}
+}
+
+// forgotten files what a forget gave: the reason for a refusal on the project's row, or its row
+// removed — except when its session, opened with no app running, stays open: it keeps the row while
+// it lives.
+func (p *panel) forgotten(up replay) {
+	if _, live := p.state[up.config]; p.reported(up.config, up.err) && !live {
+		p.order = slices.DeleteFunc(p.order, func(other string) bool { return other == up.config })
+	}
+}
+
+// answered hands control back to the parameters of a session that answered, and keeps its reason if
+// it refused: the shown value then goes back to the one the session reports, since its state did not
+// change.
+func (p *panel) answered(up replay) {
+	delete(p.replaying, up.config)
+	if up.err != nil {
+		p.refused[up.config] = up.err.Error()
+	}
 }
 
 // command carries an order to a project's session, and says whether it left.
@@ -811,7 +976,7 @@ func (p *panel) render() {
 
 // view is what the hand is doing with the panel, so that the drawing shows it.
 func (p *panel) view() view {
-	seen := view{at: p.at, room: p.room, unfolded: p.unfolded}
+	seen := view{at: p.at, room: p.room, unfolded: p.unfolded, dropped: p.dropped, typing: p.typing, keyless: p.keyless}
 	if p.press != nil {
 		seen.pressed = *p.press
 	}
@@ -823,7 +988,11 @@ func (p *panel) view() view {
 func (p *panel) snapshot() []project {
 	out := make([]project, 0, len(p.order))
 	for _, config := range p.order {
-		one := project{config: config, failed: p.failed[config], waking: p.waking[config], pending: p.pending[config]}
+		one := project{config: config, failed: p.failed[config], waking: p.waking[config], pending: p.pending[config],
+			refused: p.refused[config]}
+		if replaying, going := p.replaying[config]; going {
+			one.replaying = &replaying
+		}
 		if state, live := p.state[config]; live {
 			one.live = &state
 		}

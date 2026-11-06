@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"dsvs/internal/config"
+	"dsvs/internal/projects"
 )
 
 // "sleep & wait" gives the shell a real child: a signal sent to the parent alone would leave it
@@ -1793,4 +1794,83 @@ export default config(params, ({ env, api, delay, locale }) => ({
     { path: "/api", proxy: { target: "https://" + (env === "local" ? "local" : "staging-" + api.staging) + "-" + locale + ".example" } },
   ] }],
   apps: [{ name: "app", command: ["sh", "-c", "sleep 300 & wait", String(delay), "{port}"] }],
+}));`
+
+// A draft fills in in whatever order one likes: staging, which requires an account, stays chosen as
+// long as the account is missing, nothing applies, and the typed account applies both together —
+// only then are they kept. A submission, on the other hand, refuses what leaves the form invalid,
+// and a draft refuses what a field does not take.
+func TestADraftWaitsForTheFieldThatCompletesIt(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), config.FileName)
+	if err := os.WriteFile(path, []byte(draftBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	office := exitsVia("198.51.100.1")
+	form, cfg, err := config.Load(path, nil, InputFor(path, office, nil, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	supervising(t, session)
+
+	shown := session.Form()
+	if err := session.Set(map[string]string{"api": "staging"}); err == nil || err.Error() != "the form refuses it: client: staging needs a test account" {
+		t.Errorf("set api=staging = %v, want the form's refusal", err)
+	}
+	if !reflect.DeepEqual(session.Form(), shown) {
+		t.Error("a refused submission changed the form")
+	}
+	if err := session.Draft(map[string]string{"api": "nope"}); err == nil || err.Error() != `api: "nope" is not one of local, staging` {
+		t.Errorf("draft api=nope = %v, want the field's refusal", err)
+	}
+
+	if err := session.Draft(map[string]string{"api": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	if api, client := session.Form().Fields[0], session.Form().Fields[1]; api.Value != "staging" || !slices.Equal(client.Errors, []string{"staging needs a test account"}) {
+		t.Errorf("api = %q, client says %q; want staging, and the missing account", api.Value, client.Errors)
+	}
+	if got := apiTarget(t, session); got != "https://local.example" || session.NotApplied() != "client: staging needs a test account" {
+		t.Errorf("/api leads to %q, not applied = %q: nothing should have applied", got, session.NotApplied())
+	}
+	if kept, onNetwork := projects.Recall(path, office.Network()); len(kept)+len(onNetwork) > 0 {
+		t.Errorf("the draft kept %v and %v before applying", kept, onNetwork)
+	}
+
+	if err := session.Draft(map[string]string{"client": "lea@shop.test"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := apiTarget(t, session); got != "https://staging.example" || session.NotApplied() != "" {
+		t.Errorf("/api leads to %q, not applied = %q: the account should have applied everything", got, session.NotApplied())
+	}
+	kept, onNetwork := projects.Recall(path, office.Network())
+	if !reflect.DeepEqual(kept, map[string]string{"client": "lea@shop.test"}) || !reflect.DeepEqual(onNetwork, map[string]string{"api": "staging"}) {
+		t.Errorf("kept %v for the project and %v for the network, want the account and staging", kept, onNetwork)
+	}
+	lines := strings.Split(strings.TrimSpace(joinLines(session.Log.Lines())), "\n")
+	if got, want := lines[len(lines)-2:], []string{"-- client=lea@shop.test kept", "-- api=staging kept for eth0 via 198.51.100.1"}; !slices.Equal(got, want) {
+		t.Errorf("the log ends on %q, want %q", got, want)
+	}
+	// Each setting taken says where it comes from, the waiting one as well as the completing one.
+	text := joinLines(session.Log.Lines())
+	for _, want := range []string{"-- set api=staging (panel)\n-- configuration not applied", "-- set client=lea@shop.test (tui)", "-- configuration applied again"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("the log does not say %q:\n%s", want, text)
+		}
+	}
+}
+
+// draftBody is the shop where staging requires a test account, kept for the project; the server
+// follows the network.
+const draftBody = `import { config, form, keep, network, required } from "dsvs";
+const params = form({ api: ["local", "staging"], client: "" }, (p) => {
+  network(p.api);
+  keep(p.client);
+  required(p.client, { when: ({ valueOf }) => valueOf(p.api) === "staging", message: "staging needs a test account" });
+});
+export default config(params, ({ api }) => ({
+  port: 4300,
+  ingress: [{ host: "localhost", routes: [{ path: "/", app: "app" }, { path: "/api", proxy: { target: "https://" + api + ".example" } }] }],
+  apps: [{ name: "app", command: ["sh", "-c", "sleep 300 & wait", "{port}"] }],
 }));`

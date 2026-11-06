@@ -87,8 +87,8 @@ const (
 	closeAll deed = "quit"
 
 	// openTUI opens the session's interface or brings it back on screen, open starts the session of a
-	// project already seen, forget forgets it without touching what runs, stopEverything stops the apps
-	// of every project, and quitDsvs goes away with the icon.
+	// project already seen, forget forgets it once its apps are off, stopEverything stops the apps of
+	// every project, and quitDsvs goes away with the icon.
 	openTUI        deed = "open the tui"
 	open           deed = "wake"
 	forget         deed = "forget"
@@ -96,9 +96,15 @@ const (
 	quitDsvs       deed = "quit dsvs"
 
 	// browse opens a facade in the default browser, unfold unfolds the project whose summary alone is
-	// shown.
+	// shown, drop unfolds a parameter's list of values, or folds it.
 	browse deed = "browse"
 	unfold deed = "unfold"
+	drop   deed = "drop"
+
+	// choose gives a parameter the value the zone carries, and sets a parameter of the session it
+	// names; edit opens a text or a number for entry, the zone carrying its value.
+	choose deed = "choose"
+	edit   deed = "edit"
 
 	// look searches for a new version of the binary, renew takes it.
 	look  deed = "look"
@@ -124,7 +130,15 @@ type project struct {
 	// state, would do the opposite of what one expects. The wait ends even if the order changes
 	// nothing.
 	pending map[string]time.Time
+	// replaying is the parameter change the session is replaying, nil when it replays none: a value
+	// is changed one at a time, and the finished replay — successful or refused — hands control back.
+	replaying *change
+	// refused is the reason for the last change the session refused.
+	refused string
 }
+
+// change is a value given to a parameter, while the session replays its configuration.
+type change struct{ name, value string }
 
 // renewal is what the panel knows of the update. Three states and not one more: it is working and
 // shows its step, it found a version and offers to take it, or it has something to say and offers to
@@ -166,6 +180,8 @@ type zone struct {
 	do     deed
 	config string
 	name   string
+	// value is the value choose gives to the parameter name.
+	value string
 }
 
 // faces are the panel's fonts: the text, the titles, the discreet labels, and the fixed pitch of the
@@ -179,12 +195,28 @@ type faces struct {
 
 // view is how the panel is being looked at: where the pointer is, outside the image when it is
 // elsewhere, which zone it started pressing, the empty zone when none is, what height the screen
-// leaves, and the project chosen to unfold when not everything fits.
+// leaves, the project chosen to unfold when not everything fits, the parameter whose list of values
+// is unfolded, the one being typed into, and the one whose entry did not get the keyboard — only one
+// of each at a time.
 type view struct {
 	at       image.Point
 	pressed  zone
 	room     int
 	unfolded string
+	dropped  slot
+	typing   draft
+	keyless  slot
+}
+
+// slot designates a session's parameter; the zero value designates none.
+type slot struct{ config, name string }
+
+// draft is the entry of a text or a number: the parameter it targets, the zero value targeting none,
+// what was typed, and the cursor's place in that text. Nothing leaves before Enter.
+type draft struct {
+	slot
+	text []rune
+	at   int
 }
 
 // paint draws the sessions and returns the image to push, the zones to click, and the app rows as it
@@ -335,19 +367,7 @@ func (p *painter) project(one project, named string) {
 	}
 	p.write(pad, top+22, p.fitting(named, right-pad-8, p.with.bold), p.with.bold, nameTint)
 
-	// A failure reason comes from elsewhere and has no promised length: it takes the lines it needs
-	// rather than ending in an ellipsis, the panel having no height decided in advance.
-	lines := wrapped(one.failed, width-pad-nameX, func(text string) int { return p.widthOf(text, p.with.text) })
-	for i, line := range lines {
-		at := p.reserve(errorRow)
-		if i == 0 {
-			p.mark(glyphX, at+errorRow/2, cross, broken)
-		}
-		p.write(nameX, at+14, line, p.with.text, brokenText)
-	}
-	if len(lines) > 0 {
-		p.reserve(6)
-	}
+	p.reason(nameX, one.failed)
 	if cold {
 		p.reserve(4)
 		return
@@ -357,20 +377,38 @@ func (p *painter) project(one project, named string) {
 		p.app(one, app)
 	}
 	p.facades(one.config, one.live.Facades, one.live.Port)
+	p.params(one)
 	p.actions(one)
 }
 
-// stale writes, on one line and under a status cross, why the session keeps the previous
-// configuration. It is elided, unlike the other reasons: the details are in the log and in dsvs
-// state, and the line only says there is something to read there.
-func (p *painter) stale(why string) {
-	if why == "" {
-		return
+// reason writes a failure's reason under a state cross, the text at x.
+func (p *painter) reason(x int, text string) {
+	top := p.y
+	if p.note(x, text, brokenText) {
+		p.mark(x-nameX+glyphX, top+errorRow/2, cross, broken)
 	}
-	at := p.reserve(errorRow)
-	p.mark(glyphX, at+errorRow/2, cross, broken)
-	p.write(nameX, at+14, p.fitting(notApplied+": "+why, width-pad-nameX, p.with.text), p.with.text, brokenText)
-	p.reserve(6)
+}
+
+// note writes a message under what it concerns, and says whether there was one. It comes from
+// elsewhere and has no promised length: it takes the lines it needs rather than ending in an
+// ellipsis, the panel having no height set in advance. That is the rule for every message — a
+// failure, a configuration the session does not apply, a disabled field's reasons, its errors.
+func (p *painter) note(x int, text string, tint color.Color) bool {
+	lines := wrapped(text, width-pad-x, func(line string) int { return p.widthOf(line, p.with.text) })
+	for _, line := range lines {
+		p.write(x, p.reserve(errorRow)+14, line, p.with.text, tint)
+	}
+	if len(lines) > 0 {
+		p.reserve(6)
+	}
+	return len(lines) > 0
+}
+
+// stale writes why the session keeps the previous configuration.
+func (p *painter) stale(why string) {
+	if why != "" {
+		p.reason(nameX, notApplied+": "+why)
+	}
 }
 
 // summary writes a folded project: its name, how many apps are in each state — each count behind its
@@ -445,8 +483,309 @@ func (p *painter) facades(config string, facades []attach.Facade, port int) {
 	}
 }
 
-// notApplied opens the line of a configuration the session does not apply.
-const notApplied = "not applied"
+// params writes the session's parameters in the form's order, each group under its title, then what
+// the machine shows of itself, then the form's errors and the reason for the last refused change.
+// What is observed offers nothing to click — the grammar says so on its own, nobody sets the network
+// from here — and, while a session replays a change, neither do the parameters: that is what keeps a
+// second replay from crossing a first. A hidden field does not exist here, and a group whose fields
+// are all hidden therefore has no title.
+func (p *painter) params(one project) {
+	state := one.live
+	if len(state.Params) == 0 && state.Observed == nil {
+		return
+	}
+	p.reserve(6)
+	group := ""
+	for _, field := range state.Params {
+		if field.Hidden {
+			continue
+		}
+		if within, _ := field.Group(); within != group {
+			group = within
+			if group != "" {
+				p.write(nameX, p.reserve(titleHeight)+15, p.fitting(group, width-pad-nameX, p.with.small), p.with.small, faint)
+			}
+		}
+		p.param(one, field)
+	}
+	p.observed(state.Observed)
+	for _, notice := range state.Notices {
+		p.note(nameX, notice, waking)
+	}
+	for _, err := range state.Errors {
+		p.reason(nameX, err)
+	}
+	p.reason(nameX, one.refused)
+}
+
+// titleHeight is the strip of a parameter group's title.
+const titleHeight = 20
+
+// param writes a parameter: its label on the left, indented under its group's title, its control
+// aligned right, then what it has to say. Disabled, its control is inert, as during a replay, and its
+// reasons are written below; an imposed value reads like what is observed, without being greyed out.
+// A kept value that no longer holds is written in amber under the one replacing it, while it yields.
+func (p *painter) param(one project, param config.Field) {
+	group, label := param.Group()
+	labelX := nameX
+	if group != "" {
+		labelX += groupIndent
+	}
+	if param.Readonly {
+		p.fact(labelX, label, param.Value, ink, "", faint)
+		p.reason(labelX, strings.Join(param.Errors, "; "))
+		return
+	}
+	top := p.reserve(rowHeight)
+	row := image.Rect(bleed, top, width-bleed, top+rowHeight)
+	shown := param.Value
+	if one.replaying != nil && one.replaying.name == param.Name {
+		shown = one.replaying.value
+	}
+	inert := one.replaying != nil || param.Disabled
+	typing := !inert && p.typing.slot == slot{one.config, param.Name}
+	if p.at.In(row) && !inert && !typing {
+		p.round(image.Rect(row.Min.X, row.Min.Y+1, row.Max.X, row.Max.Y-1), 4, rowLit)
+	}
+	var left int
+	widths, segmented := p.segmentWidths(param)
+	switch {
+	case typing:
+		left = p.editor(top)
+	case param.Type == "flag":
+		left = p.toggle(row, one.config, param, shown, inert)
+	case param.Choices == nil:
+		left = p.textbox(top, one.config, param, shown, inert)
+	case segmented:
+		left = p.segments(top, one.config, param, shown, widths, inert)
+	default:
+		left = p.picker(top, one.config, param, shown, inert)
+	}
+	if one.replaying != nil {
+		left -= 8 + p.widthOf(applying, p.with.text)
+		p.write(left, top+19, applying, p.with.text, faint)
+	}
+	p.write(labelX, top+19, p.fitting(label, left-8-labelX, p.with.text), p.with.text, faint)
+	if p.dropped == (slot{one.config, param.Name}) && !(segmented || param.Type == "flag" || param.Choices == nil) && !inert {
+		p.choices(one.config, param, shown)
+	}
+	if p.keyless == (slot{one.config, param.Name}) {
+		p.note(labelX, "no keyboard here: "+build.Name()+" set "+param.Name+"=… or the TUI", faint)
+	}
+	if typing {
+		p.note(labelX, strings.Join(append(param.Bounds(), "enter applies, esc cancels"), " · "), faint)
+	}
+	if param.Disabled {
+		p.note(labelX, strings.Join(param.Reasons, "; "), faint)
+	}
+	p.note(labelX, strings.Join(param.Unavailables(), "; "), faint)
+	p.note(labelX, param.Yields(), waking)
+	p.reason(labelX, strings.Join(param.Errors, "; "))
+}
+
+// groupIndent is a field's indent under its group's title.
+const groupIndent = 12
+
+// textbox writes a text or a number: its value in a box, which a click opens for entry on the line
+// itself. Returns the box's left edge.
+func (p *painter) textbox(top int, session string, param config.Field, shown string, inert bool) int {
+	text := p.fitting(shown, 150, p.with.text)
+	box := image.Rect(width-pad-max(48, p.widthOf(text, p.with.text)+2*buttonPadX), top+3, width-pad, top+25)
+	z := zone{at: image.Rect(box.Min.X, top, box.Max.X, top+rowHeight), do: edit, config: session, name: param.Name, value: shown}
+	tint, fill := asleep, key
+	if !inert {
+		tint, fill = subdued, p.tone(z, key, keyLit, keyDown)
+		if p.at.In(z.at) {
+			tint = ink
+		}
+		p.zones = append(p.zones, z)
+	}
+	p.round(box, 4, fill)
+	p.write(box.Max.X-buttonPadX-p.widthOf(text, p.with.text), top+19, text, p.with.text, tint)
+	return box.Min.X
+}
+
+// editor writes the entry in progress: a wider box, outlined with the accent, where the text follows
+// the cursor when it does not fit. It is not a zone: one types in it, one does not click it. Returns
+// the box's left edge.
+func (p *painter) editor(top int) int {
+	box := image.Rect(nameX+labelRoom, top+3, width-pad, top+25)
+	p.round(box, 5, accent)
+	p.round(box.Inset(1), 4, keyDown)
+	room, text := box.Dx()-2*buttonPadX, p.typing.text
+	from := 0
+	for p.widthOf(string(text[from:p.typing.at]), p.with.text) > room {
+		from++
+	}
+	p.write(box.Min.X+buttonPadX, top+19, p.fitting(string(text[from:]), room, p.with.text), p.with.text, ink)
+	caret := box.Min.X + buttonPadX + p.widthOf(string(text[from:p.typing.at]), p.with.text)
+	draw.Draw(p.canvas, image.Rect(caret, top+7, caret+1, top+21), image.NewUniform(ink), image.Point{}, draw.Src)
+	return box.Min.X
+}
+
+// applying is what is written before each control while a session replays.
+const applying = "applying…"
+
+// segmentWidths returns the width of each segment of a select, and says whether it fits as segments:
+// at most four values, in the room the label leaves.
+func (p *painter) segmentWidths(param config.Field) ([]int, bool) {
+	widths, total := make([]int, len(param.Choices)), 4
+	for i, choice := range param.Choices {
+		widths[i] = max(buttonHeight, p.widthOf(choice, p.with.text)+16)
+		total += widths[i]
+	}
+	return widths, len(widths) <= 4 && total <= width-pad-nameX-labelRoom
+}
+
+// segments writes a select with short values: all in view within one frame, the chosen one filled.
+// Every other segment is a zone over the row's full height; the chosen one is not, there is nothing
+// to change there. Returns the frame's left edge.
+func (p *painter) segments(top int, session string, param config.Field, shown string, widths []int, inert bool) int {
+	total := 4
+	for _, w := range widths {
+		total += w
+	}
+	x := width - pad - total
+	p.round(image.Rect(x, top+3, width-pad, top+25), 5, key)
+	left := x
+	x += 2
+	for i, choice := range param.Choices {
+		box := image.Rect(x, top+5, x+widths[i], top+23)
+		x = box.Max.X
+		fill, text := key, subdued
+		switch {
+		case choice == shown && inert:
+			fill, text = keyLit, ink
+		case choice == shown:
+			fill, text = accent, white
+		case inert || param.Unavailable(choice) != "":
+			text = asleep
+		default:
+			z := zone{at: image.Rect(box.Min.X, top, box.Max.X, top+rowHeight), do: choose,
+				config: session, name: param.Name, value: choice}
+			fill = p.tone(z, key, keyLit, keyDown)
+			if p.at.In(z.at) {
+				text = ink
+			}
+			p.zones = append(p.zones, z)
+		}
+		p.round(box, 4, fill)
+		p.write(box.Min.X+(widths[i]-p.widthOf(choice, p.with.text))/2, top+19, choice, p.with.text, text)
+	}
+	return left
+}
+
+// picker writes a select with long or many values: a button carrying the chosen value and a chevron;
+// a click unfolds the values under the row, another folds them. Returns the button's left edge.
+func (p *painter) picker(top int, session string, param config.Field, shown string, inert bool) int {
+	text := p.fitting(shown, 150, p.with.text)
+	box := image.Rect(width-pad-(p.widthOf(text, p.with.text)+buttonPadX+28), top+3, width-pad, top+25)
+	z := zone{at: image.Rect(box.Min.X, top, box.Max.X, top+rowHeight), do: drop, config: session, name: param.Name}
+	tint, fill := asleep, key
+	if !inert {
+		tint, fill = subdued, p.tone(z, key, keyLit, keyDown)
+		if p.at.In(z.at) {
+			tint = ink
+		}
+		p.zones = append(p.zones, z)
+	}
+	p.round(box, 4, fill)
+	p.write(box.Min.X+buttonPadX, top+19, text, p.with.text, tint)
+	p.pictogram(drop, box.Max.X-14, top+14, tint)
+	return box.Min.X
+}
+
+// choices writes the values of an unfolded select, one row per value, in the panel itself: it grows,
+// which it already knows how to do. Choosing a value gives it to the parameter; the chosen one folds
+// the list.
+func (p *painter) choices(session string, param config.Field, shown string) {
+	for _, choice := range param.Choices {
+		top := p.reserve(26)
+		z := zone{at: image.Rect(bleed, top, width-bleed, top+26), do: choose, config: session, name: param.Name, value: choice}
+		tint := faint
+		switch {
+		case choice == shown:
+			z.do, tint = drop, ink
+		case param.Unavailable(choice) != "":
+			tint = asleep
+		}
+		if tint != asleep {
+			p.round(z.at, 4, p.tone(z, ground, rowLit, keyDown))
+			p.zones = append(p.zones, z)
+		}
+		if choice == shown {
+			p.pictogram(choose, 44, top+13, ink)
+		}
+		p.write(58, top+18, p.fitting(choice, width-pad-58, p.with.text), p.with.text, tint)
+	}
+}
+
+// toggle writes a flag: a track whose knob says the state, the color repeating it. A click anywhere
+// on the row toggles. Returns the track's left edge.
+func (p *painter) toggle(row image.Rectangle, session string, param config.Field, shown string, inert bool) int {
+	track := image.Rect(width-pad-32, row.Min.Y+5, width-pad, row.Min.Y+23)
+	param.Value = shown
+	z := zone{at: row, do: choose, config: session, name: param.Name, value: param.Next()}
+	on := shown == "true"
+	rest, lit, down, knob, knobX := key, keyLit, keyDown, faint, track.Min.X+9
+	if on {
+		rest, lit, down, knob, knobX = accent, accentLit, accentDown, white, track.Max.X-9
+	}
+	fill := key
+	if inert {
+		knob = asleep
+	} else {
+		fill = p.tone(z, rest, lit, down)
+		p.zones = append(p.zones, z)
+	}
+	p.round(track, 9, fill)
+	p.fill(track, knob, func(n pen) { n.circle(float32(knobX), float32(track.Min.Y+9), 7, solid) })
+	return track.Min.X
+}
+
+// observed writes what the machine shows: the network in ink, followed by "detected". Nothing
+// observed reads faint, without a suffix.
+func (p *painter) observed(seen *config.Observed) {
+	if seen == nil {
+		p.fact(nameX, "network", seen.String(), faint, "", faint)
+		return
+	}
+	p.fact(nameX, "network", seen.String(), ink, detected, faint)
+}
+
+// fact writes a read-only row: its label on the left, its value aligned right, and a suffix after it
+// when there is one. A value that does not fit beside its label goes below and wraps over the lines
+// it needs, like a message: nothing sets it from here, so this is the only place it reads. It offers
+// nothing to click.
+func (p *painter) fact(labelX int, label, value string, tint color.Color, suffix string, suffixTint color.Color) {
+	top := p.reserve(rowHeight)
+	right := width - pad
+	if suffix != "" {
+		right -= p.widthOf(suffix, p.with.small)
+		p.write(right, top+19, suffix, p.with.small, suffixTint)
+		right -= 8
+	}
+	beside := labelX+p.widthOf(label, p.with.text)+8+p.widthOf(value, p.with.text) <= right
+	if beside {
+		right -= p.widthOf(value, p.with.text)
+		p.write(right, top+19, value, p.with.text, tint)
+		right -= 8
+	}
+	p.write(labelX, top+19, p.fitting(label, right-labelX, p.with.text), p.with.text, faint)
+	if !beside {
+		p.note(labelX, value, tint)
+	}
+}
+
+// detected says a value is not set from here: the machine shows it, and that is all. notApplied opens
+// the line of a configuration the session does not apply.
+const (
+	detected   = "detected"
+	notApplied = "not applied"
+)
+
+// labelRoom is the room a parameter's label keeps at least, whatever its control asks of it.
+const labelRoom = 120
 
 // app writes an app row: its shape, its name, what it is doing, and two fixed slots for the
 // pictograms that drive it — the first starts or stops, the second restarts, empty for a stopped app.
@@ -711,6 +1050,11 @@ func (p *painter) pictogram(do deed, cx, cy int, tint color.Color) {
 			n.stroke(x-4.5, y+4.5, x+4.5, y-4.5, 1.6)
 		case unfold:
 			n.polygon(x-2, y-4, x+2.5, y, x-2, y+4)
+		case drop:
+			n.polygon(x-3.5, y-2, x+3.5, y-2, x, y+2.5)
+		case choose:
+			n.stroke(x-4.5, y+0.5, x-1.5, y+3.5, 1.7)
+			n.stroke(x-1.5, y+3.5, x+4.5, y-3.5, 1.7)
 		}
 	})
 }
