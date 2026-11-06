@@ -782,10 +782,11 @@ func paramsOf(written string) string {
 
 type closedFront struct{}
 
-func (closedFront) Listen(int) (net.Listener, error) {
+func (closedFront) Listen() (net.Listener, error) {
 	return nil, errors.New("no port in this test")
 }
 func (closedFront) Hosts([]string) error { return nil }
+func (closedFront) Move(int) error       { return errors.New("no port in this test") }
 
 type idleGateway struct{}
 

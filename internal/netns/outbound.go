@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -64,6 +66,71 @@ func relay(fd int) error {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol, icmp.NewProtocol4},
 	})
+	forwarder := tcp.NewForwarder(s, 0, 1024, func(r *tcp.ForwarderRequest) {
+		// The destination is read before anything else: Complete invalidates the request.
+		dst := where(r.ID())
+		if dst.Port() == dnsPort {
+			if conn, ok := accept(r); ok {
+				go serveDNS(conn, true, resolver, watchers.line)
+			}
+			return
+		}
+		// The real connection opens before answering the app, and its failure is returned as a real
+		// network would return it: a server that refuses, by a refusal; a destination out of reach,
+		// by the ICMP a router would send. Accepting then closing used to blur them into a silent
+		// end of connection, and an app — the session's proxy included — could no longer tell a
+		// server that is down from a network that does not reach it.
+		real, err := reach("tcp", dst)
+		// After the dial: a SYN repeated while it was waiting is filed under the same key.
+		syn, _ := syns.LoadAndDelete(r.ID())
+		if err != nil {
+			refused := errors.Is(err, unix.ECONNREFUSED) || errors.Is(err, errPrivate)
+			r.Complete(refused)
+			if quoted, ipv4 := syn.([]byte); ipv4 && !refused {
+				unreachable(quoted, errors.Is(err, unix.ENETUNREACH))
+			}
+			return
+		}
+		conn, ok := accept(r)
+		if !ok {
+			real.Close()
+			return
+		}
+		go pipe(conn, real, false)
+	})
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		if pkt.NetworkProtocolNumber == header.IPv4ProtocolNumber && header.TCP(pkt.TransportHeader().Slice()).Flags() == header.TCPFlagSyn {
+			syns.Store(id, slices.Concat(pkt.NetworkHeader().Slice(), pkt.TransportHeader().Slice()[:8]))
+		}
+		return forwarder.HandlePacket(id, pkt)
+	})
+
+	datagrams := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
+		dst := where(r.ID())
+		var queue waiter.Queue
+		endpoint, e := r.CreateEndpoint(&queue)
+		if e != nil {
+			return
+		}
+		virtual := gonet.NewUDPConn(&queue, endpoint)
+		// DNS is not relayed, it is resolved, and so it does not go out: the address the app
+		// targeted only exists in the private network, and it is the machine's stack that knows how
+		// to answer.
+		if dst.Port() == dnsPort {
+			go serveDNS(virtual, false, resolver, watchers.line)
+			return
+		}
+		real, err := reach("udp", dst)
+		if err != nil {
+			virtual.Close()
+			return
+		}
+		go pipe(virtual, real, true)
+	})
+	s.SetTransportProtocolHandler(udp.ProtocolNumber, datagrams.HandlePacket)
+
+	// The interface is connected last: it delivers packets as soon as it is created, and they must
+	// find the handlers in place.
 	if e := s.CreateNIC(nic, endpoint); e != nil {
 		return fmt.Errorf("stack interface: %v", e)
 	}
@@ -75,69 +142,77 @@ func relay(fd int) error {
 		{Destination: header.IPv4EmptySubnet, NIC: nic},
 		{Destination: header.IPv6EmptySubnet, NIC: nic},
 	})
-
-	forwarder := tcp.NewForwarder(s, 0, 1024, func(r *tcp.ForwarderRequest) {
-		// The destination is read before anything else: Complete invalidates the request.
-		dst := where(r.ID())
-		var queue waiter.Queue
-		endpoint, e := r.CreateEndpoint(&queue)
-		if e != nil {
-			r.Complete(true)
-			return
-		}
-		r.Complete(false)
-		go pipe(gonet.NewTCPConn(&queue, endpoint), dst)
-	})
-	s.SetTransportProtocolHandler(tcp.ProtocolNumber, forwarder.HandlePacket)
-
-	datagrams := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
-		dst := where(r.ID())
-		var queue waiter.Queue
-		endpoint, e := r.CreateEndpoint(&queue)
-		if e != nil {
-			return
-		}
-		go pipe(gonet.NewUDPConn(&queue, endpoint), dst)
-	})
-	s.SetTransportProtocolHandler(udp.ProtocolNumber, datagrams.HandlePacket)
 	return nil
 }
 
-// pipe replays an intercepted connection in the normal world and copies the bytes both ways. The
+// syns keeps, per connection waiting for its twin, the IPv4 header of its SYN and the start of its
+// TCP header: it is what an ICMP must quote for the app's kernel to attach it to its socket. An
+// IPv6 SYN is not there, and its out-of-reach destination is told by silence.
+var syns sync.Map
+
+// unreachable writes into the TUN what a router would answer to this SYN: host, or network,
+// unreachable, on behalf of the destination. The app's connect then fails on EHOSTUNREACH or
+// ENETUNREACH, right away, instead of waiting for a response that will not come.
+func unreachable(quoted []byte, network bool) {
+	original := header.IPv4(quoted)
+	icmp := header.ICMPv4(make([]byte, header.ICMPv4MinimumSize+len(quoted)))
+	icmp.SetType(header.ICMPv4DstUnreachable)
+	icmp.SetCode(header.ICMPv4HostUnreachable)
+	if network {
+		icmp.SetCode(header.ICMPv4NetUnreachable)
+	}
+	copy(icmp[header.ICMPv4MinimumSize:], quoted)
+	icmp.SetChecksum(^checksum.Checksum(icmp, 0))
+	packet := header.IPv4(make([]byte, header.IPv4MinimumSize+len(icmp)))
+	packet.Encode(&header.IPv4Fields{TotalLength: uint16(len(packet)), TTL: 64, Protocol: uint8(header.ICMPv4ProtocolNumber),
+		SrcAddr: original.DestinationAddress(), DstAddr: original.SourceAddress()})
+	packet.SetChecksum(^packet.CalculateChecksum())
+	copy(packet[header.IPv4MinimumSize:], icmp)
+	_, _ = unix.Write(tun, packet)
+}
+
+// accept completes the handshake with the app and returns its connection.
+func accept(r *tcp.ForwarderRequest) (net.Conn, bool) {
+	var queue waiter.Queue
+	endpoint, e := r.CreateEndpoint(&queue)
+	if e != nil {
+		r.Complete(true)
+		return nil, false
+	}
+	r.Complete(false)
+	return gonet.NewTCPConn(&queue, endpoint), true
+}
+
+// errPrivate is the refusal of a virtual network address looked for outside.
+var errPrivate = errors.New("refused")
+
+// reach opens in the normal world the connection the app targeted, and tells how it went. The
 // destination is the one the app targeted: neither the name, nor the certificate, nor anything of
 // the content is touched.
-func pipe(virtual net.Conn, dst netip.AddrPort) {
-	defer virtual.Close()
-	_, datagram := virtual.(*gonet.UDPConn)
-	network := "tcp"
-	if datagram {
-		network = "udp"
-	}
-	// DNS is not relayed, it is resolved, and so it does not go out: the address the app
-	// targeted only exists in the private network, and it is the machine's stack that knows how
-	// to answer.
-	if dst.Port() == dnsPort {
-		serveDNS(virtual, !datagram, resolver, watchers.line)
-		return
-	}
+func reach(network string, dst netip.AddrPort) (net.Conn, error) {
 	if !allowed(dst) {
 		watchers.line(fmt.Sprintf("%-4s %-45s refused", network, dst))
-		return
+		return nil, errPrivate
 	}
-
 	real, err := net.DialTimeout(network, dst.String(), 10*time.Second)
 	if err != nil {
 		watchers.line(fmt.Sprintf("%-4s %-45s %v", network, dst, err))
-		return
+		return nil, err
 	}
+	watchers.line(fmt.Sprintf("%-4s %-45s open", network, dst))
+	return real, nil
+}
+
+// pipe copies the bytes both ways between an intercepted connection and its twin in the normal
+// world.
+func pipe(virtual, real net.Conn, datagram bool) {
+	defer virtual.Close()
 	defer real.Close()
 	if datagram {
 		// A datagram does not announce its end: without exchange, the conversation is over.
 		_ = virtual.SetDeadline(time.Now().Add(udpIdle))
 		_ = real.SetDeadline(time.Now().Add(udpIdle))
 	}
-	watchers.line(fmt.Sprintf("%-4s %-45s open", network, dst))
-
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { defer wg.Done(); copyThenTell(real, virtual) }()

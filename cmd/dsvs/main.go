@@ -340,38 +340,11 @@ func writeStatus(out io.Writer, here machine) {
 		fmt.Fprintf(out, "  remembered  %s\n", config)
 	}
 	for _, peer := range here.Peers {
-		fmt.Fprintf(out, "%s%s\n", peer.Name, since(peer))
+		fmt.Fprintln(out, peer)
 		for _, session := range peer.Sessions {
 			fmt.Fprintf(out, "  port %d  %s\n", session.Port, session.Config)
 		}
 	}
-}
-
-// since says of another binary what it was willing to say of itself: its version, since when it has
-// held the ports. A hub too old to answer does not make the line false, only shorter.
-func since(peer hub.Peer) string {
-	var said []string
-	if peer.Version != "" {
-		said = append(said, peer.Version)
-	}
-	if !peer.Since.IsZero() {
-		said = append(said, "holding ports since "+peer.Since.Format("15:04"))
-	}
-	if len(said) == 0 {
-		return ""
-	}
-	return " (" + strings.Join(said, ", ") + ")"
-}
-
-// held names what already holds this port, when another dsvs binary opened it: it is the only thing
-// "address already in use" lacks for one to know what to do. A port taken by anything else has
-// nothing to add.
-func held(port int) string {
-	peer, session, ok := hub.Holder(port)
-	if !ok {
-		return ""
-	}
-	return fmt.Sprintf("; %s%s holds it for %s", peer.Name, since(peer), session.Config)
 }
 
 // service is the command: without an argument it ensures the background service and its icon, so a
@@ -622,9 +595,9 @@ func run(s *shape, headless bool, ctl, fallback string, args []string, taken *co
 	// connections of the hosts it declares. That is what lets them coexist on 4200. The configuration is
 	// the identity of the session: the hub names it by it, and refuses a second session of the same file
 	// by it.
-	front := hub.New(cfg.Path, network.Mode().Isolated)
+	front := hub.New(cfg.Path, cfg.Port, network.Mode().Isolated)
 	session := core.NewSession(form, cfg, network, front, func(s *core.Session) core.Gateway {
-		return gateway.NewProxy(cfg.Port, s, s.Sink())
+		return gateway.NewProxy(s, s.Sink())
 	})
 	session.SetRenewal(renewal(session, attachers, network))
 	if taken == nil {
@@ -681,7 +654,7 @@ func run(s *shape, headless bool, ctl, fallback string, args []string, taken *co
 	// The port is taken here, before any interface: when busy, it is an error one reads, not a log line
 	// in an interface that pretends to work. It is changed with --port.
 	if err := session.Open(serving); err != nil {
-		return failed(fmt.Errorf("port %d: %w%s", cfg.Port, err, held(cfg.Port)))
+		return failed(fmt.Errorf("port %d: %w", cfg.Port, err))
 	}
 	// The project is remembered as soon as its session has started: that is what makes it appear in
 	// the panel, cold, at the next start. A refused session remembers nothing. Failing to write it does

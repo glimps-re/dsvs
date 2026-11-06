@@ -180,8 +180,12 @@ Commands:
   help [command]                 write what a command does, or the list of them
 
 A name is an app, a facade — which pulls in the apps of its routes — or a group declared in the
-configuration. The session port is taken when it starts and released when it stops; every facade
-answers on it, and a path leading to a stopped app answers 502.
+configuration. The session port is taken when it starts, follows the configuration, and is released
+when it stops; every facade answers on it, and a path leading to a stopped app answers 502. A
+browser opening the path of an app that is starting gets a page that reloads by itself when the app
+answers, or says why it fell. An applied configuration reloads nothing but what an app declares with
+its reload key: "page" reloads the pages it serves, { stdin: "…" } types exactly that text in its
+terminal.
 
 dsvs needs a configuration: the one named by --config, or the first one found searching up from the
 current directory. Everything it needs around it starts on demand and says so — the background

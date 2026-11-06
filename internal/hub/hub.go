@@ -25,8 +25,9 @@ import (
 // Version is that of the dialogue between a session and the hub. Two binaries that do not share it
 // do not half-understand each other: the hub refuses the session, which says so and stops.
 //
-// The hello carries the requested port and the configuration that requests it.
-const Version = 3
+// The hello carries the requested port and the configuration that requests it, and a registered
+// session can ask for another port.
+const Version = 4
 
 // anyHost is the host the session declares to say "everything nobody else claims". It is said,
 // instead of saying nothing: a session without a facade and a session that takes the rest thus
@@ -151,6 +152,22 @@ func (p Peer) MarshalJSON() ([]byte, error) {
 	return json.Marshal(plain(p))
 }
 
+// String names another binary with what it was willing to say of itself: its version, since when it
+// has held the ports. A hub too old to answer does not make the line false, only shorter.
+func (p Peer) String() string {
+	var said []string
+	if p.Version != "" {
+		said = append(said, p.Version)
+	}
+	if !p.Since.IsZero() {
+		said = append(said, "holding ports since "+p.Since.Format("15:04"))
+	}
+	if len(said) == 0 {
+		return p.Name
+	}
+	return p.Name + " (" + strings.Join(said, ", ") + ")"
+}
+
 // Peers tells the other binaries' hubs. They never talk to each other, by design: they are looked
 // at to name them — a taken port is taken by one of them, and saying so is better than letting one
 // read "address already in use".
@@ -189,6 +206,16 @@ func Holder(port int) (Peer, Session, bool) {
 	return Peer{}, Session{}, false
 }
 
+// held names what holds this port, when another dsvs binary opened it: it is the only thing a taken
+// port lacks for one to know what to do. A port taken by anything else has nothing to add.
+func held(port int) string {
+	peer, session, ok := Holder(port)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("; %s holds it for %s", peer, session.Config)
+}
+
 // who asks a hub for its version and its birth. Without an answer, it is not known, and that is
 // all.
 func who(addr string) (string, time.Time) {
@@ -214,7 +241,8 @@ func who(addr string) (string, time.Time) {
 
 // Front is the session's port, held by the hub. config is the session's identity: its configuration
 // file, and nothing else. isolated says the session lives in a network namespace: the hub must be
-// born outside.
+// born outside. The port is the only place where the session keeps it: it registers on it, changes
+// it, and registers again on it.
 //
 // The registration has three states, and nothing represents them outside the methods that follow:
 // not taken yet, held by a hub's connection, or released for good. A hub that dies sends the
@@ -228,17 +256,24 @@ type Front struct {
 	// and it is sent whole on each registration.
 	// send serializes the declarations among themselves, outside the state lock: what is written to
 	// the hub no longer freezes the port loop nor the session's close.
+	// moved receives the hub's answer to a port change: it is the listener loop that reads it, the
+	// only one reading what the hub says. conns are the served connections, which the session
+	// closes when it leaves the port they come from.
 	send   sync.Mutex
 	mu     sync.Mutex
 	say    func(string)
 	in     *fdpass.Reader
+	port   int
 	hosts  []string
 	closed bool
+	moved  chan string
+	conns  map[*conn]struct{}
 }
 
 // New puts the hub in front of the session's port.
-func New(config string, isolated bool) *Front {
-	return &Front{config: config, isolated: isolated, say: func(string) {}}
+func New(config string, port int, isolated bool) *Front {
+	return &Front{config: config, port: port, isolated: isolated, say: func(string) {},
+		moved: make(chan string, 1), conns: map[*conn]struct{}{}}
 }
 
 // Say gives where to write what there is to say about the hub. The session's log does not exist yet
@@ -299,28 +334,81 @@ func (f *Front) drop(in *fdpass.Reader) {
 // Listen returns the port's connections, without taking it: the hub accepts them and passes them
 // on. The port therefore belongs to nobody, which is what lets two sessions serve their respective
 // hosts at the same time.
-func (f *Front) Listen(port int) (net.Listener, error) {
-	born, err := f.take(port)
+func (f *Front) Listen() (net.Listener, error) {
+	port, born, err := f.take()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w%s", err, held(port))
 	}
 	if born {
 		f.tell(fmt.Sprintf("-- hub for port %d started", port))
 	}
-	return &listener{front: f, port: port}, nil
+	return &listener{front: f}, nil
+}
+
+// Move switches the session to another port. The hub opens it if it is not open, leads its hosts
+// there and releases the old one if nobody else serves on it, under its registrations' lock:
+// refused — the port taken by another program, a host another session serves there —, the session
+// stays where it is, and the error says why. The connections from the old port close: a tab that
+// kept its own there is no longer served. A session that is not registered will register on the new
+// one.
+func (f *Front) Move(port int) error {
+	f.send.Lock()
+	defer f.send.Unlock()
+	f.mu.Lock()
+	in, left := f.in, f.port
+	if in == nil {
+		f.port = port
+		f.mu.Unlock()
+		return nil
+	}
+	f.mu.Unlock()
+	// An answer that arrived too late for the previous change does not answer this one.
+	select {
+	case <-f.moved:
+	default:
+	}
+	control := in.Conn()
+	timed := control.SetWriteDeadline(time.Now().Add(declarePatience))
+	_, wrote := fmt.Fprintf(control, "port %d\n", port)
+	if err := errors.Join(timed, wrote); err != nil {
+		f.drop(in)
+		return err
+	}
+	select {
+	case answer := <-f.moved:
+		if answer != "ok" {
+			return fmt.Errorf("%s%s", answer, held(port))
+		}
+	case <-time.After(declarePatience):
+		f.drop(in)
+		return fmt.Errorf("the hub did not answer")
+	}
+	f.mu.Lock()
+	f.port = port
+	var stale []*conn
+	for served := range f.conns {
+		if from, _ := served.LocalAddr().(*net.TCPAddr); from != nil && from.Port == left {
+			stale = append(stale, served)
+		}
+	}
+	f.mu.Unlock()
+	for _, served := range stale {
+		served.Close()
+	}
+	return nil
 }
 
 // take registers the session with its port's hub, launching it if there is none, and keeps the
-// connection: it is through it that the port's connections then arrive. The second return says
-// whether it had to be launched. The hosts can change while registering: what holds is the current
-// list, told again to the one that just welcomed us with the old one.
-func (f *Front) take(port int) (bool, error) {
+// connection: it is through it that the port's connections then arrive. It returns that port, and
+// says whether the hub had to be launched. The hosts can change while registering: what holds is
+// the current list, told again to the one that just welcomed us with the old one.
+func (f *Front) take() (int, bool, error) {
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
-		return false, net.ErrClosed
+		return 0, false, net.ErrClosed
 	}
-	previous, announced := f.in, f.hosts
+	previous, port, announced := f.in, f.port, f.hosts
 	f.in = nil
 	f.mu.Unlock()
 	if previous != nil {
@@ -329,21 +417,21 @@ func (f *Front) take(port int) (bool, error) {
 
 	in, born, err := join(port, f.config, announced, f.isolated, f.abandoned)
 	if err != nil {
-		return born, err
+		return port, born, err
 	}
 	f.mu.Lock()
 	if f.closed {
 		f.mu.Unlock()
 		in.Close()
-		return born, net.ErrClosed
+		return port, born, net.ErrClosed
 	}
 	f.in = in
 	stale := !slices.Equal(announced, f.hosts)
 	f.mu.Unlock()
 	if stale {
-		return born, f.declare()
+		return port, born, f.declare()
 	}
-	return born, nil
+	return port, born, nil
 }
 
 // abandoned says the session released its port: whatever looks for a hub for it stops there, and
@@ -516,7 +604,6 @@ func exeName() string { return build.Name() }
 // does not tell the difference.
 type listener struct {
 	front *Front
-	port  int
 	// revived dates the last revival. A hub that accepts then dies at once, in a loop, therefore
 	// does not make the revival spin faster than reviveEvery — neither the loop, nor the log.
 	revived time.Time
@@ -552,19 +639,25 @@ func (l *listener) Accept() (net.Conn, error) {
 		case "say":
 			l.front.tell(rest)
 			continue
+		case "port":
+			select {
+			case l.front.moved <- rest:
+			default:
+			}
+			continue
 		case "conn":
 		default:
 			return nil, errors.New(strings.TrimPrefix(line, "err "))
 		}
 		fd, passed := in.Fd()
 		if !passed {
-			return nil, fmt.Errorf("the hub for port %d passed a connection without its descriptor", l.port)
+			return nil, errors.New("the hub passed a connection without its descriptor")
 		}
 		file := os.NewFile(uintptr(fd), "hub")
-		conn, err := net.FileConn(file)
+		raw, err := net.FileConn(file)
 		file.Close()
 		if err == nil {
-			return conn, nil
+			return l.front.hold(raw), nil
 		}
 	}
 }
@@ -584,10 +677,11 @@ func (l *listener) reading() (*fdpass.Reader, error) {
 			time.Sleep(wait)
 		}
 		l.revived = time.Now()
-		if _, err := l.front.take(l.port); err != nil {
+		port, _, err := l.front.take()
+		if err != nil {
 			return nil, err
 		}
-		l.front.tell(fmt.Sprintf("-- hub for port %d taken again, the port serves once more", l.port))
+		l.front.tell(fmt.Sprintf("-- hub for port %d taken again, the port serves once more", port))
 	}
 }
 
@@ -595,5 +689,29 @@ func (l *listener) reading() (*fdpass.Reader, error) {
 func (l *listener) Close() error { return l.front.close() }
 
 func (l *listener) Addr() net.Addr {
-	return &net.TCPAddr{Port: l.port}
+	l.front.mu.Lock()
+	defer l.front.mu.Unlock()
+	return &net.TCPAddr{Port: l.front.port}
+}
+
+// conn is a served connection, which the session closes if it leaves the port it comes from.
+type conn struct {
+	net.Conn
+	front *Front
+}
+
+// hold keeps a served connection, until the server closes it.
+func (f *Front) hold(raw net.Conn) net.Conn {
+	served := &conn{Conn: raw, front: f}
+	f.mu.Lock()
+	f.conns[served] = struct{}{}
+	f.mu.Unlock()
+	return served
+}
+
+func (c *conn) Close() error {
+	c.front.mu.Lock()
+	delete(c.front.conns, c)
+	c.front.mu.Unlock()
+	return c.Conn.Close()
 }
