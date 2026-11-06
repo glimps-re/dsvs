@@ -159,24 +159,25 @@ dsvs — control panel for dev-servers
   dsvs [options] <command> [options] [arguments]
 
 Commands:
-  start [--all] <name...>      start the apps these names pull in
-  stop [--all] <name...>       stop the apps these names pull in
-  restart [--all] <name...>    restart the apps these names pull in
-  reload                       make the session read its configuration again
-  quit                         stop the apps of the session and close it
-  state [--json]               write what the session here is doing
-  logs [-n <lines>] [name...]  write the end of the logs, or follow them with -f
-  run [name...]                hold the session in this terminal, streaming the logs
-  status [--json]              write what runs on this machine, and who holds the ports
-  service [stop|restart]       start the background service and its icon, or stop it
-  update                       take a newer version of this binary, and restart the service
-  panel                        open the panel of the running sessions
-  remember                     remember the project here, so that the panel lists it cold
-  forget                       forget the project here, which the panel stops listing
-  config                       write the resolved configuration as JSON
-  types                        write the package specifier of the TypeScript types matching this binary
-  skill                        write a skill that teaches this tool to a coding agent
-  help [command]               write what a command does, or the list of them
+  start [--all] <name...>        start the apps these names pull in
+  stop [--all] <name...>         stop the apps these names pull in
+  restart [--all] <name...>      restart the apps these names pull in
+  reload                         make the session read its configuration again
+  set <name=value...>            give parameters of the configuration a value, and replay it
+  quit                           stop the apps of the session and close it
+  state [--json]                 write what the session here is doing
+  logs [-n <lines>] [name...]    write the end of the logs, or follow them with -f
+  run [name...] [name=value...]  hold the session in this terminal, streaming the logs
+  status [--json]                write what runs on this machine, and who holds the ports
+  service [stop|restart]         start the background service and its icon, or stop it
+  update                         take a newer version of this binary, and restart the service
+  panel                          open the panel of the running sessions
+  remember                       remember the project here, so that the panel lists it cold
+  forget                         forget the project here, which the panel stops listing
+  config [name=value...]         write the resolved configuration as JSON
+  types                          write the package specifier of the TypeScript types matching this binary
+  skill                          write a skill that teaches this tool to a coding agent
+  help [command]                 write what a command does, or the list of them
 
 A name is an app, a facade — which pulls in the apps of its routes — or a group declared in the
 configuration. The session port is taken when it starts and released when it stops; every facade

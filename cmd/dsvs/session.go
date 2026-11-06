@@ -15,6 +15,8 @@ import (
 	"unicode/utf8"
 
 	"dsvs/internal/attach"
+	"dsvs/internal/build"
+	"dsvs/internal/config"
 )
 
 // settling is the time given to the session to say what the order changed. An order that changes
@@ -41,15 +43,18 @@ func bare(s *shape) error {
 	return writeState(os.Stdout, <-link.States())
 }
 
-// order carries an order to the session here and writes what it says about it. start ensures it — it
-// is born if need be, the service with it; the others require it alive, since there is nothing to stop
-// or reload in a session that is not there. An empty list of names means "every app": the session
-// resolves it, and it is what --all sends.
+// order carries an order to the session here — start, stop or restart — and writes what it says about
+// it, or returns its refusal. start ensures it — it is born if need be, the service with it; the others
+// require it alive, since there is nothing to stop in a session that is not there. An empty list of
+// names means "every app": the session resolves it, and it is what --all sends.
 func order(s *shape, verb string, names []string) error {
 	if s.tui && verb == "start" {
 		return lend(s, names)
 	}
-	// start ensures the session, the others require it alive.
+	config, err := resolve(s.config)
+	if err != nil {
+		return err
+	}
 	open := watching
 	if verb == "start" {
 		open = ensure
@@ -60,21 +65,82 @@ func order(s *shape, verb string, names []string) error {
 	}
 	defer link.Close()
 	last := <-link.States()
-	if err := link.Order(verb, names...); err != nil {
+	said, err := attach.Order(config, verb, names...)
+	if err != nil {
 		return err
+	}
+	if said != "" {
+		fmt.Println(said)
 	}
 	return writeState(os.Stdout, settled(link, last))
 }
 
-// reloading makes the session here read its configuration again. The order is about the whole
-// session: a name would mean nothing there, and refusing it is better than ignoring it.
+// reloading makes the session here read its configuration again, and returns its refusal when the
+// file does not apply. The order is about the whole session: a name would mean nothing there, and
+// refusing it is better than ignoring it. The session only answers once the replay is done, as for
+// set.
 func reloading(s *shape) func([]string) error {
 	return func(names []string) error {
 		if len(names) > 0 {
 			return errors.New("reload takes no name: it is the whole session")
 		}
-		return order(s, "reload", nil)
+		config, err := resolve(s.config)
+		if err != nil {
+			return err
+		}
+		if _, err := attach.Order(config, "reload"); err != nil {
+			return err
+		}
+		return replayed(config)
 	}
+}
+
+// setting gives values to the parameters of the session here and writes the state it derives from
+// them. The refusal is the session's, since it alone knows what the configuration takes: it arrives
+// here, where the action took place.
+func setting(s *shape, pairs []string) error {
+	if len(pairs) == 0 {
+		return fmt.Errorf("set takes name=value; %s state lists the parameters", build.Name())
+	}
+	values, err := valued("set", pairs)
+	if err != nil {
+		return err
+	}
+	config, err := resolve(s.config)
+	if err != nil {
+		return err
+	}
+	if err := attach.Set(config, values); err != nil {
+		return err
+	}
+	return replayed(config)
+}
+
+// replayed writes the state of the session here, on a link opened after it answered an action that
+// replays the configuration: its answer comes once the replay is done, so the state read next is the
+// one of that action. The next state of a link opened before, on the other hand, may be that of
+// anything else that happened in the meantime — a log line from a previous action, a network change.
+func replayed(config string) error {
+	link, err := attach.Watch(config)
+	if err != nil {
+		return err
+	}
+	defer link.Close()
+	return writeState(os.Stdout, <-link.States())
+}
+
+// valued reads name=value arguments, split at the first "=": a value is a word, the rest is up to the
+// configuration, which accepts them or not.
+func valued(verb string, pairs []string) (map[string]string, error) {
+	values := make(map[string]string, len(pairs))
+	for _, pair := range pairs {
+		name, value, found := strings.Cut(pair, "=")
+		if !found {
+			return nil, fmt.Errorf("%s takes name=value, got %q", verb, pair)
+		}
+		values[name] = value
+	}
+	return values, nil
 }
 
 // closing closes the session here: its apps stop, its port is released, and its link closing is the
@@ -188,7 +254,47 @@ func writeState(out io.Writer, state attach.State) error {
 		attached = append(attached, seen.Kind)
 	}
 	fmt.Fprintf(w, "\nfacades     %s\ninterfaces  %s\n", listed(facades), listed(attached))
+	// A hidden field does not exist here. The lines saying where a value comes from, what yields, what is
+	// inert and what is wrong are only written when they have something to say.
+	var params, from, disabled []string
+	for _, field := range state.Params {
+		if field.Hidden {
+			continue
+		}
+		params = append(params, chosen(field))
+		if field.From != "default" {
+			from = append(from, field.Name+": "+field.From)
+		}
+		if field.Disabled {
+			disabled = append(disabled, strings.Join(append([]string{field.Name}, field.Reasons...), ": "))
+		}
+		for _, off := range field.Unavailables() {
+			disabled = append(disabled, field.Name+": "+off)
+		}
+	}
+	form := config.Form{Fields: state.Params, Errors: state.Errors}
+	for _, line := range []struct {
+		label string
+		items []string
+	}{{"params", params}, {"from", from}, {"yielded", form.Yields()}, {"notice", state.Notices}, {"disabled", disabled}, {"invalid", form.Problems()}} {
+		if len(line.items) > 0 {
+			fmt.Fprintf(w, "%-12s%s\n", line.label, strings.Join(line.items, "  "))
+		}
+	}
+	fmt.Fprintf(w, "network     %s\n", state.Observed)
+	if state.NotApplied != "" {
+		fmt.Fprintf(w, "not applied %s (%s logs)\n", state.NotApplied, build.Name())
+	}
 	return w.Flush()
+}
+
+// chosen writes a parameter as it is set: name=value, and its current choices in parentheses — a flag
+// has only two, which its name already says, and a free text or number has none.
+func chosen(field config.Field) string {
+	if field.Type == "flag" || field.Choices == nil {
+		return field.Name + "=" + field.Value
+	}
+	return field.Name + "=" + field.Value + " (" + strings.Join(field.Choices, " ") + ")"
 }
 
 // writeLogs writes log lines as the stream writes them: the source, aligned, then the line as the app

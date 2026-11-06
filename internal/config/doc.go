@@ -55,8 +55,11 @@
 // go through node, any other file is executed itself. A module without config() exports a
 // configuration, or a function called without a value, and its form is empty.
 //
-// What dsvs config writes is the snapshot of what a session opened here would build: the
-// configuration alone, readable again as a dsvs.json.
+// What dsvs config writes is the snapshot of what a session opened here would build, with the asked
+// values on top: the configuration alone, readable again as a dsvs.json. The observed network is just
+// one input among others: --observed gives another one, or none, and that is the question "what does
+// my configuration choose at the office?" asked from home. --params writes the form instead: what an
+// agent can set, and what is hidden, inert or invalid.
 //
 // # DSVS_CONFIG is the only anchor
 //

@@ -1,9 +1,11 @@
 package attach
 
 import (
+	"encoding/json"
 	"time"
 
 	"dsvs/internal/build"
+	"dsvs/internal/config"
 )
 
 // State is what a session tells about itself to whoever drives it without watching it: enough to fill
@@ -14,9 +16,31 @@ type State struct {
 	// Version is that of the binary holding the session: it is what tells, after an update, whether it
 	// took the new one or kept its own.
 	Version    string      `json:"version,omitempty"`
-	Apps       []App       `json:"apps,omitempty"`
-	Facades    []Facade    `json:"facades,omitempty"`
-	Interfaces []Interface `json:"interfaces,omitempty"`
+	Apps       []App       `json:"apps"`
+	Facades    []Facade    `json:"facades"`
+	Interfaces []Interface `json:"interfaces"`
+	// Params are the fields of the last evaluated form, hidden ones included: an interface does not show
+	// those, a tool reads them.
+	Params []config.Field `json:"params"`
+	// Errors are the errors of that form that no field carries, Notices what it says without refusing
+	// anything.
+	Errors  []string `json:"errors"`
+	Notices []string `json:"notices"`
+	// Observed is what the session sees of the machine; absent when nothing observes it.
+	Observed *config.Observed `json:"observed,omitempty"`
+	// NotApplied says, in one line, why the configuration in force is not the one the file builds: the
+	// last evaluation failed, or its form is invalid, and the targets are the previous ones. Absent when
+	// it is.
+	NotApplied string `json:"notApplied,omitempty"`
+}
+
+// MarshalJSON writes every list, empty ones included: a tool reads "none" in [], without having to
+// guess what a missing key means.
+func (s State) MarshalJSON() ([]byte, error) {
+	type plain State
+	s.Apps, s.Facades, s.Interfaces = append([]App{}, s.Apps...), append([]Facade{}, s.Facades...), append([]Interface{}, s.Interfaces...)
+	s.Params, s.Errors, s.Notices = append([]config.Field{}, s.Params...), append([]string{}, s.Errors...), append([]string{}, s.Notices...)
+	return json.Marshal(plain(s))
 }
 
 // App is the state of an app as a panel shows it: what it is doing, since when, and how its last run
@@ -54,8 +78,9 @@ type Log struct {
 // state reads the session at this instant. Nothing is kept from one call to the next: it is a
 // snapshot, and the driver receives a fresh one on every change.
 func (s *Server) state() State {
-	cfg := s.session.Config()
-	out := State{Config: cfg.Path, Port: cfg.Port, Version: build.Version, Interfaces: s.attached()}
+	cfg, form := s.session.Config(), s.session.Form()
+	out := State{Config: cfg.Path, Port: cfg.Port, Version: build.Version, Interfaces: s.attached(),
+		Params: form.Fields, Errors: form.Errors, Notices: form.Notices, Observed: s.session.Observed(), NotApplied: s.session.NotApplied()}
 	for _, app := range s.session.Apps() {
 		snap := app.Snapshot()
 		one := App{

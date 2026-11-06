@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"os/signal"
+	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -151,7 +154,8 @@ func (l *Link) States() <-chan State { return l.states }
 
 // Order gives the session an order: start, stop or restart of what these names bring along, reload to
 // make it reread its configuration, renew to make it take the binary on disk without letting go of its
-// apps, or quit to close everything.
+// apps, or quit to close everything. Nothing answers on this stream: a refusal is read in the session's
+// log, and the Order function is the one that waits for its answer.
 func (l *Link) Order(verb string, names ...string) error {
 	_, err := fmt.Fprintf(l.conn, "%s %s\n", verb, strings.Join(names, " "))
 	return err
@@ -169,28 +173,66 @@ func Follow(config string) error {
 // all of them with no name. It is not launched if it is not there: it reads what runs, it does not
 // decide to run things.
 func Tail(config string, n int, names []string) ([]Log, error) {
+	text, err := read(config, fmt.Sprintf("logs %d %s", n, strings.Join(names, " ")), "logs", maxTailed)
+	if err != nil {
+		return nil, err
+	}
+	var out []Log
+	if err := json.Unmarshal(text, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// Configuration returns the configuration in force in the session of this configuration, as JSON, the
+// way dsvs config writes it: built from the session's values, not from those of a new session. It is
+// not launched if it is not there.
+func Configuration(config string) (json.RawMessage, error) {
+	text, err := read(config, "config", "config", maxState)
+	if errors.Is(err, errUnread) {
+		return nil, predating(config, build.Name()+" config --session")
+	}
+	return text, err
+}
+
+// read asks a question whose answer is a line of JSON preceded by its verb, and returns that JSON, at
+// most limit bytes. The session is not launched if it is not there.
+func read(config, question, verb string, limit int) ([]byte, error) {
 	conn, err := dial(socket(config), func() error { return absent(config) })
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-	if _, err := fmt.Fprintf(conn, "logs %d %s\n", n, strings.Join(names, " ")); err != nil {
+	if _, err := fmt.Fprintln(conn, question); err != nil {
 		return nil, err
 	}
 	lines := bufio.NewScanner(conn)
-	lines.Buffer(make([]byte, 0, 4096), maxTailed)
+	lines.Buffer(make([]byte, 0, 4096), limit)
 	if !lines.Scan() {
 		return nil, errors.Join(errors.New("session interrupted"), lines.Err())
 	}
-	verb, rest, _ := strings.Cut(lines.Text(), " ")
-	if verb != "logs" {
-		return nil, errors.New(strings.TrimPrefix(lines.Text(), "err "))
+	said, text, _ := strings.Cut(lines.Text(), " ")
+	switch {
+	case said == verb:
+		return []byte(text), nil
+	case strings.HasPrefix(lines.Text(), "err unreadable greeting"):
+		return nil, errUnread
 	}
-	var out []Log
-	if err := json.Unmarshal([]byte(rest), &out); err != nil {
-		return nil, err
+	return nil, errors.New(strings.TrimPrefix(lines.Text(), "err "))
+}
+
+// Set gives values to the parameters of the session of this configuration, and returns once it has
+// replayed: nil if it took them, its reason otherwise. It is not launched if it is not there.
+func Set(config string, values map[string]string) error {
+	pairs := make([]string, 0, len(values))
+	for _, name := range slices.Sorted(maps.Keys(values)) {
+		pairs = append(pairs, strconv.Quote(name+"="+values[name]))
 	}
-	return out, nil
+	_, err := ask(config, "set "+strings.Join(pairs, " "))
+	if errors.Is(err, errUnread) {
+		return predating(config, "parameters")
+	}
+	return err
 }
 
 // Forget forgets the project of this configuration and everything dsvs keeps for it — its values, for
@@ -217,8 +259,67 @@ func Forget(config string) (listed, valued bool, err error) {
 	if listed, valued, err = projects.Forget(config); err != nil {
 		return listed, valued, err
 	}
-	_ = link.Order("reload") // a file the session does not apply is reported in its log and its state
+	_, _ = Order(config, "reload") // a file the session does not apply is reported in its log and its state
 	return listed, valued, nil
+}
+
+// Order gives an order to the session of this configuration — start, stop or restart of what these
+// names bring along, of all its apps with no name, or reload, which rereads its configuration — and
+// returns once it has taken it: what it says about it when there is something to say — a stop that
+// keeps an app another facade serves —, or its reason for refusing it, including that of a file that
+// does not apply. It is not launched if it is not there. A session from before acknowledged orders
+// does not read the question: the order then goes to it the way it understands it, on a driver's
+// stream and without an answer.
+func Order(config, verb string, names ...string) (said string, err error) {
+	said, err = ask(config, verb+" "+strings.Join(names, " "))
+	if !errors.Is(err, errUnread) {
+		return said, err
+	}
+	link, err := Watch(config)
+	if err != nil {
+		return "", err
+	}
+	defer link.Close()
+	return "", link.Order(verb, names...)
+}
+
+// ask asks the session of this configuration a question, on its own connection, and returns its
+// answer: "ok" and what follows it, its reason otherwise. It is not launched if it is not there.
+func ask(config, question string) (said string, err error) {
+	conn, err := dial(socket(config), func() error { return absent(config) })
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintln(conn, question); err != nil {
+		return "", err
+	}
+	lines := bufio.NewScanner(conn)
+	if !lines.Scan() {
+		return "", errors.Join(errors.New("session interrupted"), lines.Err())
+	}
+	reply := lines.Text()
+	if said, ok := strings.CutPrefix(reply, "ok"); ok {
+		return strings.TrimSpace(said), nil
+	}
+	if strings.HasPrefix(reply, "err unreadable greeting") {
+		return "", errUnread
+	}
+	return "", errors.New(strings.TrimPrefix(reply, "err "))
+}
+
+// errUnread is a session's answer to a question it does not read: it predates the verb.
+var errUnread = errors.New("the session does not read this question")
+
+// predating is what a client says when its session does not know what it asks: the session does not
+// read it, and it is the update that moves it to the binary that knows it.
+func predating(config, what string) error {
+	link, err := Watch(config)
+	if err != nil {
+		return err
+	}
+	defer link.Close()
+	return fmt.Errorf("this session predates %s (version %s): %s update hands it over", what, (<-link.States()).Version, build.Name())
 }
 
 func (l *Link) follow(lines *bufio.Scanner) {

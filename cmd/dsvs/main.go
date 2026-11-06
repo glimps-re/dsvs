@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -230,9 +231,16 @@ type machine struct {
 	Binary     string        `json:"binary"`
 	Version    string        `json:"version"`
 	Service    bool          `json:"service"`
-	Sessions   []hub.Session `json:"sessions,omitempty"`
-	Remembered []string      `json:"remembered,omitempty"`
-	Peers      []hub.Peer    `json:"peers,omitempty"`
+	Sessions   []hub.Session `json:"sessions"`
+	Remembered []string      `json:"remembered"`
+	Peers      []hub.Peer    `json:"peers"`
+}
+
+// MarshalJSON writes every list, empty ones included, like the state of a session.
+func (m machine) MarshalJSON() ([]byte, error) {
+	type plain machine
+	m.Sessions, m.Remembered, m.Peers = append([]hub.Session{}, m.Sessions...), append([]string{}, m.Remembered...), append([]hub.Peer{}, m.Peers...)
+	return json.Marshal(plain(m))
 }
 
 // status writes what runs. It is the answer to "what holds my ports", and it needs neither a
@@ -519,12 +527,23 @@ func cause(err error) error {
 }
 
 func die(err error) {
-	fmt.Fprintln(os.Stderr, err)
+	if !errors.Is(err, errSaid) {
+		fmt.Fprintln(os.Stderr, err)
+	}
 	os.Exit(1)
 }
 
-func run(s *shape, headless bool, ctl, fallback string, names []string, taken *core.Handover) error {
+// errSaid is the failure of a session that already said why, on its socket, to the client waiting for
+// it. Outside a systemd box, its stderr is that of the terminal that started it: saying it there again
+// would write it twice.
+var errSaid = errors.New("the session said why on its socket")
+
+func run(s *shape, headless bool, ctl, fallback string, args []string, taken *core.Handover) error {
 	path, err := resolve(s.config)
+	if err != nil {
+		return err
+	}
+	names, asked, err := namesAndValues(args)
 	if err != nil {
 		return err
 	}
@@ -544,8 +563,8 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 		attachers = server
 	}
 	failed := func(err error) error {
-		if attachers != nil {
-			attachers.Fail(err)
+		if attachers != nil && attachers.Fail(err) {
+			return errSaid
 		}
 		return err
 	}
@@ -565,7 +584,7 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 	}
 	observed, later := observe(serving, ctl, note)
 
-	form, cfg, err := opened(path, s, observed, taken)
+	form, cfg, err := opened(path, s, observed, taken, asked)
 	if err != nil {
 		return failed(err)
 	}
@@ -603,6 +622,7 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 	if observed != nil {
 		note("-- network: " + observed.String() + recalled(form))
 	}
+	session.Chose(asked)
 
 	// The apps of the handover become this session's own again before the proxy opens: those that
 	// answered still answer, and no request hits a 502 for the time of a probe. Failing the adoption
@@ -686,22 +706,23 @@ func run(s *shape, headless bool, ctl, fallback string, names []string, taken *c
 	return nil
 }
 
-// opened reads the configuration for the first time, under the rule of every replay: what the handover
-// had chosen, and what the project and its network keep. A new session thus starts on what had been chosen in it,
-// with nothing to restart. An invalid form builds nothing, and there is no configuration in effect to
-// fall back on: the error says how to start. A handover does have one, and resumes from it without
-// evaluating anything: an update therefore does not lose a session over a file the new binary refuses.
-func opened(path string, s *shape, observed *config.Observed, taken *core.Handover) (config.Form, config.Config, error) {
+// opened reads the configuration for the first time, under the rule of every replay: what run asks
+// for, then what the handover had chosen, and what the project keeps. A new session thus starts on what
+// had been chosen in it, with nothing to restart. An invalid form builds nothing, and there is no
+// configuration in effect to fall back on: the error says how to start. A handover does have one, and
+// resumes from it without evaluating anything: an update therefore does not lose a session over a file
+// the new binary refuses.
+func opened(path string, s *shape, observed *config.Observed, taken *core.Handover, asked map[string]string) (config.Form, config.Config, error) {
 	var intents map[string]string
 	if taken != nil {
 		intents = taken.Params
 	}
-	form, cfg, err := load(taken.Load, path, s.port, s.shift, s.watch, core.InputFor(path, observed, intents, nil))
+	form, cfg, err := load(taken.Load, path, s.port, s.shift, s.watch, core.InputFor(path, observed, intents, asked))
 	if err != nil {
 		return form, config.Config{}, err
 	}
-	if err := form.Accept(nil); err != nil {
-		return form, config.Config{}, fmt.Errorf("%s: %w; %s forget clears what the project keeps", path, err, build.Name())
+	if err := form.Accept(asked); err != nil {
+		return form, config.Config{}, fmt.Errorf("%s: %w; start with %s run name=value, or %[3]s forget", path, err, build.Name())
 	}
 	return form, *cfg, nil
 }
@@ -718,6 +739,21 @@ func recalled(form config.Form) string {
 		return ""
 	}
 	return ", back to " + config.Pairs(back)
+}
+
+// namesAndValues splits what run receives: names of apps, facades or groups, and name=value values,
+// asked for at the first read as set asks for them afterwards.
+func namesAndValues(args []string) ([]string, map[string]string, error) {
+	var names, pairs []string
+	for _, arg := range args {
+		if strings.Contains(arg, "=") {
+			pairs = append(pairs, arg)
+		} else {
+			names = append(names, arg)
+		}
+	}
+	values, err := valued("run", pairs)
+	return names, values, err
 }
 
 // observe returns the network as it is at the start, and the channel of its changes. Without a first
@@ -810,20 +846,33 @@ func only(roles []role, byDefault func() error) (func() error, error) {
 	return chosen, nil
 }
 
-// printConfig writes the configuration as the tool sees it — defaults applied, routes sorted — in the
-// JSON format it can read back. What the script said on its console goes to stderr: the output stays
-// replayable as is.
-func printConfig(s *shape) error {
+// printConfig writes the configuration these asked-for values build, like a session opened here on this
+// network — defaults applied, routes sorted — in the JSON format it can read back: a snapshot, hence
+// without the form a .json cannot declare. It refuses what a session would refuse. What the script said
+// on its console goes to stderr: the output stays replayable as is. asForm writes the form instead,
+// refused or not: it is the form that says what is hidden, inert or invalid, and the refusal follows.
+func printConfig(out io.Writer, s *shape, pairs []string, observed *config.Observed, asForm bool) error {
 	path, err := resolve(s.config)
 	if err != nil {
 		return err
 	}
-	form, cfg, err := load(config.Load, path, s.port, s.shift, s.watch, config.Input{})
+	values, err := valued("config", pairs)
 	if err != nil {
 		return err
 	}
-	if err := form.Accept(nil); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
+	form, cfg, err := load(config.Load, path, s.port, s.shift, s.watch, core.InputFor(path, observed, nil, values))
+	if err != nil {
+		return err
+	}
+	refused := form.Accept(values)
+	if refused != nil {
+		refused = fmt.Errorf("%s: %w", path, refused)
+	}
+	if asForm {
+		return errors.Join(write(out, form), refused)
+	}
+	if refused != nil {
+		return refused
 	}
 	for _, said := range cfg.Echo {
 		fmt.Fprintln(os.Stderr, said)
@@ -834,8 +883,71 @@ func printConfig(s *shape) error {
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Printf("%s\n", text)
+	_, err = fmt.Fprintf(out, "%s\n", text)
 	return err
+}
+
+// printSession writes what the session here has in effect: the configuration its values built, or with
+// asForm its form, where each value comes from included. These are the session's values: asking for
+// others, or for another network, makes no sense here, and dsvs set changes them.
+func printSession(out io.Writer, s *shape, pairs []string, observed string, asForm bool) error {
+	if len(pairs) > 0 || observed != "" {
+		return fmt.Errorf("--session writes the values of the session: it takes neither name=value nor --observed; %s set changes them", build.Name())
+	}
+	path, err := resolve(s.config)
+	if err != nil {
+		return err
+	}
+	if !hub.Answers(hub.SessionAddr(path)) {
+		return fmt.Errorf("no session serves %s: %s config without --session writes what a new one would build, %[2]s start opens one", path, build.Name())
+	}
+	if asForm {
+		link, err := attach.Watch(path)
+		if err != nil {
+			return err
+		}
+		defer link.Close()
+		state := <-link.States()
+		return write(out, config.Form{Fields: state.Params, Errors: state.Errors})
+	}
+	text, err := attach.Configuration(path)
+	if err != nil {
+		return err
+	}
+	var indented bytes.Buffer
+	if err := json.Indent(&indented, text, "", "  "); err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(out, "%s\n", indented.Bytes())
+	return err
+}
+
+// networkFor returns the network dsvs config answers for: the one observed here, or the one this JSON
+// describes — the observed of dsvs state --json, - for standard input, null for no network. An unknown
+// key is an error: a whole state given for its network is called out, instead of answering offline.
+func networkFor(source string) (*config.Observed, error) {
+	if source == "" {
+		ctx, stop := context.WithCancel(context.Background())
+		defer stop()
+		observed, _ := observe(ctx, "", func(line string) { fmt.Fprintln(os.Stderr, line) })
+		return observed, nil
+	}
+	in := os.Stdin
+	if source != "-" {
+		file, err := os.Open(source)
+		if err != nil {
+			return nil, err
+		}
+		defer file.Close()
+		in = file
+	}
+	described := json.NewDecoder(in)
+	described.DisallowUnknownFields()
+	var seen *config.Observed
+	if err := described.Decode(&seen); err != nil {
+		return nil, fmt.Errorf("--observed %s: %w", source, err)
+	}
+	return seen, nil
 }
 
 // join returns the network of the apps: the private network for the supervisor, loopback otherwise. A

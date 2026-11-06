@@ -231,6 +231,68 @@ func (c Config) AppsOf(name string) ([]string, bool) {
 	return nil, false
 }
 
+// Release is what a stop does with the apps some names bring along: those it stops, and those it keeps
+// because a facade that was not named still serves them.
+type Release struct {
+	Stops []string
+	Keeps []Kept
+}
+
+// Kept is an app a stop keeps, and the facades that still serve it.
+type Kept struct {
+	App string
+	By  []string
+}
+
+// Release splits wanted — the apps these names bring along, as the session resolves them — between
+// what a stop takes down and what it keeps. Stopping a facade stops only the apps of its routes that no
+// other facade serves: stopping one address does not cut the one next to it. A named app, or a member
+// of a named group, stops regardless.
+func (c Config) Release(names, wanted []string) Release {
+	var facades, asked []string
+	for _, name := range names {
+		if _, app := c.App(name); !app && slices.ContainsFunc(c.Ingresses, func(in Ingress) bool { return in.Name == name }) {
+			facades = append(facades, name)
+			continue
+		}
+		apps, _ := c.AppsOf(name)
+		asked = append(asked, apps...)
+	}
+	var release Release
+	for _, app := range wanted {
+		var named, others []string
+		for _, in := range c.IngressesOf(app) {
+			if slices.Contains(facades, in.Name) {
+				named = append(named, in.Name)
+			} else {
+				others = append(others, in.Name)
+			}
+		}
+		if len(named) > 0 && len(others) > 0 && !slices.Contains(asked, app) {
+			release.Keeps = append(release.Keeps, Kept{App: app, By: others})
+		} else {
+			release.Stops = append(release.Stops, app)
+		}
+	}
+	return release
+}
+
+// String says the stop in one line when it keeps something, and nothing otherwise: a stop that takes
+// down everything named has nothing to explain.
+func (r Release) String() string {
+	if len(r.Keeps) == 0 {
+		return ""
+	}
+	said := []string{"nothing to stop"}
+	if len(r.Stops) > 0 {
+		said[0] = "stopping " + strings.Join(r.Stops, ", ")
+	}
+	for _, kept := range r.Keeps {
+		said = append(said, "keeping "+kept.App+", still served by "+strings.Join(kept.By, ", "))
+	}
+	return strings.Join(said, "; ")
+}
+
 // Ingress is a facade: a host, and the table that says what becomes of each path. It decides the
 // routing; an app does not know the paths through which it is reached.
 type Ingress struct {

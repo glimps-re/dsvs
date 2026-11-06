@@ -3,6 +3,7 @@ package hub
 import (
 	"bufio"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -140,7 +141,14 @@ type Peer struct {
 	Name     string    `json:"name"`
 	Version  string    `json:"version,omitempty"`
 	Since    time.Time `json:"since,omitzero"`
-	Sessions []Session `json:"sessions,omitempty"`
+	Sessions []Session `json:"sessions"`
+}
+
+// MarshalJSON writes its sessions, none included.
+func (p Peer) MarshalJSON() ([]byte, error) {
+	type plain Peer
+	p.Sessions = append([]Session{}, p.Sessions...)
+	return json.Marshal(plain(p))
 }
 
 // Peers tells the other binaries' hubs. They never talk to each other, by design: they are looked

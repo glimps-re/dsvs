@@ -168,38 +168,52 @@ func handedOver(step func(string), version string) {
 	}
 	took := 0
 	for _, session := range living {
-		if err := handed(session.Config, version); err != nil {
+		notApplied, err := handed(session.Config, version)
+		if err != nil {
 			step(filepath.Base(session.Config) + " keeps the old binary: " + firstLine(err.Error()))
 			continue
 		}
 		took++
+		// A new binary that refuses the file has not lost the session: it serves on the configuration
+		// in force, and this is where whoever started the update is told.
+		if notApplied != "" {
+			step(filepath.Base(session.Config) + " took it, and keeps the configuration in force: " + notApplied)
+		}
 	}
 	if took > 0 {
 		step(fmt.Sprintf("%d session(s) took it, apps and all", took))
 	}
 }
 
-// handed asks a session for the handover and waits to see it back. The move is bounded end to end: a
-// hanging session does not hold up the update of the rest.
-func handed(config, version string) error {
-	done := make(chan error, 1)
-	go func() { done <- handover(config, version) }()
+// handed asks a session for the handover and waits to see it back, then returns what the returned
+// session does not apply of its configuration. The move is bounded end to end: a hanging session
+// does not hold up the update of the rest.
+func handed(config, version string) (string, error) {
+	type answer struct {
+		notApplied string
+		err        error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		notApplied, err := handover(config, version)
+		done <- answer{notApplied, err}
+	}()
 	select {
-	case err := <-done:
-		return err
+	case got := <-done:
+		return got.notApplied, got.err
 	case <-time.After(passing):
-		return errors.New("it did not answer")
+		return "", errors.New("it did not answer")
 	}
 }
 
-func handover(config, version string) error {
+func handover(config, version string) (string, error) {
 	link, err := attach.Watch(config)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := link.Order("renew"); err != nil {
 		link.Close()
-		return err
+		return "", err
 	}
 	// The link drops with the session's exec, and that is the acknowledgement. If it holds, the session
 	// refused to hand over, and said so in its log.
@@ -209,10 +223,10 @@ func handover(config, version string) error {
 	return back(config, version)
 }
 
-// back joins the returned session and compares what it carries with what was just laid down. Its
-// socket never stopped accepting: what takes a moment is the session itself, rereading its
-// configuration and adopting its apps.
-func back(config, version string) error {
+// back joins the returned session, compares what it carries with what was just laid down, and
+// returns what it does not apply of its configuration. Its socket never stopped accepting: what takes
+// a moment is the session itself, rereading its configuration and adopting its apps.
+func back(config, version string) (string, error) {
 	err := errors.New("it did not come back")
 	for range int(passing / (200 * time.Millisecond)) {
 		var link *attach.Link
@@ -225,12 +239,12 @@ func back(config, version string) error {
 			case state.Version != version:
 				err = errors.New("it came back as " + state.Version)
 			default:
-				return nil
+				return state.NotApplied, nil
 			}
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return err
+	return "", err
 }
 
 // install lays down the new binary, from where this one comes and where it is.

@@ -175,7 +175,7 @@ func (s *Session) Adopt(taken Handover) error {
 			return err
 		}
 	}
-	_ = s.replay() // a refusal is told in the log and in the status, and the session serves anyway
+	_ = s.replay(nil) // a refusal is told in the log and in the status, and the session serves anyway
 	return nil
 }
 

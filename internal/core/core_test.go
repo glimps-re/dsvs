@@ -9,6 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -180,6 +183,22 @@ func TestCrashIsNotAStop(t *testing.T) {
 	last := app.Snapshot().Last
 	if last.ByUser || last.Code != 3 {
 		t.Errorf("outcome = %+v, want an unrequested exit with code 3", last)
+	}
+}
+
+// A command the queue can no longer take is refused and says so, instead of being lost. Without
+// supervision running, nobody drains the queue: it fills up for sure.
+func TestAFullQueueRefusesTheOrder(t *testing.T) {
+	t.Parallel()
+	cfg, spy := fixture(t, sleeper)
+	app := NewSession(config.Form{}, cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy }).App("app")
+	for range cap(app.cmds) {
+		if err := app.Start(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := app.Stop(); err == nil || !strings.Contains(err.Error(), "app") {
+		t.Errorf("Stop on a full queue = %v, want a refusal that names the app", err)
 	}
 }
 
@@ -1225,6 +1244,94 @@ func apiTarget(t *testing.T, session *Session) string {
 	return route.Proxy.URL
 }
 
+func TestSettingAValueMovesTheProxyFirst(t *testing.T) {
+	t.Parallel()
+	session, _ := paramsSession(t)
+	before := session.Generation()
+
+	if err := session.Set(map[string]string{"env": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := apiTarget(t, session); got != "https://staging-0.example" {
+		t.Errorf("target of /api = %q, want the staging one", got)
+	}
+	if got := session.Generation(); got != before+1 {
+		t.Errorf("generation = %d, want %d", got, before+1)
+	}
+	if got := joinLines(session.Log.Lines()); !strings.Contains(got, "configuration reloaded") {
+		t.Errorf("the session log does not tell the replay:\n%s", got)
+	}
+}
+
+func TestAValueTheConfigurationDoesNotTakeChangesNothing(t *testing.T) {
+	t.Parallel()
+	session, _ := paramsSession(t)
+	generation, cfg := session.Generation(), session.Config()
+
+	err := session.Set(map[string]string{"env": "nope"})
+	if err == nil || !strings.Contains(err.Error(), "local, staging") {
+		t.Fatalf("Set = %v, want a refusal that quotes the choices", err)
+	}
+	if session.Generation() != generation || !reflect.DeepEqual(session.Config(), cfg) {
+		t.Error("a refused value changed the configuration in force")
+	}
+	if got := joinLines(session.Log.Lines()); !strings.Contains(got, "!! ") || !strings.Contains(got, "local, staging") {
+		t.Errorf("the session log does not tell the refusal:\n%s", got)
+	}
+}
+
+// A value whose built configuration is invalid is refused like any other: nothing changes, and the
+// session does not lag behind its file for all that. It used to say "not applied", and the next
+// valid setting wrote "configuration applied again".
+func TestAValueThatBuildsAnInvalidConfigurationIsARefusal(t *testing.T) {
+	t.Parallel()
+	session, rewrite := paramsSession(t)
+	rewrite(`import { config, form } from "dsvs";
+export default config(form({ target: "https://staging.example" }), ({ target }) => ({
+  port: 4300,
+  ingress: [{ host: "localhost", routes: [
+    { path: "/", app: "app" },
+    { path: "/api", ...(target ? { proxy: { target } } : {}) },
+  ] }],
+  apps: [{ name: "app", command: ["sh", "-c", "sleep 300 & wait", "{port}"] }],
+}));`)
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	generation := session.Generation()
+
+	if err := session.Set(map[string]string{"target": ""}); err == nil || !strings.Contains(err.Error(), `route "/api"`) {
+		t.Fatalf("Set target= : %v, want the route's refusal", err)
+	}
+	if got := session.NotApplied(); got != "" {
+		t.Errorf("not applied = %q after a refused gesture, want nothing: the file applies", got)
+	}
+	if session.Generation() != generation {
+		t.Error("a refused gesture changed the configuration in force")
+	}
+	if err := session.Set(map[string]string{"target": "https://demo.example"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := joinLines(session.Log.Lines()); strings.Contains(got, "configuration applied again") {
+		t.Errorf("the log says the configuration applied again, though it never stopped being applied:\n%s", got)
+	}
+}
+
+func TestAValueThatChangesAnAppLeavesItPending(t *testing.T) {
+	t.Parallel()
+	session, _ := paramsSession(t)
+	app := session.App("app")
+	app.Start()
+	waitFor(t, "the app ready", func() bool { return app.Snapshot().Status == Ready })
+
+	if err := session.Set(map[string]string{"env": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := app.Drift(); got != Stale {
+		t.Errorf("drift = %v, want %v: its command depends on the value", got, Stale)
+	}
+}
+
 // A network change the configuration ignores reloads nothing, not even the browsers: the session
 // records the observation and says so, one line, so that the pushed state carries it.
 func TestAnObservationThatChangesNothingIsSilent(t *testing.T) {
@@ -1360,3 +1467,330 @@ func TestAnObservationOutlivesAFailedReplay(t *testing.T) {
 		t.Errorf("target of /api = %q, want a configuration built on the new observation", got)
 	}
 }
+
+// A configuration the file builds but validation refuses has no line: its refusal names the file,
+// and all its faults fit on the line the status shows.
+func TestARefusalOfSeveralFaultsReadsOnOneLine(t *testing.T) {
+	t.Parallel()
+	session, rewrite := paramsSession(t)
+	rewrite(`export default { port: 4300, apps: [{ name: "a", command: ["srv"] }, { name: "b", command: ["srv"] }] };`)
+	if err := session.Reload(); err == nil {
+		t.Fatal("an invalid configuration reloads")
+	}
+	got := session.NotApplied()
+	if !strings.HasPrefix(got, "config.dsvs.ts: ") || strings.Count(got, "{port}") != 2 || strings.Contains(got, "\n") {
+		t.Errorf("not applied = %q, want the file and its two faults on one line", got)
+	}
+}
+
+// A configuration refused without a gesture — a save that breaks it, a network where it fails —
+// keeps the one in force and says why, until the evaluation that applies it again. That one is
+// logged even when it changes nothing: going back to the previous content, or to the network the
+// configuration in force comes from.
+func TestARefusedConfigurationSaysWhyUntilItAppliesAgain(t *testing.T) {
+	t.Parallel()
+	session, rewrite := paramsSession(t)
+	valid := paramsBody(`if (observed?.exits[0]?.via === "203.0.113.9") throw new Error("unknown gateway");`)
+	rewrite(valid + ",")
+	generation := session.Generation()
+	if err := session.Reload(); err == nil {
+		t.Fatal("an unreadable configuration reloads")
+	}
+	if got := session.NotApplied(); !regexp.MustCompile(`^config\.dsvs\.ts:\d+:\d+: SyntaxError[^\n]+$`).MatchString(got) {
+		t.Errorf("not applied = %q, want the syntax error and its location, on one line", got)
+	}
+	if got := apiTarget(t, session); got != "https://local-0.example" {
+		t.Errorf("target of /api = %q, want the one of the configuration in force", got)
+	}
+
+	events, stop := session.Watch()
+	defer stop()
+	lastLine := func() string {
+		lines := strings.Split(strings.TrimSpace(joinLines(session.Log.Lines())), "\n")
+		return lines[len(lines)-1]
+	}
+	rewrite(valid)
+	if err := session.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.NotApplied(); got != "" || session.Generation() != generation {
+		t.Errorf("back to the content in force: not applied = %q, generation +%d", got, session.Generation()-generation)
+	}
+	if got := lastLine(); got != "-- configuration applied again" {
+		t.Errorf("the log ends on %q", got)
+	}
+	select {
+	case <-events:
+	case <-time.After(time.Second):
+		t.Error("no event: the state would not be pushed")
+	}
+
+	home := exitsVia("198.51.100.1")
+	if err := session.Observe(home); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Observe(exitsVia("203.0.113.9")); err == nil {
+		t.Fatal("the configuration that throws on this gateway should say so")
+	}
+	if got := session.NotApplied(); !regexp.MustCompile(`^config\.dsvs\.ts:\d+:\d+: Error: unknown gateway$`).MatchString(got) {
+		t.Errorf("not applied = %q, want the thrown error and its location", got)
+	}
+	if err := session.Observe(home); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.NotApplied(); got != "" {
+		t.Errorf("back on the network of the configuration in force, not applied = %q", got)
+	}
+}
+
+// The form scenarios, in design order, on the proxy's target, the generation and the exact log
+// lines: what a gesture keeps and where, choices that reshape with the network, a refusal that
+// changes nothing, a new session that starts again from what was kept, and a form the context makes
+// invalid, which keeps the configuration in force until the gesture that fixes it.
+func TestTheFormFollowsTheNetworkAndItsRules(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), config.FileName)
+	if err := os.WriteFile(path, []byte(formBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tunnel := config.Link{Name: "tun0", Type: "tuntap", Addrs: []string{"10.8.0.2/24"}}
+	a, b, c := exitsVia("198.51.100.1"), exitsVia("198.51.100.2"), exitsVia("203.0.113.9")
+	a.Links, c.Links = append(a.Links, tunnel), append(c.Links, tunnel)
+	offline := &config.Observed{Links: a.Links}
+	opened := func(seen *config.Observed) *Session {
+		t.Helper()
+		form, cfg, err := config.Load(path, nil, InputFor(path, seen, nil, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+		supervising(t, session)
+		return session
+	}
+	session := opened(a)
+
+	told := func(want ...string) {
+		t.Helper()
+		lines := strings.Split(strings.TrimSpace(joinLines(session.Log.Lines())), "\n")
+		got := lines[max(0, len(lines)-len(want)):]
+		if !slices.Equal(got, want) {
+			t.Errorf("the log ends on %q, want %q", got, want)
+		}
+	}
+	after := func(replays uint64, target string, gesture func() error) error {
+		t.Helper()
+		generation := session.Generation()
+		err := gesture()
+		if got := session.Generation(); got != generation+replays {
+			t.Errorf("generation +%d, want +%d", got-generation, replays)
+		}
+		if got := apiTarget(t, session); got != target {
+			t.Errorf("/api leads to %q, want %q", got, target)
+		}
+		return err
+	}
+	set := func(values map[string]string) func() error { return func() error { return session.Set(values) } }
+	move := func(seen *config.Observed) func() error { return func() error { return session.Observe(seen) } }
+	from := func(name, value, origin string) {
+		t.Helper()
+		field, _ := session.Form().Field(name)
+		if field.Value != value || field.From != origin {
+			t.Errorf("%s = %q from %q, want %q from %q", name, field.Value, field.From, value, origin)
+		}
+	}
+
+	// 2. The pair goes through together, and each value is kept where the form says.
+	if err := after(1, "https://staging-vpn-en.example", set(map[string]string{"env": "staging", "api.staging": "vpn"})); err != nil {
+		t.Fatal(err)
+	}
+	told("-- env=staging kept", "-- api.staging=vpn kept for eth0 via 198.51.100.1")
+
+	// 3. On B, unknown, vpn is not among the choices: the default answers, and the intent comes
+	//    back on A.
+	if err := after(1, "https://staging-office-en.example", move(b)); err != nil {
+		t.Fatal(err)
+	}
+	told("-- network: eth0 via 198.51.100.1, tun0 → eth0 via 198.51.100.2, configuration replayed, now api.staging=office")
+	from("api.staging", "office", "default")
+	if err := after(1, "https://staging-vpn-en.example", move(a)); err != nil {
+		t.Fatal(err)
+	}
+	told("-- network: eth0 via 198.51.100.2 → eth0 via 198.51.100.1, tun0, configuration replayed, now api.staging=vpn")
+	from("api.staging", "vpn", "network")
+
+	// An unknown network where the intent holds changes nothing; offline, nothing is kept for a
+	// network.
+	if err := after(0, "https://staging-vpn-en.example", move(c)); err != nil {
+		t.Fatal(err)
+	}
+	told("-- network: eth0 via 198.51.100.1, tun0 → eth0 via 203.0.113.9, tun0, configuration unchanged")
+	if err := after(0, "https://staging-vpn-en.example", move(offline)); err != nil {
+		t.Fatal(err)
+	}
+	if err := after(1, "https://staging-public-en.example", set(map[string]string{"api.staging": "public"})); err != nil {
+		t.Fatal(err)
+	}
+	told("-- api.staging=public not kept: offline")
+	if err := after(1, "https://staging-vpn-en.example", move(a)); err != nil {
+		t.Fatal(err)
+	}
+	told("-- network: offline (eth0, tun0) → eth0 via 198.51.100.1, tun0, configuration replayed, now api.staging=vpn")
+
+	// 6. On B, it is vpn, in force on A, that stays, and not public chosen offline before it:
+	//    outside B's choices, it yields to the default there. With public, fr is refused, and
+	//    nothing changes.
+	if err := after(1, "https://staging-office-en.example", move(b)); err != nil {
+		t.Fatal(err)
+	}
+	if err := after(1, "https://staging-public-en.example", set(map[string]string{"api.staging": "public"})); err != nil {
+		t.Fatal(err)
+	}
+	told("-- api.staging=public kept for eth0 via 198.51.100.2")
+	shown := session.Form()
+	err := after(0, "https://staging-public-en.example", set(map[string]string{"locale": "fr"}))
+	if err == nil || err.Error() != "locale: public has no fr build" {
+		t.Errorf("set locale=fr = %v, want the form's refusal", err)
+	}
+	if !reflect.DeepEqual(session.Form(), shown) {
+		t.Error("a refused gesture changed the form")
+	}
+
+	// 7. A new session on B starts again from what the project and this network keep.
+	session = opened(b)
+	from("env", "staging", "kept")
+	from("api.staging", "public", "network")
+	from("delay", "0", "default")
+	if got := apiTarget(t, session); got != "https://staging-public-en.example" {
+		t.Errorf("the new session leads /api to %q", got)
+	}
+
+	// 8. On A, vpn and fr go together; on B, fr no longer holds with public: it yields to en, the
+	//    configuration applies, and the log says so. Back on A, fr returns: nothing erased it.
+	if err := after(1, "https://staging-vpn-en.example", move(a)); err != nil {
+		t.Fatal(err)
+	}
+	if err := after(1, "https://staging-vpn-fr.example", set(map[string]string{"locale": "fr"})); err != nil {
+		t.Fatal(err)
+	}
+	told("-- locale=fr kept")
+	if err := after(1, "https://staging-public-en.example", move(b)); err != nil {
+		t.Fatal(err)
+	}
+	told("-- locale=fr no longer holds (public has no fr build): locale=en until it does",
+		"-- configuration reloaded: 1 app, 1 facade, 0 groups",
+		"-- network: eth0 via 198.51.100.1, tun0 → eth0 via 198.51.100.2, configuration replayed, now api.staging=public locale=en")
+	from("locale", "en", "default")
+	if got := session.NotApplied(); got != "" {
+		t.Errorf("not applied = %q, want an applied configuration", got)
+	}
+	if err := after(1, "https://staging-vpn-fr.example", move(a)); err != nil {
+		t.Fatal(err)
+	}
+	from("locale", "fr", "session")
+	if got := joinLines(session.Log.Lines()); strings.Contains(got, "!! ") {
+		t.Errorf("the log carries an error:\n%s", got)
+	}
+}
+
+// On a network that kept nothing for api, the value in force stays: neither the last choice made
+// elsewhere, nor what the project keeps, nor the default. A new session has nothing in force: the
+// project, then the default. An option disabled on this network yields to the default there, like
+// any intent.
+func TestAnUnseenNetworkKeepsTheValueInForce(t *testing.T) {
+	office, home, vpn, hotel := exitsVia("198.51.100.1"), exitsVia("203.0.113.9"), exitsVia("198.51.100.2"), exitsVia("203.0.113.50")
+	for _, c := range []struct{ rules, opened string }{{"network(p.api);", "local"}, {"keep(p.api); network(p.api);", "demo"}} {
+		t.Run(c.rules, func(t *testing.T) {
+			t.Setenv("XDG_STATE_HOME", t.TempDir())
+			path := filepath.Join(t.TempDir(), config.FileName)
+			if err := os.WriteFile(path, []byte(strings.Replace(unseenBody, "RULES", c.rules, 1)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var session *Session
+			open := func(seen *config.Observed) {
+				t.Helper()
+				form, cfg, err := config.Load(path, nil, InputFor(path, seen, nil, nil))
+				if err != nil {
+					t.Fatal(err)
+				}
+				session = NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+				supervising(t, session)
+			}
+			do := func(err error) {
+				t.Helper()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			api := func(value, origin string) {
+				t.Helper()
+				field, _ := session.Form().Field("api")
+				if field.Value != value || field.From != origin {
+					t.Errorf("api = %q from %q, want %q from %q", field.Value, field.From, value, origin)
+				}
+			}
+
+			open(office)
+			do(session.Set(map[string]string{"api": "staging"}))
+			do(session.Observe(home))
+			do(session.Set(map[string]string{"api": "demo"}))
+			do(session.Observe(office))
+			api("staging", "network")
+			do(session.Observe(vpn))
+			api("staging", "session")
+			if got := apiTarget(t, session); got != "https://staging.example" {
+				t.Errorf("/api leads to %q, want staging", got)
+			}
+			do(session.Observe(hotel))
+			api("local", "default")
+
+			// Reopened at the office, the session has staging in force there, and the VPN keeps it.
+			open(office)
+			api("staging", "network")
+			do(session.Observe(vpn))
+			api("staging", "session")
+
+			open(vpn)
+			api(c.opened, map[string]string{"local": "default", "demo": "kept"}[c.opened])
+		})
+	}
+}
+
+// unseenBody is the shop whose api is chosen per network; staging cannot be reached from the hotel.
+const unseenBody = `import { choices, config, form, keep, network } from "dsvs";
+const params = form({ api: ["local", "staging", "demo"] }, (p, observed) => {
+  RULES
+  const hotel = observed?.exits.some((exit) => exit.via === "203.0.113.50") ?? false;
+  choices(p.api, ["local", { value: "staging", disabled: hotel && "staging is not reachable from here" }, "demo"]);
+});
+export default config(params, ({ api }) => ({
+  port: 4300,
+  ingress: [{ host: "localhost", routes: [{ path: "/api", proxy: { target: "https://" + api + ".example" } }] }],
+  apps: [{ name: "app", command: ["sh", "-c", "sleep 300 & wait", "{port}"] }],
+}));`
+
+// formBody is the scenarios' form: env and locale kept for the project, an api group that follows
+// the network and does not exist locally, whose choices depend on a tunnel, a delay that only
+// exists locally, and a refused pair.
+const formBody = `import { choices, config, defaultValue, disabled, form, hidden, keep, max, min, network, validateTree } from "dsvs";
+const params = form({ env: ["local", "staging"], api: { staging: ["office", "vpn", "public"], mirror: false }, delay: 0, locale: ["en", "fr"] }, (p, observed) => {
+  keep(p.env);
+  keep(p.locale);
+  hidden(p.api, { when: ({ valueOf }) => valueOf(p.env) === "local" });
+  network(p.api);
+  const tunnel = observed?.links.some((link) => link.name === "tun0") ?? false;
+  choices(p.api.staging, tunnel ? ["office", "vpn", "public"] : ["office", "public"]);
+  defaultValue(p.api.staging, tunnel ? "vpn" : "office");
+  disabled(p.api.mirror, { when: !tunnel && "the mirror is only reachable through the vpn" });
+  hidden(p.delay, { when: ({ valueOf }) => valueOf(p.env) !== "local" });
+  min(p.delay, 0);
+  max(p.delay, 5000);
+  validateTree(p, ({ valueOf }) => valueOf(p.locale) === "fr" && valueOf(p.api.staging) === "public" ? { field: p.locale, message: "public has no fr build" } : null);
+});
+export default config(params, ({ env, api, delay, locale }) => ({
+  port: 4300,
+  ingress: [{ host: "localhost", routes: [
+    { path: "/", app: "app" },
+    { path: "/api", proxy: { target: "https://" + (env === "local" ? "local" : "staging-" + api.staging) + "-" + locale + ".example" } },
+  ] }],
+  apps: [{ name: "app", command: ["sh", "-c", "sleep 300 & wait", String(delay), "{port}"] }],
+}));`
