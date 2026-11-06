@@ -176,7 +176,7 @@ Le spécificateur est une URL `git+ssh` sur ce dépôt : il faut donc une clé S
 
 ### Les paramètres : un formulaire
 
-Une configuration peut déclarer des **paramètres** : un formulaire, que la construction consomme. `form(modèle, schéma)` déclare les champs par leur défaut — un booléen fait un flag, un nombre un nombre, un texte un texte, une liste un choix dont le défaut est en tête, un objet un groupe — et le schéma pose leurs règles ; `config(formulaire, construction)` construit la configuration à partir des valeurs résolues, une fois le formulaire valide. Les règles sont celles des Signal Forms d'Angular — `hidden`, `disabled`, `readonly`, `required`, `min`, `max`, `minLength`, `maxLength`, `pattern`, `validate`, `validateTree`, `apply`, `applyWhen` — plus deux : `choices` et `defaultValue` donnent les choix et le défaut du moment.
+Une configuration peut déclarer des **paramètres** : un formulaire, que la construction consomme. `form(modèle, schéma)` déclare les champs par leur défaut — un booléen fait un flag, un nombre un nombre, un texte un texte, une liste un choix dont le défaut est en tête, un objet un groupe — et le schéma pose leurs règles ; `config(formulaire, construction)` construit la configuration à partir des valeurs résolues, une fois le formulaire valide. Les règles sont celles des Signal Forms d'Angular — `hidden`, `disabled`, `readonly`, `required`, `min`, `max`, `minLength`, `maxLength`, `pattern`, `validate`, `validateTree`, `apply`, `applyWhen` — plus trois : `choices` et `defaultValue` donnent les choix et le défaut du moment, et `keep` retient une valeur choisie pour le projet.
 
 Pour une boutique dont l'API vient du serveur local (l'app api) ou d'un serveur déployé :
 
@@ -198,6 +198,8 @@ export default config(params, ({ api, products }) => ({
 }));
 ```
 
+**D'où vient une valeur.** Une valeur est la première intention qui existe : celle de la session, et celle retenue pour le projet s'il la garde. Elle vaut si elle est parmi les choix du moment ; sinon le défaut répond, et l'intention revient dès qu'elle redevient possible. Une valeur retenue, c'est tout ce qui n'est pas le geste en cours ; celle que les règles de son champ ne prennent plus, comme un `max` abaissé sous elle, **cède** : au bord qu'elle dépasse pour `min` et `max`, au défaut sinon. La configuration s'applique, l'intention reste en mémoire, et dsvs le dit tant que ça dure, au journal : `products=20 no longer holds (at most 15): products=15 until it does`. Une valeur retenue fait lister le projet, comme `dsvs remember`, et `dsvs forget` l'oublie avec lui.
+
 Sans formulaire, l'export par défaut reste un objet, ou une fonction qui ignore ses arguments. `export const params` est l'ancienne forme, et elle est refusée.
 
 ### N'importe quel programme est une configuration
@@ -208,7 +210,7 @@ Node n'est qu'une implémentation d'un contrat que tout exécutable peut remplir
 {"asked":{"deployed.version":"v3"},"session":{"slowApi":"true"},"kept":{"locale":"en"},"observed":{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}]}}
 ```
 
-`DSVS_CONFIG` porte son chemin, et son dossier courant est celui du fichier. Il écrit sur stdout `{"form":{"fields":[…],"errors":[…]},"config":{…}}` : chaque champ résolu, dans l'ordre — `name`, `type` (`choice`, `flag`, `text` ou `number`), `choices`, `value`, `from` (`asked`, `network`, `session`, `kept` ou `default`), ses états `hidden`, `disabled` et ses `reasons`, `readonly`, `keep`, `network`, `errors` —, et la configuration que ces valeurs construisent, `null` quand le formulaire a une erreur. Ce qu'il écrit sur stderr va au journal de la session. Un code de sortie non nul, un JSON illisible ou dix secondes sans réponse sont une erreur qui ne change rien. Un `dsvs.json` est une configuration nue, sans formulaire.
+`DSVS_CONFIG` porte son chemin, et son dossier courant est celui du fichier. Il écrit sur stdout `{"form":{"fields":[…],"errors":[…]},"config":{…}}` : chaque champ résolu, dans l'ordre — `name`, `type` (`choice`, `flag`, `text` ou `number`), `choices`, `value`, `from` (`asked`, `network`, `session`, `kept` ou `default`), ses états `hidden`, `disabled` et ses `reasons`, `readonly`, `keep`, `network`, `errors`, et `yielded`, la valeur retenue qui ne tient plus, avec sa couche et ses erreurs —, et la configuration que ces valeurs construisent, `null` quand le formulaire a une erreur. Ce qu'il écrit sur stderr va au journal de la session. Un code de sortie non nul, un JSON illisible ou dix secondes sans réponse sont une erreur qui ne change rien. Un `dsvs.json` est une configuration nue, sans formulaire.
 
 ### Sauvegarder suffit
 

@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -12,6 +14,7 @@ import (
 
 	"dsvs/internal/build"
 	"dsvs/internal/config"
+	"dsvs/internal/projects"
 )
 
 // The role is the decision point of the command: set up wrong, it had made a role of the table
@@ -179,5 +182,127 @@ func TestTypesNameTheRepositoryAndTheTagOfTheBinary(t *testing.T) {
 	}
 	if !strings.Contains(said.String(), "ahead of its last tag") {
 		t.Errorf("stderr %q does not say the binary is ahead", said.String())
+	}
+}
+
+// A project is only remembered if its session started: a refused start — a port another one holds, an
+// invalid form — remembered it anyway, and the panel would have offered it cold.
+func TestARefusedSessionDoesNotRememberItsProject(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.dsvs.ts")
+	if err := os.WriteFile(path, []byte(`throw new Error("refused");`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := run(&shape{config: path}, false, filepath.Join(t.TempDir(), "absent"), "asked for by hand", nil, nil); err == nil {
+		t.Fatal("the session started on a configuration that throws")
+	}
+	if got := projects.List(); len(got) != 0 {
+		t.Errorf("remembered projects = %v, want none", got)
+	}
+}
+
+// What the panel lists cold, status writes: as text and as JSON, and without a project it says so
+// rather than staying silent.
+func TestStatusWritesTheRememberedProjects(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+
+	var none bytes.Buffer
+	if err := status(&none, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(none.String(), "  remembered: none\n") {
+		t.Errorf("without a project, status writes %q", none.String())
+	}
+	none.Reset()
+	if err := status(&none, true); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(none.String(), "remembered") {
+		t.Errorf("sans projet, le JSON porte %q", none.String())
+	}
+
+	config := filepath.Join(t.TempDir(), "dsvs.json")
+	if err := os.WriteFile(config, []byte(`{"apps":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := projects.Remember(config); err != nil {
+		t.Fatal(err)
+	}
+
+	var text bytes.Buffer
+	if err := status(&text, false); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(text.String(), "  remembered  "+config+"\n") {
+		t.Errorf("status writes %q, want the remembered project", text.String())
+	}
+
+	var asJSON bytes.Buffer
+	if err := status(&asJSON, true); err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct{ Remembered []string }
+	if err := json.Unmarshal(asJSON.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(decoded.Remembered, []string{config}) {
+		t.Errorf("remembered = %v, want [%s]", decoded.Remembered, config)
+	}
+}
+
+// Remembering then forgetting the project here goes through the projects file, and each gesture says
+// what it did — including when there was nothing to do, without that being an error.
+func TestRememberThenForgetTheProjectHere(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	dir := t.TempDir()
+	config := filepath.Join(dir, "dsvs.json")
+	if err := os.WriteFile(config, []byte(`{"apps":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	below := filepath.Join(dir, "sub")
+	if err := os.Mkdir(below, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(below)
+	// Under /tmp, the resolved path may go through a link: expect the one resolve returns.
+	abs, err := resolve("")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	said := func(run func(io.Writer, *shape, []string) error, s *shape) (string, error) {
+		var out bytes.Buffer
+		err := run(&out, s, nil)
+		return out.String(), err
+	}
+
+	if got, err := said(remembering, &shape{}); err != nil || got != "remembered "+abs+"\n" {
+		t.Errorf("remember = %q, %v", got, err)
+	}
+	if got := projects.List(); !slices.Equal(got, []string{abs}) {
+		t.Errorf("projects = %v, want [%s]", got, abs)
+	}
+	if got, err := said(remembering, &shape{}); err != nil || got != abs+" is already remembered\n" {
+		t.Errorf("second remember = %q, %v", got, err)
+	}
+
+	if got, err := said(forgetting, &shape{}); err != nil || got != "forgot "+abs+"\n" {
+		t.Errorf("forget = %q, %v", got, err)
+	}
+	if got := projects.List(); len(got) != 0 {
+		t.Errorf("projects = %v, want none", got)
+	}
+	if got, err := said(forgetting, &shape{}); err != nil || !strings.Contains(got, abs+" was not remembered") {
+		t.Errorf("second forget = %q, %v", got, err)
+	}
+
+	if _, err := said(remembering, &shape{config: dir}); err == nil || !strings.Contains(err.Error(), "is a directory") {
+		t.Errorf("remember of a directory = %v", err)
+	}
+	if got, err := said(forgetting, &shape{config: "/does/not/exist/dsvs.json"}); err != nil {
+		t.Errorf("forget of a vanished project = %q, %v", got, err)
 	}
 }

@@ -96,6 +96,8 @@ Commands:
   service [stop|restart]       start the background service and its icon, or stop it
   update                       take a newer version of this binary, and restart the service
   panel                        open the panel of the running sessions
+  remember                     remember the project here, so that the panel lists it cold
+  forget                       forget the project here, which the panel stops listing
   config                       write the resolved configuration as JSON
   types                        write the package specifier of the TypeScript types matching this binary
   skill                        write a skill that teaches this tool to a coding agent
@@ -232,7 +234,7 @@ The specifier is a `git+ssh` URL on this repository, so it needs an SSH key that
 
 ### Parameters: a form
 
-A configuration can declare **parameters**: a form that the build consumes. `form(model, schema)` declares the fields by their default — a boolean makes a flag, a number a number, a string a text, a list a choice with the default first, an object a group — and the schema sets their rules; `config(form, build)` builds the configuration from the resolved values, once the form is valid. The rules are those of Angular's Signal Forms — `hidden`, `disabled`, `readonly`, `required`, `min`, `max`, `minLength`, `maxLength`, `pattern`, `validate`, `validateTree`, `apply`, `applyWhen` — plus two: `choices` and `defaultValue` give the choices and default of the moment.
+A configuration can declare **parameters**: a form that the build consumes. `form(model, schema)` declares the fields by their default — a boolean makes a flag, a number a number, a string a text, a list a choice with the default first, an object a group — and the schema sets their rules; `config(form, build)` builds the configuration from the resolved values, once the form is valid. The rules are those of Angular's Signal Forms — `hidden`, `disabled`, `readonly`, `required`, `min`, `max`, `minLength`, `maxLength`, `pattern`, `validate`, `validateTree`, `apply`, `applyWhen` — plus three: `choices` and `defaultValue` give the choices and default of the moment, and `keep` keeps a chosen value for the project.
 
 For a shop whose API comes from the local server (the api app) or from a deployed one:
 
@@ -254,6 +256,8 @@ export default config(params, ({ api, products }) => ({
 }));
 ```
 
+**Where a value comes from.** A value is the first intention that exists: the session's, and the one kept for the project if the field keeps it. It holds if it is among the choices of the moment; otherwise the default answers, and the intention comes back once it is possible again. A kept value is anything but the gesture in progress; one that the rules of its field no longer take, such as a `max` lowered under it, **yields**: to the bound it crosses for `min` and `max`, to the default otherwise. The configuration applies, the intention stays in memory, and dsvs says so while it lasts, in the log: `products=20 no longer holds (at most 15): products=15 until it does`. A kept value makes the project listed, as `dsvs remember` does, and `dsvs forget` forgets it with the project.
+
 Without a form, the default export stays an object, or a function that ignores its arguments. `export const params` is the former shape, and is refused.
 
 ### Any program is a configuration
@@ -264,7 +268,7 @@ Node is one implementation of a contract that any executable can fulfil, passed 
 {"asked":{"deployed.version":"v3"},"session":{"slowApi":"true"},"kept":{"locale":"en"},"observed":{"links":[{"name":"tun0","type":"tuntap","addrs":["10.8.0.2/24"]}]}}
 ```
 
-`DSVS_CONFIG` holds its path, and its working directory is the file's folder. It writes on stdout `{"form":{"fields":[…],"errors":[…]},"config":{…}}`: each resolved field in order — `name`, `type` (`choice`, `flag`, `text` or `number`), `choices`, `value`, `from` (`asked`, `network`, `session`, `kept` or `default`), its states `hidden`, `disabled` and its `reasons`, `readonly`, `keep`, `network`, `errors` —, and the configuration those values build, `null` when the form has an error. What it writes on stderr goes to the session log. A non-zero exit, unreadable JSON or ten seconds without an answer are an error that changes nothing. A `dsvs.json` is a bare configuration, without a form.
+`DSVS_CONFIG` holds its path, and its working directory is the file's folder. It writes on stdout `{"form":{"fields":[…],"errors":[…]},"config":{…}}`: each resolved field in order — `name`, `type` (`choice`, `flag`, `text` or `number`), `choices`, `value`, `from` (`asked`, `network`, `session`, `kept` or `default`), its states `hidden`, `disabled` and its `reasons`, `readonly`, `keep`, `network`, `errors`, and `yielded`, the kept value that no longer holds with its layer and errors —, and the configuration those values build, `null` when the form has an error. What it writes on stderr goes to the session log. A non-zero exit, unreadable JSON or ten seconds without an answer are an error that changes nothing. A `dsvs.json` is a bare configuration, without a form.
 
 ### Saving is enough
 

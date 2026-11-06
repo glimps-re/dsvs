@@ -103,9 +103,10 @@ survive the command. The apps these names pull in are started with it.`,
 		args:    "[--json]",
 		summary: "write what runs on this machine, and who holds the ports",
 		long: `status writes what runs: this binary and its version, its background service, the sessions it
-holds a port for, and the other dsvs binaries with theirs. It is the answer to "what holds my
-port", and it needs neither a configuration nor a service.`,
-		declare: reading(func(asJSON bool) error { return status(asJSON) }),
+holds a port for, the projects it remembers — those the panel lists, running or cold — and the
+other dsvs binaries with theirs. It is the answer to "what holds my port", and it needs neither a
+configuration nor a service.`,
+		declare: reading(func(asJSON bool) error { return status(os.Stdout, asJSON) }),
 	}, {
 		name:    "service",
 		args:    "[stop|restart]",
@@ -129,6 +130,25 @@ releases, dsvs-beta the pre-releases too. DSVS_RELEASES points at a mirror of th
 		long: `panel opens the panel of the projects and their sessions, without going through the status bar
 icon, and returns when it closes.`,
 		declare: direct(func([]string) error { return openPanel() }),
+	}, {
+		name:    "remember",
+		summary: "remember the project here, so that the panel lists it cold",
+		long: `remember makes this binary remember the project of the configuration found here, or of the one
+named by --config, without opening a session: the panel lists it cold, and dsvs status writes it.
+Opening a session does the same on its own, and so does a value kept for the project or a network,
+since what is kept is seen and forgotten through the list. The configuration must be a file that
+exists; it is not evaluated.`,
+		declare: direct(func(names []string) error { return remembering(os.Stdout, s, names) }),
+	}, {
+		name:    "forget",
+		summary: "forget the project here, which the panel stops listing",
+		long: `forget makes this binary forget the project of the configuration found here, or the one named by
+--config: the panel stops listing it cold, and dsvs status no longer writes it. A session running
+for it keeps running — forget drops an address, it stops nothing — and the project is remembered
+again the next time a session opens for it, an update included. The file need not exist any more:
+dsvs forget --config <path> takes a path as dsvs status writes it. Forgetting a project that was
+not remembered succeeds, since the result asked for holds.`,
+		declare: direct(func(names []string) error { return forgetting(os.Stdout, s, names) }),
 	}, {
 		name:    "config",
 		summary: "write the resolved configuration as JSON",
