@@ -3,6 +3,7 @@ module dsvs
 go 1.26.5
 
 require (
+	github.com/charmbracelet/x/term v0.2.2
 	github.com/creack/pty v1.1.24
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/vishvananda/netlink v1.3.1

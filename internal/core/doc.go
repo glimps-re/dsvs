@@ -33,6 +33,14 @@
 //
 // # Known limits
 //
+// Without a systemd box, a kill -9 of the tool leaves the intermediate runner orphaned: Pdeathsig
+// only covers the processes one launches oneself, not those a runner detaches behind it. The log
+// warns when the box is missing, and a normal stop takes everything down, box or not.
+//
+// Killing the systemd-run forwarder does not kill the session: detached — the usual case, the
+// interface lending it its terminal — it only falls at its next written line; under the log stream,
+// it falls with its pty.
+//
 // A facade that only has proxying and redirects has nothing to start: a start order on it does
 // nothing, and it appears in no aggregate. It is not an unknown name for all that.
 package core

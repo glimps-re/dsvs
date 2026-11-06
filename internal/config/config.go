@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // Suffix marks every configuration file of this tool — the entry one as well as those it imports,
@@ -339,6 +340,9 @@ func evaluate(abs string) ([]byte, []string, error) {
 	node := exec.Command("node", "--input-type=module", "-e", shim)
 	node.Env = append(os.Environ(), "DSVS_CONFIG="+abs)
 	node.Dir = filepath.Dir(abs)
+	// A script that hangs must not outlive the tool: even outside the systemd box, the kernel takes it
+	// down with us.
+	node.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	// What the script says is captured, not relayed: during a hot reload, the binary's stderr is the
 	// TUI's screen. A failure carries it along — that is where the real cause is.
 	var console bytes.Buffer
