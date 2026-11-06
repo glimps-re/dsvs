@@ -95,8 +95,8 @@ Commands:
   run [name...] [name=value...]  hold the session in this terminal, streaming the logs
   status [--json]                write what runs on this machine, and who holds the ports
   service [stop|restart]         start the background service and its icon, or stop it
-  update                         take a newer version of this binary, and restart the service
-  panel                          open the panel of the running sessions
+  update                         take a newer version, the beta for dsvs-beta, and restart the service
+  panel [--png <file>]           open the panel of the running sessions
   remember                       remember the project here, so that the panel lists it cold
   forget                         forget the project here, which the panel stops listing
   config [name=value...]         write the resolved configuration as JSON
@@ -117,8 +117,8 @@ dsvs with no command starts what the configuration found here needs, writes the 
 and returns; --tui opens the interface on that session instead. A configuration runs only once, and
 two sessions never fight over a host: the second one is refused, and says so.
 
-A few flags are the binary talking to itself — --tray, --hub, --session, --install-unit, --version —
-and are not commands.
+A few flags are the binary talking to itself — --tray, --hub, --session, --install-unit,
+--remove-unit, --version — and are not commands.
 
 Options, before or after the command:
   --config <file>
@@ -140,7 +140,7 @@ Options, before or after the command:
 
 ### The icon and the panel
 
-The icon opens the panel; its tooltip gives the binary and its version. The projects you have opened stay listed from one login to the next, cold, each with three gestures: start or stop its apps, open its TUI or raise it, or forget it. Each app can be started, stopped and restarted, and each facade opens in the browser. At the bottom, two distinct gestures: stop the apps of every project, or quit dsvs, icon included; then the update, and the beta row described above.
+The icon opens the panel; its tooltip gives the binary and its version. The projects you have opened stay listed from one login to the next, cold, each with three gestures: start or stop its apps, open its TUI or raise it, or forget it. Each app has a start/stop and a restart pictogram, and each facade opens in the browser. At the bottom, two distinct gestures: stop the apps of every project, or quit dsvs, icon included; and the update, and the beta row described above. `dsvs panel --png <file>` draws the panel into a PNG, without a display.
 
 ## Configuration
 

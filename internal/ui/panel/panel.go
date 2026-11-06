@@ -3,8 +3,10 @@ package panel
 import (
 	"fmt"
 	"image"
+	"image/png"
 	"io"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -20,6 +22,8 @@ import (
 	"github.com/jezek/xgb/xproto"
 	"golang.org/x/image/font"
 	"golang.org/x/image/font/gofont/gobold"
+	"golang.org/x/image/font/gofont/gomedium"
+	"golang.org/x/image/font/gofont/gomono"
 	"golang.org/x/image/font/gofont/goregular"
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/font/sfnt"
@@ -36,6 +40,10 @@ import (
 // give to a window outside its management: the cross is the safe way out, and it depends on nothing.
 const escape = 9
 
+// patience is how long an app waits for the state its order should cause: an order with no effect
+// causes none, and the wait must end anyway.
+const patience = 3 * time.Second
+
 // glance is the pace at which we check whether someone just clicked elsewhere. Short enough to catch
 // a quick click, long enough to cost nothing.
 const glance = 50 * time.Millisecond
@@ -51,7 +59,7 @@ const glance = 50 * time.Millisecond
 // the click beside it, which a VM's X server never sees; a focus request earns us either the
 // keystrokes of someone who thinks they are typing elsewhere, or an immediate FocusOut that closes the
 // panel at random (both measured). An anchor with negative coordinates: at the pointer, where an
-// icon's click would open it.
+// coordinates: at the pointer, where an icon's click would open it.
 func Open(anchor image.Rectangle, until <-chan struct{}, gone func()) error {
 	// xgb tells stderr what it did not find — a missing .Xauthority, for instance, while it connects
 	// fine without one. A panel does not litter the terminal that opens it.
@@ -78,13 +86,16 @@ func Open(anchor image.Rectangle, until <-chan struct{}, gone func()) error {
 		limit: int(xproto.Setup(conn).MaximumRequestLength) * 4,
 		msb:   xproto.Setup(conn).ImageByteOrder == xproto.ImageOrderMSBFirst,
 		state: map[string]attach.State{}, links: map[string]*attach.Link{}, failed: map[string]string{},
-		waking: map[string]bool{}, reports: make(chan report, 8), told: make(chan renewal, 8),
+		waking: map[string]bool{}, pending: map[string]map[string]time.Time{}, reports: make(chan report, 8), told: make(chan renewal, 8),
 		awake: make(chan woken, 8), done: make(chan struct{}), working: &working}
 	p.ordered = p.through
 	defer p.release()
 
 	if err := p.reach(); err != nil {
 		return err
+	}
+	for config, link := range p.links {
+		go p.follow(config, link.States())
 	}
 	if err := p.show(anchor); err != nil {
 		return err
@@ -94,6 +105,28 @@ func Open(anchor image.Rectangle, until <-chan struct{}, gone func()) error {
 	p.news = looking
 	go p.look()
 	return p.live(until)
+}
+
+// Render writes the panel as a PNG, as the icon would open it now, without a window or an X server:
+// the same drawing, pushed into a file rather than onto the screen. Nothing is hovered, and
+// everything is unfolded.
+func Render(w io.Writer) error {
+	with, err := load()
+	if err != nil {
+		return err
+	}
+	p := &panel{state: map[string]attach.State{}, links: map[string]*attach.Link{}, done: make(chan struct{})}
+	defer p.release()
+	if err := p.reach(); err != nil {
+		return err
+	}
+	for config, link := range p.links {
+		if state, live := <-link.States(); live {
+			p.state[config] = state
+		}
+	}
+	canvas, _, _ := paint(p.snapshot(), renewal{stage: idle}, with, time.Now(), view{at: image.Pt(-1, -1), room: math.MaxInt})
+	return png.Encode(w, canvas)
 }
 
 // report is a state that arrives from a session, or its departure.
@@ -130,9 +163,16 @@ type panel struct {
 	failed map[string]string
 	// waking are the projects whose session is coming up: they no longer offer to start it, which is
 	// also what keeps a second click from starting a second session.
-	waking  map[string]bool
-	reports chan report
-	awake   chan woken
+	waking map[string]bool
+	// pending says, per project, until when each app whose order has left waits for its session's
+	// next state, which tells what the order gave: an order that changes nothing causes none, and the
+	// wait then stops at its deadline.
+	pending map[string]map[string]time.Time
+	// unfolded is the project chosen to unfold when the panel overflows the screen: it only lasts one
+	// opening.
+	unfolded string
+	reports  chan report
+	awake    chan woken
 
 	// ordered carries an order to a project's session. It is a field so that a test hears what the
 	// panel orders without real sessions to lend it.
@@ -158,6 +198,8 @@ type panel struct {
 	// it when its content changes size: the screen never said where the status bar was, the anchor
 	// does.
 	anchor image.Rectangle
+	// room is the height the screen leaves to the panel, which folds when it exceeds it.
+	room int
 	// armed says the button was seen released since opening: the click that brought up the panel must
 	// not close it right away.
 	armed bool
@@ -184,7 +226,6 @@ func (p *panel) reach() error {
 		}
 		p.links[session.Config] = link
 		p.order = append(p.order, session.Config)
-		go p.follow(session.Config, link.States())
 	}
 	slices.Sort(p.order)
 	for _, config := range projects.List() {
@@ -255,9 +296,11 @@ func (p *panel) show(anchor image.Rectangle) error {
 	}
 	p.anchor = anchor
 	p.at = image.Pt(-1, -1)
-	canvas, zones, rows := paint(p.snapshot(), p.news, p.with, time.Now(), p.at)
+	screens := p.screens()
+	p.room = available(p.anchor, screens)
+	canvas, zones, rows := paint(p.snapshot(), p.news, p.with, time.Now(), p.view())
 	p.zones, p.rows, p.size = zones, rows, canvas.Bounds().Size()
-	p.origin = beside(p.anchor, p.size, p.screens())
+	p.origin = beside(p.anchor, p.size, screens)
 	x, y := p.origin.X, p.origin.Y
 
 	win, err := xproto.NewWindowId(p.conn)
@@ -322,6 +365,9 @@ func (p *panel) live(until <-chan struct{}) error {
 			if p.clickedAway() {
 				return nil
 			}
+			if p.expire(time.Now()) {
+				p.render()
+			}
 
 		case <-until:
 			return nil // we are called back: a second click on the icon, for instance
@@ -341,6 +387,7 @@ func (p *panel) live(until <-chan struct{}) error {
 			p.render()
 
 		case up := <-p.reports:
+			delete(p.pending, up.config)
 			if up.gone {
 				delete(p.state, up.config)
 				delete(p.links, up.config)
@@ -371,6 +418,7 @@ func (p *panel) live(until <-chan struct{}) error {
 				p.follows(-1, -1)
 			case xproto.ButtonPressEvent:
 				p.grab(int(e.EventX), int(e.EventY))
+				p.render()
 			case xproto.ButtonReleaseEvent:
 				// A click beside a button does nothing: the cross is there to leave.
 				if !p.clicked(int(e.EventX), int(e.EventY)) {
@@ -381,6 +429,23 @@ func (p *panel) live(until <-chan struct{}) error {
 			}
 		}
 	}
+}
+
+// expire forgets the waits whose deadline has passed, and says whether one of them was still shown.
+func (p *panel) expire(now time.Time) bool {
+	expired := false
+	for config, apps := range p.pending {
+		for name, until := range apps {
+			if !until.After(now) {
+				delete(apps, name)
+				expired = true
+			}
+		}
+		if len(apps) == 0 {
+			delete(p.pending, config)
+		}
+	}
+	return expired
 }
 
 // clicked carries a released button to the panel, and says whether it stays open. The gesture only
@@ -486,6 +551,17 @@ func (p *panel) act(z zone) bool {
 			p.order = slices.DeleteFunc(p.order, func(other string) bool { return other == z.config })
 		}
 		return true
+	case start, stop, restart:
+		if p.command(z.config, z.do, z.name) {
+			if p.pending[z.config] == nil {
+				p.pending[z.config] = map[string]time.Time{}
+			}
+			p.pending[z.config][z.name] = time.Now().Add(patience)
+		}
+		return true
+	case unfold:
+		p.unfolded = z.config
+		return true
 	case stopEverything:
 		for config := range p.links {
 			p.command(config, closeAll, "")
@@ -523,9 +599,9 @@ func (p *panel) act(z zone) bool {
 	return true
 }
 
-// command carries an order to a project's session.
-func (p *panel) command(config string, do deed, name string) {
-	p.reported(config, p.ordered(config, do, name))
+// command carries an order to a project's session, and says whether it left.
+func (p *panel) command(config string, do deed, name string) bool {
+	return p.reported(config, p.ordered(config, do, name))
 }
 
 // reported keeps on a project's row what a gesture gave, clears it when it worked, and says whether
@@ -553,24 +629,28 @@ func (p *panel) through(config string, do deed, name string) error {
 // it takes: hence the background, and the step shown meanwhile.
 func (p *panel) look() {
 	newer, err := update.Newer()
-	news := renewal{stage: idle}
-	news.beta, news.betaOut = besideBeta()
+	var news renewal
 	switch {
 	case err != nil:
-		news.said = err.Error()
+		news = failure(err)
 	case newer == "":
-		news.said = "up to date"
+		news = renewal{stage: idle, said: "up to date"}
 	default:
-		news.stage, news.to = found, newer
+		news = renewal{stage: found, to: newer}
 	}
+	news.beta, news.betaOut = besideBeta()
 	p.tell(news)
 }
 
 // besideBeta is the gesture this binary offers on the beta: dsvs installs one once it is out, the
-// beta uninstalls itself, and any other binary has nothing to do with it. Why no beta is offered is
-// not worth a line: the update says it already when the releases are out of reach.
+// beta uninstalls itself, and any other binary has nothing to do with it — nor has a binary built
+// from a clone, which follows its clone and never the releases. Why no beta is offered is not worth a
+// line: the update says it already when the releases are out of reach.
 func besideBeta() (deed, string) {
-	if build.Name() == build.Beta {
+	switch {
+	case build.Origin != "":
+		return nothing, ""
+	case build.Name() == build.Beta:
 		return removeBeta, ""
 	}
 	if out, _ := update.BetaToInstall(); out != "" {
@@ -622,7 +702,8 @@ func (p *panel) step(said string) { p.tell(doing(said)) }
 func (p *panel) over(gesture, said string, err error) {
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s failed: %v\n", gesture, err)
-		said = err.Error()
+		p.tell(failure(err))
+		return
 	}
 	p.tell(renewal{stage: idle, said: said})
 }
@@ -716,7 +797,7 @@ func openTerminal(config string) error {
 // An app that appears, a failure line or an update make the panel grow: opened near an edge, it would
 // go past it, whereas it had been placed on opening.
 func (p *panel) render() {
-	canvas, zones, rows := paint(p.snapshot(), p.news, p.with, time.Now(), p.at)
+	canvas, zones, rows := paint(p.snapshot(), p.news, p.with, time.Now(), p.view())
 	p.zones, p.rows = zones, rows
 	if size := canvas.Bounds().Size(); size != p.size {
 		p.size = size
@@ -728,12 +809,21 @@ func (p *panel) render() {
 	p.push(canvas)
 }
 
+// view is what the hand is doing with the panel, so that the drawing shows it.
+func (p *panel) view() view {
+	seen := view{at: p.at, room: p.room, unfolded: p.unfolded}
+	if p.press != nil {
+		seen.pressed = *p.press
+	}
+	return seen
+}
+
 // snapshot returns the projects in the panel's order: the running sessions, then what was already
 // seen and is asleep.
 func (p *panel) snapshot() []project {
 	out := make([]project, 0, len(p.order))
 	for _, config := range p.order {
-		one := project{config: config, failed: p.failed[config], waking: p.waking[config]}
+		one := project{config: config, failed: p.failed[config], waking: p.waking[config], pending: p.pending[config]}
 		if state, live := p.state[config]; live {
 			one.live = &state
 		}
@@ -805,6 +895,13 @@ func beside(anchor image.Rectangle, size image.Point, screens []image.Rectangle)
 		clamp(at.Y, home.Min.Y, max(home.Min.Y, home.Max.Y-size.Y)))
 }
 
+// available is the height the panel can take: that of the screen receiving the anchor, minus the
+// icon, the gap and both edges.
+func available(anchor image.Rectangle, screens []image.Rectangle) int {
+	home := nearest(anchor.Min.Add(anchor.Max).Div(2), screens).Inset(edge)
+	return home.Dy() - anchor.Dy() - gap
+}
+
 // nearest returns the screen containing this point, or the one whose center is closest to it: a click
 // always lands somewhere, even in a dead strip.
 func nearest(at image.Point, screens []image.Rectangle) image.Rectangle {
@@ -862,23 +959,26 @@ func (p *panel) pointer() (int, int) {
 // load reads the panel's fonts. They are embedded in the binary: nothing to install, and the same
 // rendering everywhere.
 func load() (faces, error) {
-	text, err := face(goregular.TTF, 13)
-	if err != nil {
-		return faces{}, err
+	var with faces
+	for _, one := range []struct {
+		into   *font.Face
+		raw    []byte
+		points float64
+	}{
+		{&with.text, goregular.TTF, 12},
+		{&with.bold, gobold.TTF, 13},
+		{&with.small, gomedium.TTF, 11},
+		{&with.mono, gomono.TTF, 11},
+	} {
+		parsed, err := sfnt.Parse(one.raw)
+		if err != nil {
+			return faces{}, err
+		}
+		if *one.into, err = opentype.NewFace(parsed, &opentype.FaceOptions{Size: one.points, DPI: 96, Hinting: font.HintingFull}); err != nil {
+			return faces{}, err
+		}
 	}
-	bold, err := face(gobold.TTF, 13)
-	if err != nil {
-		return faces{}, err
-	}
-	return faces{text: text, bold: bold}, nil
-}
-
-func face(raw []byte, points float64) (font.Face, error) {
-	parsed, err := sfnt.Parse(raw)
-	if err != nil {
-		return nil, err
-	}
-	return opentype.NewFace(parsed, &opentype.FaceOptions{Size: points, DPI: 96, Hinting: 3})
+	return with, nil
 }
 
 func name(conn *xgb.Conn, win xproto.Window, text string) {

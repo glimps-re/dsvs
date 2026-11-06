@@ -81,7 +81,7 @@ La liste des commandes et des options est la sortie de `dsvs help`, reproduite d
 
 ### L'icône et le panneau
 
-L'icône ouvre le panneau ; son infobulle donne le binaire et sa version. Les projets ouverts y restent listés d'une ouverture de session à l'autre, à froid, chacun avec trois gestes : démarrer ou arrêter ses apps, ouvrir sa TUI ou la rappeler à l'écran, ou l'oublier. Chaque app peut être démarrée, arrêtée et relancée, et chaque façade s'ouvre dans le navigateur. En bas, deux gestes distincts : arrêter les apps de tous les projets, ou quitter dsvs, icône comprise ; puis la mise à jour, et la ligne de la beta décrite plus haut.
+L'icône ouvre le panneau ; son infobulle donne le binaire et sa version. Les projets ouverts y restent listés d'une ouverture de session à l'autre, à froid, chacun avec trois gestes : démarrer ou arrêter ses apps, ouvrir sa TUI ou la rappeler à l'écran, ou l'oublier. Chaque app a un pictogramme pour démarrer ou arrêter et un pour relancer, et chaque façade s'ouvre dans le navigateur. En bas, deux gestes distincts : arrêter les apps de tous les projets, ou quitter dsvs, icône comprise ; puis la mise à jour, et la ligne de la beta décrite plus haut. `dsvs panel --png <fichier>` dessine le panneau dans un PNG, sans affichage.
 
 ## Configuration
 

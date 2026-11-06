@@ -52,9 +52,11 @@
 // holds the status bar icon, and that is the role the systemd unit runs; --hub is the hub, which holds
 // the ports for every session and serves nothing itself; --session holds the session without a
 // terminal, for the clients that attach to it; --install-unit installs the unit; --version writes the
-// version. The installed unit, the hub, spawn, build.sh and update.VersionOf type them — including an
-// old binary during an update, which will never know the commands of the new one. The role is a single
-// decision point: a flag names it, two are refused, and none lets the command line decide.
+// version. --remove-unit takes the unit away, and is what the beta calls on itself when it is
+// uninstalled from its panel. The installed unit, the hub, spawn, build.sh and update.VersionOf type
+// them — including an old binary during an update, which will never know the commands of the new one.
+// The role is a single decision point: one flag names it, two are refused, and none lets the command
+// line decide.
 //
 // The icon's socket is the voice of the service: it accepts quit and restart, whatever process sends
 // them — that is the way dsvs service stop and restart go. Setting up an icon when another one is
