@@ -69,6 +69,36 @@ type Config struct {
 	// Echo is what the script wrote to its console during the evaluation. It goes to the session's log:
 	// written on the binary's stderr, it would draw over the TUI's screen.
 	Echo []string `json:"-"`
+
+	// Observed is what the machine showed when this configuration was built.
+	Observed *Observed `json:"-"`
+
+	// Answer is the answer of the program it comes from, as written: a handover carries it, and the new
+	// image rebuilds the configuration in force from it without evaluating anything (Answered).
+	Answer json.RawMessage `json:"-"`
+}
+
+// Input is what an evaluation receives: the human's intentions, layer by layer, and what the machine
+// shows. Asked is what a gesture asks for, Network what is kept for the observed network, Session what
+// was chosen since the session started, Kept what is kept for the project. The cascade that derives a
+// value from them is the engine's, because it depends on the rules: Go merges nothing.
+type Input struct {
+	Asked    map[string]string `json:"asked"`
+	Network  map[string]string `json:"network"`
+	Session  map[string]string `json:"session"`
+	Kept     map[string]string `json:"kept"`
+	Observed *Observed         `json:"observed"`
+}
+
+// Observed is what the machine shows and nobody sets. nil: nothing observes it.
+type Observed struct {
+	Links []Link `json:"links"`
+}
+
+type Link struct {
+	Name  string   `json:"name"`
+	Type  string   `json:"type"`
+	Addrs []string `json:"addrs"`
 }
 
 const defaultSubnet = "10.77.0.0/24"
@@ -318,67 +348,109 @@ var palette = []string{"cyan", "magenta", "green", "yellow", "blue", "red"}
 
 var ansiByName = map[string]int{"red": 1, "green": 2, "yellow": 3, "blue": 4, "magenta": 5, "cyan": 6}
 
-// Load reads the configuration file and returns a validated object: nothing downstream has anything
-// left to check. A .json is read as is, everything else is a module that node evaluates — it is the
-// same contract, and the shim only translates it. watch are the command line's paths, validated along
-// with the file's: a path that watches nothing must say so at load.
-func Load(path string, watch []string) (Config, error) {
+// Load evaluates the configuration for this input: the form, always, and the configuration it builds
+// when it is valid — nil otherwise, and the form says why. What comes out is validated: nothing
+// downstream has anything left to check. A configuration is a program that receives the input and
+// returns JSON — node is one implementation of it, a .json the degenerate case. watch are the command
+// line's paths, validated along with the file's: a path that watches nothing must say so at load.
+func Load(path string, watch []string, in Input) (Form, *Config, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
-		return Config{}, err
+		return Form{}, nil, err
 	}
-	var (
-		out  []byte
-		echo []string
-	)
-	if filepath.Ext(abs) == ".json" {
-		out, err = os.ReadFile(abs)
-	} else {
-		out, echo, err = evaluate(abs)
-	}
+	out, echo, err := evaluate(abs, in)
 	if err != nil {
-		return Config{}, err
+		return Form{}, nil, err
 	}
-	var shape any
+	return read(path, abs, watch, in, out, echo)
+}
+
+// Answered reads what an evaluation of this configuration answered, without redoing it, and validates
+// it as if the answer had just arrived: that is how a handover takes over the configuration in force,
+// whether or not the new binary knows how to build the file.
+func Answered(path string, watch []string, in Input, answer []byte) (Form, *Config, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return Form{}, nil, err
+	}
+	return read(path, abs, watch, in, answer, nil)
+}
+
+// read turns an answer into the form and the configuration it describes, validated.
+func read(path, abs string, watch []string, in Input, out []byte, echo []string) (Form, *Config, error) {
+	var answer struct {
+		Form   Form `json:"form"`
+		Config any  `json:"config"`
+	}
 	// A number stays written as is: that is what tells 4380 from 4380.5 where an integer is expected.
 	decoder := json.NewDecoder(bytes.NewReader(out))
 	decoder.UseNumber()
-	if err := decoder.Decode(&shape); err != nil {
-		return Config{}, fmt.Errorf("%s: unreadable output: %w", path, err)
+	if err := decoder.Decode(&answer); err != nil {
+		return Form{}, nil, fmt.Errorf("%s: unreadable output: %w", path, err)
+	}
+	if problems := answer.Form.validate(); len(problems) > 0 {
+		return Form{}, nil, fault(path, problems)
+	}
+	if answer.Config == nil {
+		if len(answer.Form.Problems()) == 0 {
+			return Form{}, nil, fmt.Errorf("%s: the form is valid, and built no configuration", path)
+		}
+		return answer.Form, nil, nil
 	}
 	// The shape is checked before decoding, which keeps quiet about a key it does not know and reports
 	// a value of the wrong type in Go's words.
-	if problems := shaped("", shape, reflect.TypeFor[Config]()); len(problems) > 0 {
-		return Config{}, fault(path, problems)
+	if problems := shaped("", answer.Config, reflect.TypeFor[Config]()); len(problems) > 0 {
+		return Form{}, nil, fault(path, problems)
 	}
-	var cfg Config
-	if err := json.Unmarshal(out, &cfg); err != nil {
-		return Config{}, fmt.Errorf("%s: unreadable output: %w", path, err)
+	var built struct {
+		Config *Config `json:"config"`
 	}
+	if err := json.Unmarshal(out, &built); err != nil {
+		return Form{}, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	cfg := built.Config
+	cfg.Answer = out
 	cfg.Echo = echo
+	cfg.Observed = in.Observed
 	cfg.ForcedWatch = watch
 	cfg.resolve(abs)
-	return cfg, cfg.validate(path)
+	if err := cfg.validate(path); err != nil {
+		return Form{}, nil, err
+	}
+	return answer.Form, cfg, nil
 }
 
-// evaluate has node evaluate a module, which strips its types, and returns the JSON it gets from it
-// along with what the script said on its console.
-func evaluate(abs string) ([]byte, []string, error) {
+// evaluate runs the configuration and returns the JSON it writes along with what it said on its
+// console. It is the one place where the extension decides who reads it: a .json is a bare
+// configuration, without a form, a module goes through node which strips its types, any other file is
+// a program, with the same contract.
+func evaluate(abs string, in Input) ([]byte, []string, error) {
+	if filepath.Ext(abs) == ".json" {
+		out, err := os.ReadFile(abs)
+		return append(append([]byte(`{"form":{"fields":[]},"config":`), out...), '}'), nil, err
+	}
 	answering, done := context.WithTimeout(context.Background(), evaluationLimit)
 	defer done()
-	node := exec.CommandContext(answering, "node", "--input-type=module", "-e", shim)
-	// A grandchild that keeps stdout open must not hold the read back once node is killed.
-	node.WaitDelay = time.Second
-	node.Env = append(os.Environ(), "DSVS_CONFIG="+abs)
-	node.Dir = filepath.Dir(abs)
+	program, err := programFor(answering, abs)
+	if err != nil {
+		return nil, nil, err
+	}
+	input, err := json.Marshal(in.normalized())
+	if err != nil {
+		return nil, nil, err
+	}
+	// A grandchild that keeps stdout open must not hold the read back once the program is killed.
+	program.WaitDelay = time.Second
+	program.Env = append(os.Environ(), "DSVS_CONFIG="+abs, "DSVS_INPUT="+string(input))
+	program.Dir = filepath.Dir(abs)
 	// A script that hangs must not outlive the tool: even outside the systemd box, the kernel takes it
 	// down with us.
-	node.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
+	program.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGKILL}
 	// What the script says is captured, not relayed: during a hot reload, the binary's stderr is the
 	// TUI's screen. A failure carries it along — that is where the real cause is.
 	var console bytes.Buffer
-	node.Stderr = &console
-	out, err := node.Output()
+	program.Stderr = &console
+	out, err := program.Output()
 	if answering.Err() != nil {
 		return nil, nil, fmt.Errorf("%s: did not answer within %s%s", abs, evaluationLimit, block(console.String()))
 	}
@@ -453,16 +525,59 @@ var (
 )
 
 // thrown names a program's failure by the error it threw — the line node writes at the top of its
-// stack, TypeError: … — and failing that by its exit code: it is the first line of the error, the one
-// an interface with room for a single line reads.
+// stack, TypeError: … — failing that by the last thing it said, and otherwise by its exit code: it is
+// the first line of the error, the one an interface with room for a single line reads.
 func thrown(console string, exit error) string {
 	if line := raised.FindString(console); line != "" {
 		return line
+	}
+	if said := lines(console); len(said) > 0 {
+		return said[len(said)-1]
 	}
 	return exit.Error()
 }
 
 var raised = regexp.MustCompile(`(?m)^(?:[A-Z][A-Za-z]*)?Error\b[^:\n]*: .+$`)
+
+// programFor returns the command that evaluates this file: node for a module, the file itself
+// otherwise.
+func programFor(ctx context.Context, abs string) (*exec.Cmd, error) {
+	switch filepath.Ext(abs) {
+	case ".ts", ".mts", ".js", ".mjs":
+		return exec.CommandContext(ctx, "node", "--input-type=module", "-e", shim), nil
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&0o111 == 0 {
+		return nil, fmt.Errorf("%s: neither a module node reads (.ts .mts .js .mjs) nor an executable program", abs)
+	}
+	return exec.CommandContext(ctx, abs), nil
+}
+
+// normalized returns the input with empty collections rather than null: that is what the program, in
+// JavaScript or in shell, can walk without a guard.
+func (in Input) normalized() Input {
+	for _, layer := range []*map[string]string{&in.Asked, &in.Network, &in.Session, &in.Kept} {
+		if *layer == nil {
+			*layer = map[string]string{}
+		}
+	}
+	if in.Observed != nil {
+		seen := Observed{Links: slices.Clone(in.Observed.Links)}
+		if seen.Links == nil {
+			seen.Links = []Link{}
+		}
+		for i := range seen.Links {
+			if seen.Links[i].Addrs == nil {
+				seen.Links[i].Addrs = []string{}
+			}
+		}
+		in.Observed = &seen
+	}
+	return in
+}
 
 // evaluationLimit bounds an evaluation: a script that never returns would otherwise hold the reload in
 // progress forever. It is a variable so that a test can shorten it.
@@ -534,13 +649,35 @@ func (c Config) Ingress(host string) (Ingress, bool) {
 	return *open, true
 }
 
-// console.log is sent to stderr so that stdout carries only the JSON.
-const shim = `
+// shim is what node runs. console.log is sent to stderr so that stdout carries only the JSON. The hook
+// serves "dsvs" to the configuration and to what it imports: the binary's engine answers, whether a
+// types package is installed or not. An export made by config() resolves; without a form, the export is
+// a configuration, or a function called without a value, and the form is empty.
+var shim = `
 console.log = console.error;
+const { registerHooks } = await import("node:module");
 const { pathToFileURL } = await import("node:url");
-const mod = await import(pathToFileURL(process.env.DSVS_CONFIG).href);
-const value = typeof mod.default === "function" ? await mod.default() : mod.default;
-process.stdout.write(JSON.stringify(value ?? null));
+const engine = ` + quoted(engine) + `;
+registerHooks?.({
+  resolve: (specifier, context, next) => (specifier === "dsvs" ? { url: "dsvs:engine", shortCircuit: true } : next(specifier, context)),
+  load: (url, context, next) => (url === "dsvs:engine" ? { format: "module", source: engine, shortCircuit: true } : next(url, context)),
+});
+const input = JSON.parse(process.env.DSVS_INPUT);
+const mod = await import(pathToFileURL(process.env.DSVS_CONFIG).href).catch((error) => {
+  if (!registerHooks && error?.code === "ERR_MODULE_NOT_FOUND") {
+    error.message += "; node " + process.version + ' cannot serve "dsvs" to a configuration: form() needs node 22.15 or later';
+  }
+  throw error;
+});
+const resolve = mod.default?.[Symbol.for("dsvs.resolve")];
+if (!resolve && "params" in mod) {
+  process.stderr.write('export const params is replaced by form() from "dsvs": see the types\n');
+  process.exit(1);
+}
+const answer = resolve
+  ? await resolve(input)
+  : { form: { fields: [] }, config: (typeof mod.default === "function" ? await mod.default({}, input.observed) : mod.default) ?? null };
+process.stdout.write(JSON.stringify(answer));
 `
 
 func (c *Config) resolve(path string) {

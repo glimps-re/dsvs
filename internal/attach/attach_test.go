@@ -121,7 +121,7 @@ func TestAttachSaysWhyTheConfigurationIsInvalid(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"apps": [{"name": "front", "command": ["serve", "--port", "{port}"]}], "ingress": [{"routes": [{"path": "/", "app": "front"}]}]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	_, invalid := config.Load(path, nil)
+	_, _, invalid := config.Load(path, nil, config.Input{})
 	if invalid == nil {
 		t.Fatal("this configuration should be refused")
 	}
@@ -335,7 +335,7 @@ func session(t *testing.T) (*core.Session, string) {
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 	dir := t.TempDir()
 	cfg := config.Config{Dir: dir, Path: filepath.Join(dir, "config.dsvs.json")}
-	return core.NewSession(cfg, core.Loopback{}, noFront{}, func(*core.Session) core.Gateway { return nil }), cfg.Path
+	return core.NewSession(config.Form{}, cfg, core.Loopback{}, noFront{}, func(*core.Session) core.Gateway { return nil }), cfg.Path
 }
 
 // running sets up a supervised session, with an app that sleeps: enough to observe an order.
@@ -352,7 +352,7 @@ func running(t *testing.T) (*core.Session, string) {
 		},
 		Ingresses: []config.Ingress{config.NewIngress(config.Ingress{Host: "shop.localhost"})},
 	}
-	session := core.NewSession(cfg, core.Loopback{}, noFront{}, func(*core.Session) core.Gateway { return idleGateway{} })
+	session := core.NewSession(config.Form{}, cfg, core.Loopback{}, noFront{}, func(*core.Session) core.Gateway { return idleGateway{} })
 	ctx, cancel := context.WithCancel(context.Background())
 	stopped := make(chan struct{})
 	go func() {

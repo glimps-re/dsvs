@@ -2,7 +2,7 @@
   "name": "dsvs",
   "version": "0.0.0",
   "private": true,
-  "description": "The shape of a dsvs configuration. Types only: import type.",
+  "description": "The shape of a dsvs configuration and of its form. Types only: the dsvs binary serves the code.",
   "types": "index.d.ts",
   "files": ["index.d.ts"]
 }

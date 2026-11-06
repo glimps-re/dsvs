@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"dsvs/internal/build"
+	"dsvs/internal/config"
 )
 
 // The role is the decision point of the command: set up wrong, it had made a role of the table
@@ -80,7 +81,7 @@ func TestLoadChoosesThePortOfTheSession(t *testing.T) {
 		{"a typed port despite a shift", 4999, 100, 4999, 4999},
 	} {
 		t.Run(tc.what, func(t *testing.T) {
-			cfg, err := load(path, tc.port, tc.shift, nil)
+			_, cfg, err := load(config.Load, path, tc.port, tc.shift, nil, config.Input{})
 			if err != nil {
 				t.Fatalf("load = %v", err)
 			}

@@ -77,7 +77,7 @@ func TestHandoverCarriesWhatNothingElseSays(t *testing.T) {
 func TestAdoptedRunKeepsItsProcess(t *testing.T) {
 	t.Parallel()
 	cfg, spy := fixture(t, sleeper)
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
+	session := NewSession(config.Form{}, cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
 
 	tty, pid := onAPty(t, "sh", "-c", "read line; echo adopted; sleep 300 & wait")
 	if err := session.Adopt(handoverOf(t, "app", cfg.Apps[0], tty, pid)); err != nil {
@@ -125,7 +125,7 @@ func TestAdoptedAppTheConfigurationDroppedKeepsItsPlace(t *testing.T) {
 	cfg, spy := fixture(t, sleeper)
 	dropped := cfg.Apps[0]
 	cfg.Apps = nil
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
+	session := NewSession(config.Form{}, cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
 
 	tty, pid := onAPty(t, sleeper...)
 	if err := session.Adopt(handoverOf(t, "app", dropped, tty, pid)); err != nil {
@@ -150,7 +150,7 @@ func TestAdoptedAppTheConfigurationDroppedKeepsItsPlace(t *testing.T) {
 func TestAnUnknownHandoverIsRefused(t *testing.T) {
 	t.Parallel()
 	cfg, spy := fixture(t, sleeper)
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
+	session := NewSession(config.Form{}, cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
 	if err := session.Adopt(Handover{Version: HandoverVersion + 1}); err == nil {
 		t.Error("a manifest of another version was accepted")
 	}
@@ -161,7 +161,7 @@ func TestAnUnknownHandoverIsRefused(t *testing.T) {
 func TestRenewIsRefusedWithoutTheBox(t *testing.T) {
 	t.Parallel()
 	cfg, spy := fixture(t, sleeper)
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
+	session := NewSession(config.Form{}, cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
 	err := session.Renew()
 	if err == nil {
 		t.Fatal("the handover was accepted without a gesture set")

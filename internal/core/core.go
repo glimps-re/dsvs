@@ -457,8 +457,19 @@ type Session struct {
 	// mu guards what the reload replaces: the configuration, read by the proxy on each request, the
 	// facades, whose logs it holds, and the list of supervisors — the declared apps, then those
 	// that survive their removal as long as their process.
-	mu        sync.RWMutex
-	cfg       config.Config
+	mu       sync.RWMutex
+	cfg      config.Config
+	observed *config.Observed
+	// form is the last evaluated form: the one the interfaces show. The configuration in force is
+	// the last one a valid form built, so it can lag behind the form, never get ahead of it.
+	form config.Form
+	// notApplied says why the configuration in force is not the one the file builds today: the last
+	// evaluation failed, or its form is invalid. Empty when it is. It is the only thing that says
+	// so, and only the evaluation writes it.
+	notApplied string
+	// intents are the values chosen since the session started: an accepted gesture writes them, and
+	// they cross a handover. A default is never one.
+	intents   map[string]string
 	ingresses []*Ingress
 	apps      []*App
 	// viewports are the windows of the watching interfaces, and cols/rows the size lent to the
@@ -475,16 +486,20 @@ type Session struct {
 	saved map[string]string
 }
 
-// NewSession builds the session, its apps and its facades. newGateway receives the session to read
-// the apps' state from it: the gateway therefore never exists without something to serve.
-func NewSession(cfg config.Config, network Network, front Front, newGateway func(*Session) Gateway) *Session {
+// NewSession builds the session, its apps and its facades, on the configuration this form built.
+// newGateway receives the session to read the apps' state from it: the gateway therefore never
+// exists without something to serve.
+func NewSession(form config.Form, cfg config.Config, network Network, front Front, newGateway func(*Session) Gateway) *Session {
 	s := &Session{
-		cfg:   cfg,
-		cols:  defaultCols,
-		rows:  defaultRows,
-		net:   network,
-		front: front,
-		Log:   NewJournal("session", logSize, defaultRows),
+		cfg:      cfg,
+		observed: cfg.Observed,
+		form:     form,
+		intents:  map[string]string{},
+		cols:     defaultCols,
+		rows:     defaultRows,
+		net:      network,
+		front:    front,
+		Log:      NewJournal("session", logSize, defaultRows),
 	}
 	s.enlist(cfg.Apps)
 	s.saved = saved(cfg.Watched())
@@ -545,25 +560,67 @@ func (s *Session) Facades() []*Ingress {
 	return s.ingresses
 }
 
-// Reload rereads the configuration and replaces what is declarative: the facades, their routes, their
-// targets, the groups, and the list of apps. What is alive does not reload — the port is taken, the
-// subnet is carved out, a process does not change command midway: an app whose declaration moved says
-// so and waits for its restart, a removed app runs until it is stopped. An unreadable or invalid
-// configuration changes nothing: the session carries on with the running one.
-func (s *Session) Reload() error {
+// Reload replays the configuration with the session's intents: it is what replaces what is
+// declarative — the facades, their routes, their targets, the groups, and the list of apps. What is
+// alive does not reload — the port is taken, the subnet is carved out, a process does not change
+// command midway: an app whose declaration moved says so and waits for its restart, a removed app
+// runs until it is stopped. An unreadable or invalid configuration changes nothing: the session
+// carries on with the running one. Neither does an invalid form, but it is the one the session shows
+// from then on, with its errors. In every case it says why (NotApplied), until the evaluation that
+// applies the file again, and which the log tells.
+func (s *Session) Reload() error { return s.replay() }
+
+// Form returns the last evaluated form: what an interface shows of the parameters.
+func (s *Session) Form() config.Form {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.form
+}
+
+// NotApplied says, in one line, why the configuration in force is not the one the file builds for
+// what the session shows: the last evaluation failed, or its form is invalid, and the targets are the
+// previous ones. Empty when it is; the log carries the details.
+func (s *Session) NotApplied() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.notApplied
+}
+
+// replay is the only path of a re-read. The evaluated form is kept as soon as the evaluation
+// succeeded; the configuration, only if the form is valid.
+func (s *Session) replay() error {
 	s.reloading.Lock()
 	defer s.reloading.Unlock()
 
 	current := s.Config()
 	s.mu.Lock()
 	s.saved = saved(current.Watched())
+	intents := maps.Clone(s.intents)
 	s.mu.Unlock()
 
-	next, err := config.Load(current.Path, current.ForcedWatch)
+	form, built, err := config.Load(current.Path, current.ForcedWatch, config.Input{Session: intents})
 	if err != nil {
+		// The log keeps the whole failure, including what the program said; the status reads its head.
+		why := headline(current.Path, err)
+		s.lags(why)
 		s.LogSink(s.Log)("!! " + err.Error())
+		return errors.New(why)
+	}
+	s.mu.Lock()
+	shown := s.form
+	s.form = form
+	s.mu.Unlock()
+	if built == nil {
+		problems := strings.Join(form.Problems(), "; ")
+		s.lags(problems)
+		err := errors.New("configuration not applied: " + problems)
+		s.LogSink(s.Log)("-- " + err.Error())
 		return err
 	}
+	if s.lags("") != "" {
+		s.LogSink(s.Log)("-- configuration applied again")
+	}
+	next := *built
 	// The command line's port prevails at every read: the file cannot take back a session choice, so
 	// there is nothing to announce on that side.
 	next.ForcedPort = current.ForcedPort
@@ -572,9 +629,11 @@ func (s *Session) Reload() error {
 	}
 	stuck := frozen(current, next)
 	next.Port, next.Subnet = current.Port, current.Subnet
-	// The script's echo is not a declaration: it does not count in "nothing changed".
-	echo := next.Echo
-	next.Echo = current.Echo
+	// The script's echo, the observation and the response are not declarations: they do not count
+	// in "nothing changed". What changed without the output moving reloads nothing, but the
+	// configuration in force keeps the observation and the response it is made of.
+	echo, observed, answer := next.Echo, next.Observed, next.Answer
+	next.Echo, next.Observed, next.Answer = current.Echo, current.Observed, current.Answer
 	// The freeze is announced when the declaration changes, once — not on every save while the
 	// drift persists, and never when the command line has the last word.
 	tell := stuck != "" && stuck != s.frozenSaid
@@ -584,9 +643,16 @@ func (s *Session) Reload() error {
 	}
 	// Saving without having changed anything must neither reload the browsers nor stir the logs.
 	if reflect.DeepEqual(next, current) {
+		s.mu.Lock()
+		s.cfg.Observed, s.cfg.Answer = observed, answer
+		s.mu.Unlock()
+		if !reflect.DeepEqual(form, shown) {
+			s.emit(Event{Source: s.Log.Name(), Kind: Changed})
+		}
 		return nil
 	}
 
+	next.Observed, next.Answer = observed, answer
 	s.mu.Lock()
 	s.cfg = next
 	s.mu.Unlock()
@@ -613,6 +679,28 @@ func (s *Session) Reload() error {
 	s.reloadBrowsers()
 	s.emit(Event{Source: s.Log.Name(), Kind: Reloaded})
 	return nil
+}
+
+// lags records why the configuration in force is no longer the file's — nothing when it is again —
+// and returns what was said about it until then.
+func (s *Session) lags(why string) (was string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	was, s.notApplied = s.notApplied, why
+	return was
+}
+
+// headline is what one line says of a failure of this configuration: its first, which starts with
+// the location of the failure, written from the configuration's directory — config.dsvs.ts:12:5: …
+// —, the directory being the one the session already carries. What follows is what the program
+// said, which the log keeps; except when the first line only names the file: the list of its faults
+// follows, and the line takes it.
+func headline(path string, err error) string {
+	first, rest, _ := strings.Cut(strings.TrimPrefix(err.Error(), filepath.Dir(path)+string(filepath.Separator)), "\n")
+	if strings.HasSuffix(first, ":") {
+		return first + " " + strings.Join(strings.Fields(rest), " ")
+	}
+	return first
 }
 
 // adopt brings the facades in line with the configuration. A facade never changes after it is
