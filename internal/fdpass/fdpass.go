@@ -1,9 +1,11 @@
 // Package fdpass carries a file descriptor from one process to another over a Unix socket: the
 // kernel reinstalls it in the receiver, which gets the same resource and not a copy of its bytes.
-// It is what lets a port opened in one namespace be served from another.
+// It is what lets a port opened in one namespace be served from another, and a connection accepted
+// by the hub be served by the session that owns the host.
 package fdpass
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -66,6 +68,91 @@ func Recv(conn *net.UnixConn) (string, []int, error) {
 		return true
 	})
 	return line, fds, errors.Join(err, inner)
+}
+
+// Reader reads a stream of lines and the descriptors that go with them. A stream socket does not
+// keep write boundaries: two lines written in a row arrive stuck together, a line arrives cut in
+// two, and the kernel delivers with them the descriptors of the sends it stuck together. Framing is
+// therefore a protocol rule, and it lives here alone: each Line returns a whole line, and Fd
+// returns the descriptors in their order of arrival, the very order of their lines.
+//
+// The reader belongs to the goroutine that reads: only it touches the received descriptors, and it
+// is the one that gives back to the kernel those nobody came to take, as soon as the stream returns
+// nothing more. From anywhere else, there is only Close, which breaks the socket and nothing else.
+type Reader struct {
+	conn *net.UnixConn
+	rest []byte
+	fds  []int
+}
+
+func NewReader(conn *net.UnixConn) *Reader { return &Reader{conn: conn} }
+
+// Conn returns the socket, to write on it: framing only concerns reading.
+func (r *Reader) Conn() *net.UnixConn { return r.conn }
+
+// Close breaks the socket, and leaves the received descriptors to whoever reads them: the ongoing
+// read then returns an error, and that is where they are closed. A reader can therefore be closed
+// from any goroutine without ever racing for a descriptor number the other one is taking.
+func (r *Reader) Close() error { return r.conn.Close() }
+
+// Line returns the next whole line, reading the socket as many times as needed.
+func (r *Reader) Line() (string, error) {
+	for {
+		if line, rest, found := bytes.Cut(r.rest, []byte("\n")); found {
+			r.rest = rest
+			return strings.TrimSpace(string(line)), nil
+		}
+		if err := r.fill(); err != nil {
+			// Nothing will come to take them anymore: what arrived and was not asked for goes back
+			// to the kernel, and the connection that was waiting behind closes with it.
+			for _, fd := range r.fds {
+				unix.Close(fd)
+			}
+			r.fds = nil
+			return "", err
+		}
+	}
+}
+
+// Fd returns the next arrived descriptor. The second return value says whether there was one: a
+// line whose descriptor is missing is a peer that does not speak the protocol, never a read too
+// early — the kernel delivers a send's descriptors with its bytes.
+func (r *Reader) Fd() (int, bool) {
+	if len(r.fds) == 0 {
+		return 0, false
+	}
+	fd := r.fds[0]
+	r.fds = r.fds[1:]
+	return fd, true
+}
+
+func (r *Reader) fill() error {
+	raw, err := r.conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var inner error
+	err = raw.Read(func(socket uintptr) bool {
+		buf := make([]byte, 4096)
+		oob := make([]byte, unix.CmsgSpace(4*maxFds))
+		n, oobn, _, _, e := unix.Recvmsg(int(socket), buf, oob, unix.MSG_CMSG_CLOEXEC)
+		switch {
+		case e == unix.EAGAIN || e == unix.EWOULDBLOCK:
+			return false // nothing has arrived yet: the runtime will call back when the socket is readable
+		case e != nil:
+			inner = e
+			return true
+		case n == 0 && oobn == 0:
+			inner = io.EOF
+			return true
+		}
+		r.rest = append(r.rest, buf[:n]...)
+		fds, e := rights(oob[:oobn])
+		r.fds = append(r.fds, fds...)
+		inner = e
+		return true
+	})
+	return errors.Join(err, inner)
 }
 
 // rights reads the descriptors of an ancillary data block. No message is the ordinary case: the

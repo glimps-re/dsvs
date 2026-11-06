@@ -529,6 +529,11 @@ func (c Config) validate(path string) error {
 			fail("two facades are named %q", in.Name)
 		}
 		seen[in.Name] = true
+		// The hub keeps this name to mean "everything nobody else claims": a facade writing it would be a
+		// catch-all on its side and not on ours.
+		if in.Host == "*" {
+			fail("%s: host \"*\" is reserved; an empty host takes what nobody claims", in.Name)
+		}
 		if owner, taken := hosts[in.Host]; taken {
 			fail("%s and %s claim the same host", owner, in.Name)
 		}

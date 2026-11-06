@@ -192,6 +192,8 @@ func TestLoadRefusesWhatWouldBreakLater(t *testing.T) {
 			routes: [{ path: "/a", proxy: { target: "api.example.com" } }] }], apps: [` + app + `] }`,
 		"proxy target without a host": `{ port: 1, ingress: [{ host: "x",
 			routes: [{ path: "/a", proxy: { target: "https://" } }] }], apps: [` + app + `] }`,
+		"facade on the host reserved for the catch-all": `{ port: 1, ingress: [{ host: "*",
+			routes: [{ path: "/a", app: "a" }] }], apps: [` + app + `] }`,
 		"facade without a route": `{ port: 1, ingress: [{ host: "x", routes: [] }], apps: [` + app + `] }`,
 		"no facade":              `{ port: 1, ingress: [], apps: [` + app + `] }`,
 		"empty command":          `{ port: 1, ingress: [` + front + `], apps: [{ name: "a", command: [] }] }`,
