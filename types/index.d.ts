@@ -87,7 +87,12 @@ export interface App {
    * required somewhere — without it, nothing would know where to reach the app.
    */
   command: string[];
-  env?: Record<string, string>;
+  /**
+   * The variables set on top of the session's environment. An `undefined` value sets none: an
+   * object built from a condition is written as is, and apps with different variables fit in the
+   * same array.
+   */
+  env?: Record<string, string | undefined>;
   /** Working directory, absolute or relative to the configuration file. Default: its directory. */
   dir?: string;
   /** Color of the app in the logs. Default: taken from a palette, in order. */
@@ -95,7 +100,3 @@ export interface App {
 }
 
 export type Color = "red" | "green" | "yellow" | "blue" | "magenta" | "cyan";
-
-export function group(name: string, apps: App[]) {
-  return { name, members: apps.map((item) => item.name) };
-}

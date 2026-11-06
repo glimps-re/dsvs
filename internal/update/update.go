@@ -306,6 +306,14 @@ func fastForwards() bool {
 	return err == nil
 }
 
+// Repo is the GitHub repository of the releases: DSVS_REPO, or the tool's own.
+func Repo() string {
+	if named := os.Getenv("DSVS_REPO"); named != "" {
+		return named
+	}
+	return "glimps-re/dsvs"
+}
+
 func git(args ...string) (string, error) {
 	return runWith(nil, build.Origin, "git", args...)
 }
