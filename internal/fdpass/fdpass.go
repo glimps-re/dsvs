@@ -7,9 +7,13 @@ package fdpass
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"os"
+	"strconv"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -192,4 +196,66 @@ func SendConn(to *net.UnixConn, line string, conn *net.TCPConn) error {
 		return err
 	}
 	return sendErr
+}
+
+// Crossing says which of a descriptor survives an execve, and it is the only place that knows how:
+// FD_CLOEXEC cleared, the kernel reinstalls it in the process's new image; set again, the caller
+// takes back what it had promised to carry across when the exec failed. What crosses over, on the
+// other hand, is named where one leaves — each exec has its own.
+func Crossing(cross bool, fds ...int) error {
+	for _, fd := range fds {
+		flags, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+		if err != nil {
+			return fmt.Errorf("fd %d: %w", fd, err)
+		}
+		if cross {
+			flags &^= unix.FD_CLOEXEC
+		} else {
+			flags |= unix.FD_CLOEXEC
+		}
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, flags); err != nil {
+			return fmt.Errorf("fd %d: %w", fd, err)
+		}
+	}
+	return nil
+}
+
+// Alone closes on exec everything the caller did not name: it is the only way to say what crosses
+// over when a library opens descriptors without saying so. gvisor sets its network stack's stop
+// eventfd without FD_CLOEXEC (measured: one more in the gatekeeper at each handover), and one can
+// only name what stays. What is gone between the listing and the fcntl is not an error — the
+// listing's own descriptor is one of those.
+func Alone(fds ...int) error {
+	held, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return err
+	}
+	named := make(map[int]bool, len(fds))
+	for _, fd := range fds {
+		named[fd] = true
+	}
+	for _, entry := range held {
+		fd, err := strconv.Atoi(entry.Name())
+		if err != nil || named[fd] {
+			continue
+		}
+		_ = Crossing(false, fd)
+	}
+	return Crossing(true, fds...)
+}
+
+// Number returns a descriptor's number without touching it: os.File.Fd would switch it back to
+// blocking and take it out of the poller.
+func Number(of interface {
+	SyscallConn() (syscall.RawConn, error)
+}) (int, error) {
+	raw, err := of.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	fd := -1
+	if err := raw.Control(func(handle uintptr) { fd = int(handle) }); err != nil {
+		return 0, err
+	}
+	return fd, nil
 }

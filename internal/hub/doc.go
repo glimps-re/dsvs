@@ -45,6 +45,14 @@
 // A hub of another version refuses the sessions, and says so naming both versions. It is the only
 // scenario where an update costs a session its apps.
 //
+// Bind returns the socket and the lock together, and that is also what carries them across a
+// handover's exec: Fds names them, Adopt takes them back. Releasing the lock for the time of a
+// handover, even a few milliseconds, would let a client knock on nothing and launch a second
+// session for the same configuration — it would take the name, and the new one would exit on
+// ErrTaken, letting the cgroup take the apps down. The hub, for its part, leaves with its last
+// session and the port reopens behind it: a handover therefore costs the in-flight connections to
+// that port, for the time of the exec.
+//
 // Without a systemd session, a session in a private network refuses to launch the hub: a mere
 // detach does not leave the network namespace, and the port would be invisible from the machine
 // there. The message says so and suggests --net loopback.

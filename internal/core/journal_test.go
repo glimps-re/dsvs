@@ -264,3 +264,37 @@ func TestJournalErasesPartsOfTheScreen(t *testing.T) {
 		t.Errorf("erase up = %q", got)
 	}
 }
+
+// A log is replayed through the path that writes it: its dump read back gives the same lines,
+// styles and in-place rewrites included. It is what carries the logs across a handover.
+func TestDumpReplays(t *testing.T) {
+	log := NewJournal("app", 4096, 4)
+	log.Write([]byte("\x1b[32mgreen\x1b[0m and \x1b[1mbold\x1b[0m\r\n"))
+	log.Write([]byte("loading\rdone\r\n"))
+	log.Add("-- a supervisor line")
+	log.Write([]byte("no final newline"))
+
+	replayed := NewJournal("app", 4096, 4)
+	replayed.Write([]byte(log.Dump()))
+
+	want, got := lines(log), lines(replayed)
+	if len(want) != len(got) {
+		t.Fatalf("replayed lines = %d, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if want[i] != got[i] {
+			t.Errorf("replayed line %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if row, col := replayed.Cursor(); row != len(want)-1 || col == 0 {
+		t.Errorf("replayed cursor = %d,%d, want the end of the last line", row, col)
+	}
+}
+
+func lines(log *Journal) []string {
+	out := make([]string, 0, 8)
+	for _, line := range log.Lines() {
+		out = append(out, line.Text)
+	}
+	return out
+}

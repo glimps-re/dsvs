@@ -27,6 +27,24 @@
 // names (Errno -2, nsswitch without myhostname), so a node script that targets such a name fails
 // where the browser succeeds.
 //
+// # The handover
+//
+// A session that moves to the binary on disk moves its gatekeeper there first, through a reload on
+// the control socket: it execs itself like the supervisor, keeps its PID — hence its systemd unit,
+// its cgroup and its child — and carries across the TUN, the control socket, the subnet and the PID
+// to wait for. The gatekeeper's refusal stops the handover before the session has dismantled
+// anything.
+//
+// What its exec does not keep: the outgoing connections in flight in the userspace stack, replayed
+// by a dial in the normal world, drop — the same family as the proxy's in-flight connections at the
+// session's handover, and already accepted there. The Watch connection drops too, and the
+// supervisor's new image reopens it.
+//
+// Pdeathsig on the supervisor and the handover exclude each other: the signal fires at the parent's
+// exec (measured), and the supervisor would die of the gatekeeper's. The gatekeeper therefore only
+// sets it outside the systemd box, and refuses the reload where it set it — the box's cgroup is
+// what replaces it.
+//
 // # Looking inside
 //
 // From outside, nsenter -t <supervisor pid> -U -n -m --preserve-credentials. The -U is not

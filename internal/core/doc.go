@@ -31,11 +31,34 @@
 // it had, and its supervisor withdraws itself as soon as it stops — "no longer declared and
 // stopped" is therefore not a representable state.
 //
+// # The handover, and what Pdeathsig costs it
+//
+// A session replaces its binary without letting go of its apps: it execs itself, keeps its PID,
+// hence its cgroup and its children, and the new image adopts them. Export says what nothing else
+// will say on the other side, Adopt takes it back, and the supervision loop does not know whether
+// the run it holds comes from a launch or an adoption: it is the same follow, a run and the state
+// it is in.
+//
+// Pdeathsig and the systemd box cover the same thing, and one is redundant when the other is there.
+// PR_SET_PDEATHSIG fires on the death of the thread that forked, and execve destroys every thread
+// but the caller: the apps therefore get a SIGTERM at each handover (measured, 2 survivors out of
+// 20). Where the session can hand over — SetRenewal set, that is inside the box — the apps start
+// without Pdeathsig and the cgroup provides the guarantee; elsewhere Pdeathsig stays, and the verb
+// is refused with its reason. One question, two consequences, and no guard to write.
+//
+// What a handover does not keep: in-flight HTTP connections, the per-facade counters, and the
+// timestamps of log lines — the text crosses over, replayed through the path that normally writes
+// it, but it is dated from its replay.
+//
 // # Known limits
 //
 // Without a systemd box, a kill -9 of the tool leaves the intermediate runner orphaned: Pdeathsig
 // only covers the processes one launches oneself, not those a runner detaches behind it. The log
 // warns when the box is missing, and a normal stop takes everything down, box or not.
+//
+// An app that dies between the export and the exec is adopted on a pid the old image has already
+// waited for: Wait returns ECHILD, its log says so, and the run ends without a code. The window is
+// that of a marshal and an execve.
 //
 // Killing the systemd-run forwarder does not kill the session: detached — the usual case, the
 // interface lending it its terminal — it only falls at its next written line; under the log stream,

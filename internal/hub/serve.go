@@ -89,6 +89,40 @@ type Socket struct {
 
 func (s *Socket) Close() error { return errors.Join(s.UnixListener.Close(), s.lock.Close()) }
 
+// Fds returns the descriptors to carry across a handover's exec: the socket, and its lock. The lock
+// first — it is the right to carry that name, and releasing it for the time of the handover would
+// let a client knock on nothing and launch a second session for the same configuration, which would
+// take the place and make the new one exit on ErrTaken.
+func (s *Socket) Fds() (listen, lock int, err error) {
+	if listen, err = fdpass.Number(s.UnixListener); err != nil {
+		return 0, 0, err
+	}
+	lock, err = fdpass.Number(s.lock)
+	return listen, lock, err
+}
+
+// Adopt takes back a socket and its lock inherited from an exec: it never stopped accepting, and
+// the lock was never released. The file is deleted on close, like the one Bind opens.
+func Adopt(addr string, listen, lock int) (*Socket, error) {
+	// net.FileListener duplicates the descriptor: the one that crossed over is of no further use.
+	// It is released through its *os.File, sole owner of the number — closing the number on the
+	// side would let the File's finalizer close it again at the first GC, when another file has
+	// taken it.
+	passed := os.NewFile(uintptr(listen), addr)
+	held, err := net.FileListener(passed)
+	passed.Close()
+	if err != nil {
+		return nil, err
+	}
+	sock, taken := held.(*net.UnixListener)
+	if !taken {
+		held.Close()
+		return nil, fmt.Errorf("fd %d is not the unix socket of %s", listen, addr)
+	}
+	sock.SetUnlinkOnClose(true)
+	return &Socket{UnixListener: sock, lock: os.NewFile(uintptr(lock), addr+".lock")}, nil
+}
+
 // hub is the table of sessions, in registration order, and the ports they keep held. Nothing in it
 // is derived: a request's host is looked up every time, so a session that leaves releases its hosts
 // without anybody having to take them back.

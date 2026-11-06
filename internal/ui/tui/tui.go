@@ -387,6 +387,12 @@ func (m Model) press(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// The file is already reread on every save: this key is there to force it, and to catch up
 		// on what lives outside its folder.
 		_ = m.session.Reload()
+
+	case "u":
+		// The session switches to the binary on disk without letting go of its apps: this interface
+		// falls with the exec, and the client that lent it reattaches on the other side. A refusal
+		// reads in the session's log.
+		_ = m.session.Renew()
 	}
 	return m, nil
 }

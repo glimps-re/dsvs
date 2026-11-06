@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/netip"
 	"os"
@@ -31,6 +32,10 @@ const (
 	// already in its namespace: it is the only switch between the two roles.
 	CtlEnv = "DSVS_NETNS_CTL"
 
+	// GateEnv carries what the gatekeeper carries across its own exec. Its presence tells the new
+	// image it takes over a private network already up instead of setting one up.
+	GateEnv = "DSVS_NETNS_GATE"
+
 	// Unreachable is the code by which the supervisor says it could not set up the private network.
 	// The gatekeeper then falls back to loopback mode, keeping the reason.
 	Unreachable = 78
@@ -39,7 +44,15 @@ const (
 // Gate plays the gatekeeper's role: it sets up the control socket, re-executes the binary in a user
 // and network namespace, serves its requests, and returns the supervisor's exit code. An error says
 // the namespace is out of reach — it is up to the caller to fall back to loopback.
-func Gate() (int, error) {
+//
+// boxed says whether the session runs in the systemd box, and this single question decides two
+// things: Pdeathsig on the supervisor, and the right to move to the binary on disk. The two exclude
+// each other — Pdeathsig fires at the parent's exec, measured, and would kill the supervisor.
+func Gate(boxed bool) (int, error) {
+	if passed, inherited := os.LookupEnv(GateEnv); inherited {
+		return resume(passed, boxed)
+	}
+
 	dir, err := os.MkdirTemp("", "dsvs-")
 	if err != nil {
 		return 0, err
@@ -57,21 +70,65 @@ func Gate() (int, error) {
 		Cloneflags:  unix.CLONE_NEWUSER | unix.CLONE_NEWNET | unix.CLONE_NEWNS,
 		UidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
 		GidMappings: []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
-		Pdeathsig:   syscall.SIGKILL,
+	}
+	if !boxed {
+		child.SysProcAttr.Pdeathsig = syscall.SIGKILL
 	}
 	if err := child.Start(); err != nil {
 		listener.Close()
 		os.RemoveAll(dir)
 		return 0, err
 	}
-	return (&gatekeeper{listener: listener, child: child.Process}).hold()
+	return (&gatekeeper{listener: listener, child: child.Process, boxed: boxed}).hold()
 }
 
-// gatekeeper is what the gatekeeper process holds: the control socket, and the supervisor it waits
-// for. The way out is in the package's variables — there is only one.
+// resume takes the private network back after the gatekeeper moved to the binary on disk. Nothing
+// is set up again on the kernel side — the TUN, the addresses and the control socket crossed the
+// exec — and only the way-out stack, which lived in the old image, reconnects to the same
+// descriptor. The resolver re-reads the machine's servers: the least one can do for a fresh one.
+//
+// Failing here does not mean the namespace is out of reach: it is up, and the supervisor with it.
+// Returning an error would make the caller fall back to loopback and open a second session on top
+// of the first — the gatekeeper therefore tells the reason and leaves, the box taking the rest
+// down.
+func resume(passed string, boxed bool) (int, error) {
+	os.Unsetenv(GateEnv)
+	c, err := parseCrossing(passed)
+	if err != nil {
+		return lost(err)
+	}
+	// net.FileListener duplicates the descriptor: the one that crossed over is of no further use.
+	// It is released through its *os.File, sole owner of the number — closing the number on the
+	// side would let the File's finalizer close it again at the first GC, when the supervisor's
+	// pidfd has taken it.
+	ctl := os.NewFile(uintptr(c.listen), "ctl")
+	listener, err := net.FileListener(ctl)
+	ctl.Close()
+	if err != nil {
+		return lost(err)
+	}
+	private, resolver = c.subnet, forwardTo(nameservers())
+	if err := relay(c.tun); err != nil {
+		return lost(err)
+	}
+	child, err := os.FindProcess(c.pid)
+	if err != nil {
+		return lost(err)
+	}
+	return (&gatekeeper{listener: listener, child: child, boxed: boxed}).hold()
+}
+
+func lost(err error) (int, error) {
+	fmt.Fprintf(os.Stderr, "the gatekeeper cannot take the private network back: %v\n", err)
+	return 1, nil
+}
+
+// gatekeeper is what the gatekeeper process holds: the control socket, the supervisor it waits for,
+// and the box. The way out is in the package's variables — there is only one.
 type gatekeeper struct {
 	listener net.Listener
 	child    *os.Process
+	boxed    bool
 }
 
 // hold serves the supervisor until its death and returns its exit code. The control socket's
@@ -124,7 +181,8 @@ func (g *gatekeeper) answer() {
 }
 
 // grant carries out a request in the normal world. The supervisor can only ask for the connection
-// of its way out, whose descriptor it gives, and for a way to follow it. Nothing else crosses.
+// of its way out, whose descriptor it gives, for a way to follow it, and for the move to the binary
+// on disk. Nothing else crosses.
 func (g *gatekeeper) grant(conn *net.UnixConn, request string, fds []int) error {
 	verb, rest, _ := strings.Cut(request, " ")
 	switch verb {
@@ -147,8 +205,76 @@ func (g *gatekeeper) grant(conn *net.UnixConn, request string, fds []int) error 
 		// The connection stays open: the gatekeeper writes on it what goes out, until the
 		// supervisor leaves.
 		return watchers.hold(conn)
+	case "reload":
+		if !g.boxed {
+			return errors.New("no systemd box: the gatekeeper keeps its binary, or the supervisor would die of its exec")
+		}
+		if tun < 0 {
+			return errors.New("the outbound is not wired yet")
+		}
+		if _, err := fmt.Fprintln(conn, "ok"); err != nil {
+			return err
+		}
+		return g.renew()
 	}
 	return fmt.Errorf("unknown request %q", verb)
+}
+
+// renew moves the gatekeeper to the binary on disk: it execs itself, like the supervisor, and
+// therefore keeps its PID — its systemd unit, its cgroup and its child see nothing happen. The
+// binary is not tried out here: the supervisor just did it for this path, and doing it again would
+// say nothing more. What drops at the exec: the outgoing connections in flight, and the Watch
+// connection.
+func (g *gatekeeper) renew() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	listen, err := fdpass.Number(g.listener.(*net.UnixListener))
+	if err != nil {
+		return err
+	}
+	c := crossing{tun: tun, listen: listen, pid: g.child.Pid, subnet: private}
+	// What is not named here closes on exec: the old image's way-out stack opens descriptors it
+	// does not declare, and they would pile up from one handover to the next.
+	if err := fdpass.Alone(syscall.Stdin, syscall.Stdout, syscall.Stderr, c.tun, c.listen); err != nil {
+		return err
+	}
+	err = syscall.Exec(exe, os.Args, append(os.Environ(), GateEnv+"="+c.String()))
+	// The exec failed, and the gatekeeper carries on as is: what was to cross over gets its
+	// FD_CLOEXEC back, otherwise the next supervisor launched would inherit the TUN and the control
+	// socket.
+	_ = fdpass.Crossing(false, c.tun, c.listen)
+	return err
+}
+
+// crossing says what the gatekeeper carries across its exec, and it is the only place that says it:
+// the way-out TUN, the control socket, the subnet and the supervisor to wait for. Four fields fit
+// in an environment variable, and an in-memory manifest would cost one more descriptor for the same
+// content.
+type crossing struct {
+	tun    int
+	listen int
+	pid    int
+	subnet netip.Prefix
+}
+
+func (c crossing) String() string {
+	return fmt.Sprintf("%d,%d,%d,%s", c.tun, c.listen, c.pid, c.subnet)
+}
+
+func parseCrossing(text string) (crossing, error) {
+	var c crossing
+	var subnet string
+	if n, err := fmt.Sscanf(text, "%d,%d,%d,%s", &c.tun, &c.listen, &c.pid, &subnet); n != 4 {
+		return c, fmt.Errorf("%s=%q is not tun,ctl,pid,subnet: %w", GateEnv, text, err)
+	}
+	prefix, err := netip.ParsePrefix(subnet)
+	if err != nil {
+		return c, fmt.Errorf("%s=%q: %w", GateEnv, text, err)
+	}
+	c.subnet = prefix
+	return c, nil
 }
 
 // Virtual is the private network as the supervisor sees it: each app has its address there, and the
@@ -196,6 +322,28 @@ func Join(ctl string, apps []string, subnet netip.Prefix) (*Virtual, error) {
 		v.warnings = append(v.warnings, fmt.Sprintf("!! resolv.conf of the private network: %v", err))
 	}
 	return v, nil
+}
+
+// Rejoin takes back the private network of a session that just handed over. It is already set up,
+// and in the kernel: lo up, one address per app on lo, the way out connected and its TUN at the
+// gatekeeper's. Nothing is therefore to be set up again — wire() would add the gatekeeper's address
+// again and reopen the TUN — and only the app → address table comes back, through the manifest.
+func Rejoin(ctl string, subnet netip.Prefix, ips map[string]string) (*Virtual, error) {
+	lo, err := netlink.LinkByName("lo")
+	if err != nil {
+		return nil, fmt.Errorf("lo not found: %w", err)
+	}
+	plan := map[string]string{}
+	maps.Copy(plan, ips)
+	return &Virtual{ctl: ctl, subnet: subnet, lo: lo, ips: plan}, nil
+}
+
+// Plan returns the app → address table: it is the only link a handover has to carry across, and it
+// is what keeps for each app the address it had.
+func (v *Virtual) Plan() map[string]string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return maps.Clone(v.ips)
 }
 
 // gateway is the gatekeeper's address as seen from inside: the one it gives to the way-out
@@ -256,6 +404,11 @@ func (v *Virtual) wire() error {
 
 	return v.ask("tun "+v.subnet.String(), int(out.Fd()))
 }
+
+// Renew moves the gatekeeper to the binary on disk, before the session does the same. It keeps its
+// PID, its TUN and its control socket: there is nothing to set up again on this side, and the Watch
+// connection, which drops at its exec, reopens with the session's new image.
+func (v *Virtual) Renew() error { return v.ask("reload") }
 
 // ask carries a request to the gatekeeper and returns what it says about it. The attached
 // descriptors travel with it: that is how the TUN gets across.

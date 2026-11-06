@@ -278,6 +278,12 @@ type App struct {
 	// has no other question to ask, and a stopped app has no representable address.
 	live atomic.Pointer[backend]
 
+	// handsOver says the session can hand over through exec: the apps then start without Pdeathsig,
+	// which would kill them at the handover, the cgroup of the systemd box being the guarantee that
+	// replaces it. It is a question, not a value — the gesture is made after the supervisors are
+	// built.
+	handsOver func() bool
+
 	// mu guards the published state, the current run and the size lent to its terminal.
 	mu   sync.RWMutex
 	snap Snapshot
@@ -286,13 +292,14 @@ type App struct {
 	// longer declares.
 	run config.App
 	// cur is the current run, nil when the app is stopped: its process, its terminal and its
-	// address.
+	// address, that is everything a handover has to carry across.
 	cur  *run
 	cols int
 	rows int
 }
 
-// run is an app's process for the duration of one supervision round.
+// run is an app's process for the duration of one supervision round. It comes from a launch or from
+// the adoption of a handover, and the loop that follows it does not know which.
 type run struct {
 	proc *os.Process
 	tty  *os.File
@@ -425,6 +432,10 @@ type Session struct {
 	gw    Gateway
 	net   Network
 	front Front
+
+	// renewal replaces the session's binary without letting go of its apps; nil when the process
+	// cannot do it. Set before Run, read afterwards — see SetRenewal.
+	renewal func() error
 
 	// watchers are the change subscribers: each its own channel, otherwise two interfaces would
 	// steal each other's wake-ups. Its own lock, because a supervisor emits at any moment,
@@ -887,13 +898,14 @@ func (s *Session) enlist(declared []config.App) (born, dropped []string) {
 // mu held.
 func (s *Session) recruit(name string) *App {
 	app := &App{
-		Name:     name,
-		Log:      NewJournal(name, logSize, defaultRows),
-		declared: func() (config.App, bool) { return s.Config().App(name) },
-		serves:   func() string { return served(s.Config(), name) },
-		net:      s.net,
-		cmds:     make(chan command, 8),
-		notify:   s.emit,
+		Name:      name,
+		Log:       NewJournal(name, logSize, defaultRows),
+		declared:  func() (config.App, bool) { return s.Config().App(name) },
+		serves:    func() string { return served(s.Config(), name) },
+		net:       s.net,
+		cmds:      make(chan command, 8),
+		notify:    s.emit,
+		handsOver: s.handsOver,
 		// The session's size, not the default one: an app born from a reload formats for the same
 		// window as its neighbors.
 		cols: s.cols,
@@ -1075,9 +1087,10 @@ func (s *App) send(c command) {
 }
 
 // supervise alternates between two regimes: stopped, where it waits for a command, and a run, of
-// which runOnce says whether another must follow.
+// which runOnce says whether another must follow. An app adopted from a handover already has its
+// run: supervision resumes there, launching nothing and waiting for nobody.
 func (s *App) supervise(ctx context.Context) {
-	for again := false; ; {
+	for again := s.resume(ctx); ; {
 		if !again {
 			// Stopped and no longer declared: the app has no reason to be, and neither has its
 			// supervision.
@@ -1126,8 +1139,7 @@ func (s *App) launch(cfg config.App) (*run, error) {
 	// The app gets a real terminal: that is what gives it colors, progress bars, and an input one
 	// can write to. It is launched there as the leader of a new session, hence of a new process
 	// group: a signal to the group also takes the children (npx → nx → dev-server), otherwise the
-	// port would stay held by an orphan. Pdeathsig adds the case where the tool dies without being able
-	// to clean up.
+	// port would stay held by an orphan.
 	cmd := exec.Command(command[0], command[1:]...)
 	cmd.Dir = cfg.Dir
 	cmd.Env = os.Environ()
@@ -1138,7 +1150,14 @@ func (s *App) launch(cfg config.App) (*run, error) {
 		cmd.Env = append(cmd.Env, "TERM=xterm-256color")
 	}
 
-	attrs := &syscall.SysProcAttr{Setsid: true, Setctty: true, Pdeathsig: syscall.SIGTERM}
+	attrs := &syscall.SysProcAttr{Setsid: true, Setctty: true}
+	if !s.handsOver() {
+		// Pdeathsig adds the case where the tool dies without being able to clean up. Where the
+		// session can hand over, it is redundant and fatal: PR_SET_PDEATHSIG fires on the death of
+		// the thread that forked, hence at every handover exec — measured, 2 apps surviving out of
+		// 20. The cgroup of the systemd box then covers the same thing, and better.
+		attrs.Pdeathsig = syscall.SIGTERM
+	}
 
 	s.mu.RLock()
 	size := &pty.Winsize{Cols: uint16(s.cols), Rows: uint16(s.rows)}
@@ -1150,7 +1169,9 @@ func (s *App) launch(cfg config.App) (*run, error) {
 	return &run{proc: cmd.Process, tty: tty, ep: ep}, nil
 }
 
-// follow holds a run until its end and says whether another must come.
+// follow holds a run until its end and says whether another must come. It does not know whether the
+// run comes from a launch or an adoption: snap says where it stands, and live whether the app
+// already answers — in which case the proxy keeps its address and there is nothing to probe.
 func (s *App) follow(ctx context.Context, r *run, snap Snapshot) (again bool) {
 	quietControlEcho(r.tty)
 
@@ -1158,7 +1179,8 @@ func (s *App) follow(ctx context.Context, r *run, snap Snapshot) (again bool) {
 	go s.drain(r.tty, drained)
 	exited := make(chan *os.ProcessState, 1)
 	go func() {
-		// The run is our child. Failing to wait for it leaves a run without a status: there is nothing to get from it,
+		// The run is our child, a handover's exec changing neither our PID nor the parentage.
+		// Failing to wait for it leaves a run without a status: there is nothing to get from it,
 		// and it is said.
 		state, err := r.proc.Wait()
 		if err != nil {
@@ -1169,7 +1191,10 @@ func (s *App) follow(ctx context.Context, r *run, snap Snapshot) (again bool) {
 
 	probeCtx, stopProbe := context.WithCancel(ctx)
 	defer stopProbe()
-	ready := probe(probeCtx, r.ep.String(), s.serves())
+	var ready <-chan struct{}
+	if s.live.Load() == nil {
+		ready = probe(probeCtx, r.ep.String(), s.serves())
+	}
 	s.publish(r, snap)
 
 	// done is neutralized after use: a canceled context stays ready forever and the select would
@@ -1178,6 +1203,11 @@ func (s *App) follow(ctx context.Context, r *run, snap Snapshot) (again bool) {
 		kill <-chan time.Time
 		done = ctx.Done()
 	)
+	if snap.Status == Stopping || snap.Status == Restarting {
+		// A stop requested before the handover resumes its deadline: without it, nobody reaps
+		// anymore.
+		kill = time.After(gracePeriod)
+	}
 	for {
 		select {
 		case <-done:
@@ -1274,7 +1304,8 @@ func (s *App) drain(tty *os.File, done chan struct{}) {
 	}
 }
 
-// publish replaces the current run and the published state in one go, and wakes up the interfaces.
+// publish replaces the current run and the published state in one go, and wakes up the interfaces:
+// a run without a published state, or the reverse, would be a state a handover could not describe.
 func (s *App) publish(cur *run, snap Snapshot) {
 	s.mu.Lock()
 	s.cur, s.snap = cur, snap

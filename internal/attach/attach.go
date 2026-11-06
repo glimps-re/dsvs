@@ -23,10 +23,31 @@ import (
 // what it has to do afterwards — that is waited for on the socket.
 const patience = 5 * time.Second
 
+// reloading is the word by which a session says it is moving to the binary on disk. Its socket does
+// not close — it crosses the exec — and the interface starts again on the other side: the client
+// reattaches instead of exiting with an error.
+const reloading = "reloading"
+
 // Attach lends this process's terminal to the session of this configuration and returns when the
 // interface goes away. start launches the session when it is not there; names are the apps to start,
 // ordered after attaching so that a session already alive hears them like a new one.
+//
+// A session moving to the binary on disk does not count as a departure: the client reattaches, and the
+// requested apps have already been requested.
 func Attach(config, ui string, names []string, start func() error) error {
+	for {
+		err := attach(config, ui, names, start)
+		if !errors.Is(err, errReloading) {
+			return err
+		}
+		names = nil
+	}
+}
+
+// errReloading says the session is replacing itself with the binary on disk.
+var errReloading = errors.New("the session is taking the binary on disk")
+
+func attach(config, ui string, names []string, start func() error) error {
 	conn, err := dial(socket(config), start)
 	if err != nil {
 		return err
@@ -215,6 +236,8 @@ func answer(conn *net.UnixConn) error {
 		return errors.New("session interrupted")
 	case strings.HasPrefix(line, "err "):
 		return errors.New(strings.TrimPrefix(line, "err "))
+	case line == reloading:
+		return errReloading
 	case line == "ok" || line == "bye":
 		return nil
 	}

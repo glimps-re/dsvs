@@ -12,6 +12,14 @@
 // A session's identity is the absolute path of its configuration: whoever knows which configuration
 // they want knows where to knock, with no directory to look up.
 //
+// # A handover is not a departure
+//
+// renew asks the session to move to the binary on disk. Its socket crosses the exec — it never stopped
+// accepting, and Adopt picks it up on the other side — so a client has nothing to wait for to
+// reattach. Attached interfaces receive the word "reloading" just before: their TUI does not cross,
+// the lent terminal is handed back, and the client asks for an interface again instead of exiting with
+// an error.
+//
 // The socket is opened before the configuration is read, and that is what also makes it the session's
 // voice: a session that does not start says so there, to whoever waits for it, instead of dying on a
 // silent wait.

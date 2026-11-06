@@ -39,9 +39,13 @@ func allowed(dst netip.AddrPort) bool {
 	return !private.Contains(dst.Addr())
 }
 
+// private is set when the way out is set up, when the subnet is known; resolver and tun are set at
+// the same moment. All three only concern the gatekeeper, which has only one way out to hold, and a
+// negative tun says it is not connected yet.
 var (
 	private  netip.Prefix
 	resolver Resolver
+	tun      = -1
 )
 
 // relay connects the private network's TUN to a userspace network stack and returns: connections
@@ -50,6 +54,7 @@ func relay(fd int) error {
 	if err := unix.SetNonblock(fd, true); err != nil {
 		return fmt.Errorf("the TUN refuses non-blocking mode: %w", err)
 	}
+	tun = fd
 	endpoint, err := fdbased.New(&fdbased.Options{FDs: []int{fd}, MTU: mtu})
 	if err != nil {
 		return fmt.Errorf("network stack: %w", err)

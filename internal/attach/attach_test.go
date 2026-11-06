@@ -262,6 +262,37 @@ func TestTailReadsTheEndOfTheJournals(t *testing.T) {
 	}
 }
 
+// Two renewals, two verbs: reload makes the session reread the configuration, renew makes it take the
+// binary on disk. Mixing them up made a session asked to reread its configuration exec itself
+// instead.
+func TestReloadAndRenewAreTwoOrders(t *testing.T) {
+	session, path := running(t)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+
+	link, err := Watch(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { link.Close() })
+
+	// No handover is set up on this session: renew is refused with a message saying so, and that is what
+	// shows the verb arrived safely.
+	if err := link.Order("renew"); err != nil {
+		t.Fatal(err)
+	}
+	told(t, session, "binary on disk")
+
+	// This test's configuration does not come from a file: rereading it fails, and the log says so —
+	// again, the proof that the verb arrived.
+	if err := link.Order("reload"); err != nil {
+		t.Fatal(err)
+	}
+	told(t, session, filepath.Base(path))
+}
+
 // told waits for this text in the session's log: an order arrives through the socket, and what it
 // yields is written in a goroutine other than the test's.
 func told(t *testing.T, session *core.Session, text string) {

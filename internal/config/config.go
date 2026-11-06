@@ -261,6 +261,14 @@ type App struct {
 	Ansi int `json:"-"`
 }
 
+// Resolved restores what JSON does not carry: the resolved color is derived again from the color's
+// name, which does travel. A declaration that went through a handover passes here, otherwise it would
+// no longer equal the file's and the app would think it has to restart.
+func (s App) Resolved() App {
+	s.Ansi = ansiByName[s.Color]
+	return s
+}
+
 // Tokens replaced in the command and the environment at start: through them an app learns where to
 // listen, without anyone having a port to write.
 const (

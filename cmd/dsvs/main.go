@@ -74,6 +74,14 @@ func main() {
 // private network, then the session. headless leaves it without a terminal, for the clients that attach
 // to it; otherwise the logs stream onto this one.
 func serve(headless bool, s *shape, names []string) error {
+	// An inherited manifest says a running session is being taken over: its box, its private network
+	// and its apps are already there, and none of it is set up again. If it is unreadable, there is
+	// nothing to take over: exit, and the cgroup takes the apps away rather than leaving them with
+	// nobody.
+	taken, err := taking()
+	if err != nil {
+		return err
+	}
 	// Three situations: this is the supervisor, already in its private network; this tries to open it,
 	// and everything then plays out in the re-executed binary; or this does without it, keeping why.
 	ctl, inside := os.LookupEnv(netns.CtlEnv)
@@ -85,11 +93,15 @@ func serve(headless bool, s *shape, names []string) error {
 	}
 	fallback := ""
 	switch {
+	case taken != nil:
+		// The gatekeeper still waits for this PID, and the network is set up: only the reason for doing
+		// without it is taken over, so that the network's card keeps telling the same story.
+		fallback = taken.Fallback
 	case inside:
 	case s.net == "loopback":
 		fallback = "asked for by hand"
 	default:
-		code, err := netns.Gate()
+		code, err := netns.Gate(os.Getenv(boxEnv) == inBox)
 		switch {
 		case err == nil && code != netns.Unreachable:
 			os.Exit(code)
@@ -99,7 +111,7 @@ func serve(headless bool, s *shape, names []string) error {
 			fallback = cause(err).Error()
 		}
 	}
-	return run(s, headless, ctl, fallback, names)
+	return run(s, headless, ctl, fallback, names, taken)
 }
 
 // hold holds the status bar icon. Only one at a time, and the socket says so: taking it fails when
@@ -395,7 +407,7 @@ func die(err error) {
 	os.Exit(1)
 }
 
-func run(s *shape, headless bool, ctl, fallback string, names []string) error {
+func run(s *shape, headless bool, ctl, fallback string, names []string, taken *core.Handover) error {
 	path, err := resolve(s.config)
 	if err != nil {
 		return err
@@ -409,7 +421,7 @@ func run(s *shape, headless bool, ctl, fallback string, names []string) error {
 	// start — otherwise it would only have a silent wait.
 	var attachers *attach.Server
 	if headless {
-		server, err := attach.Bind(path)
+		server, err := bind(path, taken)
 		if errors.Is(err, hub.ErrTaken) {
 			return nil // another session already serves this configuration: nothing to do, and nothing to say
 		}
@@ -434,8 +446,12 @@ func run(s *shape, headless bool, ctl, fallback string, names []string) error {
 	if err != nil {
 		return failed(fmt.Errorf("%s: %w", cfg.Path, err))
 	}
+	if taken != nil {
+		// A handover starts nothing: what was running keeps running, and what was stopped stays stopped.
+		names = nil
+	}
 
-	network, err := join(cfg, ctl, fallback)
+	network, err := join(cfg, ctl, fallback, taken)
 	if err != nil {
 		// The gatekeeper waits for this code to fall back on loopback: only it can still do so.
 		fmt.Fprintln(os.Stderr, err)
@@ -450,6 +466,16 @@ func run(s *shape, headless bool, ctl, fallback string, names []string) error {
 	session := core.NewSession(cfg, network, front, func(s *core.Session) core.Gateway {
 		return gateway.NewProxy(cfg.Port, s, s.Sink())
 	})
+	session.SetRenewal(renewal(session, attachers, network))
+
+	// The apps of the handover become this session's own again before the proxy opens: those that
+	// answered still answer, and no request hits a 502 for the time of a probe. Failing the adoption
+	// is the only case where exiting is preferred: apps nobody supervises any more cannot be recovered.
+	if taken != nil {
+		if err := session.Adopt(*taken); err != nil {
+			return failed(fmt.Errorf("handover: %w", err))
+		}
+	}
 
 	// A session without a box does not have the cgroup guarantee: a brutal stop can leave orphans.
 	// That is said, with the reason.
@@ -606,14 +632,27 @@ func printConfig(s *shape) error {
 	return err
 }
 
-// join returns the network of the apps: the private network for the supervisor, loopback otherwise.
-func join(cfg config.Config, ctl, fallback string) (core.Network, error) {
+// join returns the network of the apps: the private network for the supervisor, loopback otherwise. A
+// handover does not set it up, it finds it again: it lives in the kernel, not in the process.
+func join(cfg config.Config, ctl, fallback string, taken *core.Handover) (core.Network, error) {
 	if ctl == "" {
 		return core.Loopback{Reason: fallback}, nil
+	}
+	if taken != nil {
+		return netns.Rejoin(ctl, cfg.Prefix(), taken.IPs)
 	}
 	names := make([]string, 0, len(cfg.Apps))
 	for _, app := range cfg.Apps {
 		names = append(names, app.Name)
 	}
 	return netns.Join(ctl, names, cfg.Prefix())
+}
+
+// bind opens the session's socket, or takes over the one a handover carried across: it never stopped
+// accepting, so no client finds the place empty and starts a second one.
+func bind(path string, taken *core.Handover) (*attach.Server, error) {
+	if taken != nil {
+		return attach.Adopt(path, taken.Listen, taken.Lock)
+	}
+	return attach.Bind(path)
 }

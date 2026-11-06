@@ -61,7 +61,8 @@ type Server struct {
 	watching []*watched
 }
 
-// watched is an attached interface and the socket used to talk to it.
+// watched is an attached interface and the socket used to talk to it: that is where a handover tells
+// it to reattach.
 type watched struct {
 	Interface
 	conn *net.UnixConn
@@ -77,10 +78,34 @@ func Bind(config string) (*Server, error) {
 	return accept(sock), nil
 }
 
+// Adopt takes back the socket a handover carried across the exec: it never stopped accepting, and the
+// interfaces that were attached to it reattach.
+func Adopt(config string, listen, lock int) (*Server, error) {
+	sock, err := hub.Adopt(socket(config), listen, lock)
+	if err != nil {
+		return nil, err
+	}
+	return accept(sock), nil
+}
+
 func accept(sock *hub.Socket) *Server {
 	s := &Server{sock: sock, settled: make(chan struct{})}
 	go s.welcome()
 	return s
+}
+
+// Fds returns the descriptors of the socket and its lock, to carry across a handover's exec.
+func (s *Server) Fds() (listen, lock int, err error) { return s.sock.Fds() }
+
+// Reloading tells the attached interfaces that the session is moving to the binary on disk: their
+// socket is about to close in the exec, and this word tells them to reattach instead of exiting with
+// an error.
+func (s *Server) Reloading() {
+	s.seen.Lock()
+	defer s.seen.Unlock()
+	for _, seen := range s.watching {
+		fmt.Fprintln(seen.conn, reloading)
+	}
 }
 
 // Ready hands over the session to serve: those who were waiting see their interface open. ctx is the
@@ -330,6 +355,10 @@ func (s *Server) orders(conn *net.UnixConn, resize func(cols, rows int), leave f
 				// Reread the configuration, without restarting anything. What a saved file already
 				// triggers on its own, for the imports no watched path covers.
 				_ = s.session.Reload()
+			case verb == "renew":
+				// Move to the binary on disk without letting go of the apps. A refusal is read in the
+				// session's log, where the gesture happened.
+				_ = s.session.Renew()
 			case verb == "quit":
 				// Close everything: the session stops, and the attached interfaces watch it do so.
 				s.stop()

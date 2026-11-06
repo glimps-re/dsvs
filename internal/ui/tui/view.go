@@ -950,6 +950,7 @@ func helpLines(leaving string) []string {
 		{"/ c", "filters the log · clears it"},
 		{"o", "opens the url in the browser"},
 		{"R", "rereads the configuration, which saving already rereads"},
+		{"u", "takes the binary on disk, keeping the apps"},
 		{"!", "a shell in the network of the apps"},
 		{"q", "asks how to leave, on “" + leaving + "” — except in the console"},
 	}

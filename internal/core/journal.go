@@ -614,3 +614,16 @@ func decodeRune(s string) (rune, int) {
 	}
 	return []rune(s[:size])[0], size
 }
+
+// Dump returns the log as a terminal would have written it: its rendered lines, separated by line
+// breaks. Write eats it back, so a log is replayed through the path that normally writes it. The
+// lines' timestamps, however, do not cross over: a replayed log is dated from its replay.
+func (j *Journal) Dump() string {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	texts := make([]string, 0, len(j.lines))
+	for _, l := range j.lines {
+		texts = append(texts, j.render(l))
+	}
+	return strings.Join(texts, "\r\n")
+}
