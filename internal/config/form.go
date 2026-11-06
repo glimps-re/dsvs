@@ -19,6 +19,9 @@ type Form struct {
 	Fields []Field `json:"fields"`
 	// Errors are the form's errors that no field carries.
 	Errors []string `json:"errors,omitzero"`
+	// Notices are what the form says without refusing anything, and that no shown field carries: a
+	// build that depends on a hidden field.
+	Notices []string `json:"notices"`
 }
 
 // Field is a field of the form, as the rules made it for this evaluation. A dotted name
@@ -30,7 +33,10 @@ type Field struct {
 	// Choices are the current ones; a flag always has its own, a text or a number has some only through
 	// a rule.
 	Choices []string `json:"choices,omitzero"`
-	Value   string   `json:"value"`
+	// DisabledChoices are the choices that cannot be taken here, each with its reason, empty when the
+	// rule gives none: they stay in sight, and the value never takes them.
+	DisabledChoices map[string]string `json:"disabledChoices,omitzero"`
+	Value           string            `json:"value"`
 	// From says where the value comes from: asked, network, session, kept or default.
 	From      string   `json:"from"`
 	Hidden    bool     `json:"hidden,omitzero"`
@@ -69,10 +75,40 @@ func (f Field) Yields() string {
 	return fmt.Sprintf("%s=%s no longer holds (%s): %s=%s until it does", f.Name, f.Yielded.Value, strings.Join(f.Yielded.Errors, "; "), f.Name, f.Value)
 }
 
-// Next returns the choice after the value, wrapping around: the panel's and the TUI's gesture on a
-// flag or a choice.
+// Next returns the choice after the value, wrapping around, skipping the disabled ones: the panel's
+// and the TUI's gesture on a flag or a choice.
 func (f Field) Next() string {
-	return f.Choices[(slices.Index(f.Choices, f.Value)+1)%len(f.Choices)]
+	at := slices.Index(f.Choices, f.Value)
+	for step := 1; step < len(f.Choices); step++ {
+		if next := f.Choices[(at+step)%len(f.Choices)]; f.Unavailable(next) == "" {
+			return next
+		}
+	}
+	return f.Value
+}
+
+// Unavailable says that one of the field's choices is disabled here, and why; nothing when it can be
+// chosen.
+func (f Field) Unavailable(choice string) string {
+	why, off := f.DisabledChoices[choice]
+	switch {
+	case !off:
+		return ""
+	case why == "":
+		return choice + " is disabled here"
+	}
+	return choice + " is disabled here: " + why
+}
+
+// Unavailables says, in the order of the choices, each of those disabled here.
+func (f Field) Unavailables() []string {
+	var said []string
+	for _, choice := range f.Choices {
+		if off := f.Unavailable(choice); off != "" {
+			said = append(said, off)
+		}
+	}
+	return said
 }
 
 // Group returns the group the field lives in, and its name within that group: api.deployment is
@@ -135,6 +171,8 @@ func (f Form) Accept(asked map[string]string) error {
 			return fmt.Errorf("%s is read-only here", name)
 		case field.Choices != nil && !slices.Contains(field.Choices, value):
 			return fmt.Errorf("%s: %q is not one of %s", name, value, strings.Join(field.Choices, ", "))
+		case field.Unavailable(value) != "":
+			return fmt.Errorf("%s: %s", name, field.Unavailable(value))
 		case field.From != "asked" && field.Type == "number":
 			return fmt.Errorf("%s: %q is not a number", name, value)
 		case field.From != "asked" || field.Value != value:
@@ -159,6 +197,12 @@ func (f Form) Problems() []string {
 		}
 	}
 	return append(out, f.Errors...)
+}
+
+// Said returns everything the form says without refusing: each value that yields, then its notices.
+// It is what the log tells when things start.
+func (f Form) Said() []string {
+	return append(f.Yields(), f.Notices...)
 }
 
 // Yields returns the sentence of each field whose kept intention no longer holds, in the model's
@@ -255,6 +299,16 @@ func (f Form) validate() []string {
 		if field.Choices != nil && !slices.Contains(field.Choices, field.Value) {
 			fail("%s: value %q is not one of %s", field.Name, field.Value, strings.Join(field.Choices, ", "))
 		}
+		for choice, why := range field.DisabledChoices {
+			switch {
+			case !slices.Contains(field.Choices, choice):
+				fail("%s: disabled choice %q is not one of %s", field.Name, choice, strings.Join(field.Choices, ", "))
+			case choice == field.Value:
+				fail("%s: value %q is disabled", field.Name, choice)
+			case strings.ContainsAny(why, "\r\n"):
+				fail("%s: %q holds a line break", field.Name, why)
+			}
+		}
 		if _, err := strconv.ParseFloat(field.Value, 64); field.Type == "number" && err != nil {
 			fail("%s: value %q is not a number", field.Name, field.Value)
 		}
@@ -274,9 +328,9 @@ func (f Form) validate() []string {
 			}
 		}
 	}
-	for _, text := range f.Errors {
+	for _, text := range append(slices.Clone(f.Errors), f.Notices...) {
 		if strings.ContainsAny(text, "\r\n") {
-			fail("form error %q holds a line break", text)
+			fail("form message %q holds a line break", text)
 		}
 	}
 	return problems
