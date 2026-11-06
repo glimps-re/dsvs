@@ -530,7 +530,7 @@ func demoNet(t *testing.T, isolated bool) Model {
 		// A group names the apps it starts, and nothing else: a facade does not start.
 		Groups: []config.Group{{Name: "beta", Members: []string{"front", "storybook"}}},
 	}
-	session := core.NewSession(cfg, heldNet{held, isolated}, ownPort{}, func(*core.Session) core.Gateway { return upGateway{} })
+	session := core.NewSession(config.Form{}, cfg, heldNet{held, isolated}, ownPort{}, func(*core.Session) core.Gateway { return upGateway{} })
 	ctx, cancel := context.WithCancel(context.Background())
 	stopped := make(chan struct{})
 	go func() {
@@ -1054,11 +1054,11 @@ func TestDriftShowsInTheList(t *testing.T) {
 		}
 	}
 	declare("first")
-	cfg, err := config.Load(path, nil)
+	form, cfg, err := config.Load(path, nil, config.Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := core.NewSession(cfg, heldNet{held, false}, ownPort{}, func(*core.Session) core.Gateway { return upGateway{} })
+	session := core.NewSession(form, *cfg, heldNet{held, false}, ownPort{}, func(*core.Session) core.Gateway { return upGateway{} })
 	ctx, cancel := context.WithCancel(context.Background())
 	stopped := make(chan struct{})
 	go func() {

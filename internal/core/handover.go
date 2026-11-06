@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"time"
 
@@ -18,9 +20,8 @@ const HandoverVersion = 1
 
 // Handover is what a session passes to its re-executed image: what nothing else says on the other
 // side. What the kernel already holds — the processes, the terminals, the private network's
-// addresses, the windows' size — only appears there as a descriptor number, or not at all: the
-// configuration is reread from argv, and the logs travel as text, as a terminal would have written
-// them.
+// addresses, the windows' size — only appears there as a descriptor number, or not at all, and the
+// logs travel as text, as a terminal would have written them.
 type Handover struct {
 	Version int `json:"version"`
 	// Listen and Lock are the session's attach socket and the lock that gives it its name. They
@@ -36,6 +37,26 @@ type Handover struct {
 	Log      string        `json:"log"`
 	Apps     []AppState    `json:"apps,omitempty"`
 	Facades  []FacadeState `json:"facades,omitempty"`
+	// Params are the session's intents: the new image replays the configuration with them, and the
+	// file does not say them. A default is never among them: it is resolved again on the other
+	// side.
+	Params map[string]string `json:"params,omitempty"`
+	// Answer is the response that built the configuration in force. The new image starts again from
+	// it without evaluating anything, then replays the file as after a save: a binary that refuses
+	// the file therefore keeps the configuration in force and says so, instead of losing the
+	// session. Missing from a handover coming from an older binary, the new image evaluates the
+	// file to start.
+	Answer json.RawMessage `json:"answer,omitempty"`
+}
+
+// Load returns what an image opens on: the configuration in force on the other side of the
+// handover, as its response says it, without evaluating anything; failing that — no handover, or a
+// handover from an older binary —, the one the file builds.
+func (h *Handover) Load(path string, watch []string, in config.Input) (config.Form, *config.Config, error) {
+	if h == nil || h.Answer == nil {
+		return config.Load(path, watch, in)
+	}
+	return config.Answered(path, watch, in, h.Answer)
 }
 
 // AppState is what an app carries: its log, what its runs gave, and its current run if there is
@@ -104,7 +125,11 @@ func (s *Session) refused(err error) error {
 // if the exec fails, and the descriptors it names are still its own — it is up to the caller to
 // clear their FD_CLOEXEC, right before leaving.
 func (s *Session) Export() (Handover, error) {
-	out := Handover{Version: HandoverVersion, Fallback: s.net.Mode().Reason, Log: s.Log.Dump()}
+	s.mu.RLock()
+	intents := maps.Clone(s.intents)
+	s.mu.RUnlock()
+	out := Handover{Version: HandoverVersion, Fallback: s.net.Mode().Reason, Log: s.Log.Dump(), Params: intents,
+		Answer: s.Config().Answer}
 	for _, in := range s.Facades() {
 		out.Facades = append(out.Facades, FacadeState{Name: in.Cfg.Name, Log: in.Log.Dump()})
 	}
@@ -120,14 +145,20 @@ func (s *Session) Export() (Handover, error) {
 
 // Adopt takes back a handover's state: the apps that were running become this session's again, with
 // their process, their terminal and their address, and the logs are replayed through the path that
-// normally writes them. To be called before Run, which then puts each supervisor to work in the run
-// it just found again. Failing here is fatal to the session: live apps nobody supervises anymore
-// cannot be caught again, and it is better for the cgroup to take them down.
+// normally writes them. The session, opened on the configuration in force on the other side
+// (Handover.Load), then replays the file as after a save: it is this binary that says whether it
+// applies it, and a refusal keeps the configuration in force. To be called before Run, which then
+// puts each supervisor to work in the run it just found again. Failing here is fatal to the
+// session: live apps nobody supervises anymore cannot be caught again, and it is better for the
+// cgroup to take them down.
 func (s *Session) Adopt(taken Handover) error {
 	if taken.Version != HandoverVersion {
 		return fmt.Errorf("handover format %d, not %d", taken.Version, HandoverVersion)
 	}
 	s.Log.Write([]byte(taken.Log))
+	s.mu.Lock()
+	maps.Copy(s.intents, taken.Params)
+	s.mu.Unlock()
 	for _, facade := range taken.Facades {
 		if in := s.facade(facade.Name); in != nil {
 			in.Log.Write([]byte(facade.Log))
@@ -144,6 +175,7 @@ func (s *Session) Adopt(taken Handover) error {
 			return err
 		}
 	}
+	_ = s.replay() // a refusal is told in the log and in the status, and the session serves anyway
 	return nil
 }
 

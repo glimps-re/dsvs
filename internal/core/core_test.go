@@ -107,7 +107,7 @@ func TestThePortIsTakenForTheWholeSession(t *testing.T) {
 func TestThePortIsReleasedWhenTheSessionEnds(t *testing.T) {
 	t.Parallel()
 	cfg, spy := fixture(t, sleeper)
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
+	session := NewSession(config.Form{}, cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := session.Open(ctx); err != nil {
 		t.Fatal(err)
@@ -145,7 +145,7 @@ func TestABusyPortStopsEverything(t *testing.T) {
 	t.Parallel()
 	cfg, spy := fixture(t, sleeper)
 	spy.fail(errors.New("address already in use"))
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
+	session := NewSession(config.Form{}, cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
 
 	if err := session.Open(context.Background()); err == nil {
 		t.Fatal("the session opened on a busy port")
@@ -279,7 +279,7 @@ func fixture(t *testing.T, command []string) (config.Config, *spyGateway) {
 func start(t *testing.T, command []string) (*Session, *App, *spyGateway) {
 	t.Helper()
 	cfg, spy := fixture(t, command)
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
+	session := NewSession(config.Form{}, cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return spy })
 
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := session.Open(ctx); err != nil {
@@ -638,7 +638,7 @@ func TestBackendLivesWithTheRun(t *testing.T) {
 
 	app.Stop()
 	waitFor(t, "the backend withdrawn", func() bool { return session.Backend("app") == nil })
-	if session.Backend("unknown") != nil {
+	if session.Backend("inconnu") != nil {
 		t.Error("an app that does not exist should not have a backend")
 	}
 }
@@ -667,7 +667,7 @@ func TestReadinessAsksForARealAnswer(t *testing.T) {
 		Ingresses: []config.Ingress{config.NewIngress(config.Ingress{Host: "localhost", Routes: []config.Route{{Path: "/app", App: "app"}}})},
 		Apps:      []config.App{declared},
 	}
-	session := NewSession(cfg, network, ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	session := NewSession(config.Form{}, cfg, network, ownPort{}, func(*Session) Gateway { return &spyGateway{} })
 	ctx, cancel := context.WithCancel(context.Background())
 	stopped := make(chan struct{})
 	go func() { defer close(stopped); session.Run(ctx, []string{"app"}) }()
@@ -712,11 +712,11 @@ func TestReloadReplacesWhatIsDeclarative(t *testing.T) {
 		}
 	}
 	declare("https://first.example", "")
-	cfg, err := config.Load(path, nil)
+	form, cfg, err := config.Load(path, nil, config.Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
 	kept := session.Facades()[0]
 	kept.Log.Add("a trace from before")
 
@@ -762,11 +762,11 @@ func TestSavingReloads(t *testing.T) {
 		}
 	}
 	declare("https://first.example")
-	cfg, err := config.Load(path, nil)
+	form, cfg, err := config.Load(path, nil, config.Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go session.watch(ctx)
@@ -842,12 +842,12 @@ export default {
 		}
 	}
 	declare("https://first.example")
-	cfg, err := config.Load(path, nil)
+	form, cfg, err := config.Load(path, nil, config.Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	cfg.Port, cfg.ForcedPort = 4300, 4300
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
 	if got := joinLines(session.Log.Lines()); !strings.Contains(got, "targets recomputed") {
 		t.Errorf("what the script said at load should be readable in the log:\n%s", got)
 	}
@@ -902,11 +902,11 @@ func TestChangedPortIsKeptAndSaidOnce(t *testing.T) {
 		}
 	}
 	declare("4300")
-	cfg, err := config.Load(path, nil)
+	form, cfg, err := config.Load(path, nil, config.Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
 
 	declare("4400")
 	if err := session.Reload(); err != nil {
@@ -942,11 +942,11 @@ func TestBadReloadChangesNothing(t *testing.T) {
 }`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := config.Load(path, nil)
+	form, cfg, err := config.Load(path, nil, config.Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
 
 	if err := os.WriteFile(path, []byte(`export default { port: 4300, ingress: [], apps: [] }`), 0o644); err != nil {
 		t.Fatal(err)
@@ -1029,11 +1029,11 @@ func TestAppsFollowTheDeclaration(t *testing.T) {
 	}
 
 	declare("app:first")
-	cfg, err := config.Load(path, nil)
+	form, cfg, err := config.Load(path, nil, config.Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
 	supervising(t, session)
 	app := session.App("app")
 	app.Start()
@@ -1164,11 +1164,11 @@ func TestSavingAConfigWithoutTheSuffixReloads(t *testing.T) {
 		}
 	}
 	declare("https://first.example")
-	cfg, err := config.Load(path, nil)
+	form, cfg, err := config.Load(path, nil, config.Input{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	session := NewSession(cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
+	session := NewSession(form, *cfg, heldNet(t), ownPort{}, func(*Session) Gateway { return &spyGateway{} })
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go session.watch(ctx)
