@@ -33,7 +33,7 @@ import (
 const downloading = 5 * time.Minute
 
 // InstallBeta puts dsvs-beta beside this binary, at the newest version of the beta channel, then
-// writes its unit and starts its service: a second icon, amber, comes up next to this one. It
+// writes its unit and starts its service: a second icon, violet, comes up next to this one. It
 // returns what the beta said once installed.
 func InstallBeta(step func(string)) (string, error) {
 	exe, err := os.Executable()

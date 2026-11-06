@@ -28,7 +28,7 @@
 // never a type — and the shape carries it, the color only repeats it, because a font can miss a glyph
 // and a theme can swallow a hue.
 //
-// The header says which binary the panel comes from; a branch binary adds the amber square of its
+// The header says which binary the panel comes from; a branch binary adds the violet square of its
 // icon, and the working dsvs carries none.
 //
 // # The gestures
@@ -37,11 +37,11 @@
 // lists them. With no session running, only quitting dsvs is left: there is nothing to stop, and
 // quitting would otherwise be unreachable.
 //
-// The beta adds one, on a row of its own under the others: dsvs offers to install it once one is
-// out and none is beside it, next to the amber square of the icon it will bring, and the beta
-// offers to uninstall itself, as discreet as quitting. Only a published binary offers either: one
-// built from a clone follows its clone. Like the update, the gesture shows its steps while it works
-// and offers nothing to press again.
+// The beta adds one, on a row of its own under the others: dsvs offers to install it once one is out
+// and none is beside it, next to the violet square of the icon it will bring, and the beta offers to
+// uninstall itself, as discreet as quitting. Only a published binary offers either: one built from a
+// clone follows its clone. Like the update, the gesture shows its steps while it works and offers
+// nothing to press again.
 //
 // An app's gestures are pictograms in two fixed slots, which never move under the pointer; the state
 // column writes what the click would do. After an order, the app offers nothing until its session's
