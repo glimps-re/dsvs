@@ -93,12 +93,69 @@ type Input struct {
 // Observed is what the machine shows and nobody sets. nil: nothing observes it.
 type Observed struct {
 	Links []Link `json:"links"`
+	Exits []Exit `json:"exits"`
+}
+
+// String says the network in a word, for the log, the state and the interfaces: each interface once,
+// the ones traffic exits through first with their gateway, then the other links. Without an exit it is
+// offline, and the links still visible only qualify it: a bare eth0 used to read as a network.
+func (o *Observed) String() string {
+	if o == nil {
+		return "not observed"
+	}
+	shown := make([]string, 0, len(o.Exits)+len(o.Links))
+	named := map[string]bool{}
+	for _, exit := range o.Exits {
+		if named[exit.Dev] {
+			continue
+		}
+		named[exit.Dev] = true
+		shown = append(shown, exitLabel(exit))
+	}
+	for _, link := range o.Links {
+		if !named[link.Name] {
+			shown = append(shown, link.Name)
+		}
+	}
+	switch {
+	case len(o.Exits) > 0:
+		return strings.Join(shown, ", ")
+	case len(shown) > 0:
+		return "offline (" + strings.Join(shown, ", ") + ")"
+	}
+	return "offline"
+}
+
+// Network is what names this network for the values kept on it: the preferred exit, as String writes
+// it. Empty when nothing observes it or nothing exits — there is then no network to keep anything
+// for.
+func (o *Observed) Network() string {
+	if o == nil || len(o.Exits) == 0 {
+		return ""
+	}
+	return exitLabel(o.Exits[0])
+}
+
+// Exit is a default route: the gateway, empty for a route without one, and the interface.
+type Exit struct {
+	Via string `json:"via"`
+	Dev string `json:"dev"`
 }
 
 type Link struct {
 	Name  string   `json:"name"`
 	Type  string   `json:"type"`
 	Addrs []string `json:"addrs"`
+}
+
+// Pairs writes values the way set takes them, name=value, sorted by name: that is how the log and the
+// state quote them.
+func Pairs(values map[string]string) string {
+	shown := make([]string, 0, len(values))
+	for _, name := range slices.Sorted(maps.Keys(values)) {
+		shown = append(shown, name+"="+values[name])
+	}
+	return strings.Join(shown, " ")
 }
 
 const defaultSubnet = "10.77.0.0/24"
@@ -565,9 +622,12 @@ func (in Input) normalized() Input {
 		}
 	}
 	if in.Observed != nil {
-		seen := Observed{Links: slices.Clone(in.Observed.Links)}
+		seen := Observed{Links: slices.Clone(in.Observed.Links), Exits: slices.Clone(in.Observed.Exits)}
 		if seen.Links == nil {
 			seen.Links = []Link{}
+		}
+		if seen.Exits == nil {
+			seen.Exits = []Exit{}
 		}
 		for i := range seen.Links {
 			if seen.Links[i].Addrs == nil {
@@ -906,6 +966,17 @@ func (i Ingress) validateTarget(route Route, apps map[string]bool, fail func(str
 			fail("%s: target %q of %q has no host", i.Name, route.Proxy.URL, route.Path)
 		}
 	}
+}
+
+// exitLabel writes an exit: the interface, and the gateway when the route has one.
+func exitLabel(exit Exit) string {
+	switch {
+	case exit.Via == "":
+		return exit.Dev
+	case exit.Dev == "":
+		return "via " + exit.Via
+	}
+	return exit.Dev + " via " + exit.Via
 }
 
 // shaped says how a value does not have the shape t describes, in the configuration's words: a key t

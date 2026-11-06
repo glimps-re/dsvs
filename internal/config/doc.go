@@ -80,6 +80,11 @@
 // would lose the types without gaining autonomy, which only a static format truly gives — that is
 // what dsvs.json is there for.
 //
+// dsvs computing a network parameter itself from rules written in the configuration ("staging if
+// tun0 exists"): it would learn the domain's vocabulary. The schema receives the raw fact and derives
+// its rules from it; the human chooses, the machine informs. The engine knows only the vocabulary of
+// forms.
+//
 // Values on stdin or in argv, a program that returns only the Config while Go resolves the defaults,
 // two evaluations per replay (the declaration, then the build): the environment already carries
 // DSVS_CONFIG and reads from a shell with nothing to do, the default rule would be written twice, and
@@ -87,7 +92,7 @@
 //
 // Values written in the configuration, or a values file it would read: that is state that outlives
 // the session, and that is what the configuration does not have to carry. What outlives it is kept
-// beside it, for the project, where the form says.
+// beside it, for the project or per network, where the form says.
 //
 // A static export of the parameters (export const params), beside config(): two ways of saying the
 // same thing, forever. The shim refuses the old one and says what replaces it.
