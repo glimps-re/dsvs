@@ -27,7 +27,7 @@ const (
 func Name() string {
 	exe, err := os.Executable()
 	if err != nil {
-		return "dsvs"
+		return Stable
 	}
 	return filepath.Base(exe)
 }

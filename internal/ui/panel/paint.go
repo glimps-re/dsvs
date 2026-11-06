@@ -5,46 +5,71 @@ import (
 	"image"
 	"image/color"
 	"image/draw"
+	"math"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"golang.org/x/image/font"
 	"golang.org/x/image/math/fixed"
+	"golang.org/x/image/vector"
 
 	"dsvs/internal/attach"
 	"dsvs/internal/build"
+	"dsvs/internal/config"
 )
 
 // The panel's measures, in pixels. A single column, fixed-height rows: what decides the size is the
 // number of apps.
 const (
-	width      = 420
-	pad        = 12
-	rowHeight  = 24
-	headerRow  = 26
-	titleRow   = 30
-	actionRow  = 30
-	facadeRow  = 20
-	ruleRow    = 12
-	buttonPadX = 7
-	statusX    = pad + 130
+	width        = 420
+	pad          = 16
+	bleed        = 8
+	headerRow    = 36
+	titleRow     = 34
+	rowHeight    = 28
+	errorRow     = 18
+	facadeRow    = 24
+	actionRow    = 40
+	ruleRow      = 17
+	newsRow      = 22
+	buttonHeight = 24
+	buttonPadX   = 10
+	buttonGap    = 6
+	glyphX       = 24
+	nameX        = 38
+	statusX      = 190
 )
 
+// The palette. Every text/background or glyph/background pair it allows has its contrast measured by
+// a test.
 var (
-	ground = color.RGBA{0x1c, 0x1d, 0x22, 0xff}
-	ink    = color.RGBA{0xe8, 0xe8, 0xec, 0xff}
-	faint  = color.RGBA{0x8b, 0x8d, 0x98, 0xff}
-	rule   = color.RGBA{0x2e, 0x30, 0x38, 0xff}
-	key    = color.RGBA{0x33, 0x36, 0x40, 0xff}
-	keyLit = color.RGBA{0x46, 0x4a, 0x59, 0xff}
-	rowLit = color.RGBA{0x28, 0x2a, 0x33, 0xff}
-	ready  = color.RGBA{0x6f, 0xc2, 0x76, 0xff}
-	waking = color.RGBA{0xe0, 0xb3, 0x4a, 0xff}
-	broken = color.RGBA{0xe0, 0x6c, 0x6c, 0xff}
-	asleep = color.RGBA{0x5c, 0x5f, 0x6b, 0xff}
+	ground     = rgb(0x1c1d22)
+	rule       = rgb(0x2e3038)
+	rowLit     = rgb(0x2a2c35)
+	key        = rgb(0x3b3e49)
+	keyLit     = rgb(0x4a4e5e)
+	keyDown    = rgb(0x2a2c34)
+	ink        = rgb(0xe8e8ec)
+	faint      = rgb(0x9a9dab)
+	subdued    = rgb(0xaeb1bd)
+	brokenText = rgb(0xef8a8a)
+	accent     = rgb(0x3566c8)
+	accentLit  = rgb(0x3d6fd6)
+	accentDown = rgb(0x2d58ae)
+	white      = rgb(0xffffff)
+	ready      = rgb(0x6fc276)
+	waking     = rgb(0xe0b34a)
+	broken     = rgb(0xe06c6c)
+	asleep     = rgb(0x7c7f8c)
+	branch     = rgb(0xb9a3ff)
 )
+
+func rgb(hex uint32) color.RGBA {
+	return color.RGBA{uint8(hex >> 16), uint8(hex >> 8), uint8(hex), 0xff}
+}
 
 // deed is what a click triggers. Zones carry them; the window executes them. Those that are session
 // orders carry the verb the session understands: there is nothing to translate between the click and
@@ -70,8 +95,10 @@ const (
 	stopEverything deed = "stop everything"
 	quitDsvs       deed = "quit dsvs"
 
-	// browse opens a facade in the default browser.
+	// browse opens a facade in the default browser, unfold unfolds the project whose summary alone is
+	// shown.
 	browse deed = "browse"
+	unfold deed = "unfold"
 
 	// look searches for a new version of the binary, renew takes it.
 	look  deed = "look"
@@ -90,8 +117,13 @@ type project struct {
 	live   *attach.State
 	failed string
 	// waking says its session is coming up: there is then nothing to click on its row, and that is
-	// what the row says.
+	// what the row says. It only goes with a cold project: the session coming up has no state yet.
 	waking bool
+	// pending says, per app with an order on its way, until when it waits: it offers nothing to click
+	// before its session's next state, otherwise a second click, which would change meaning with the
+	// state, would do the opposite of what one expects. The wait ends even if the order changes
+	// nothing.
+	pending map[string]time.Time
 }
 
 // renewal is what the panel knows of the update. Three states and not one more: it is working and
@@ -103,6 +135,9 @@ type renewal struct {
 	said  string
 	// to is the version found, and only means something under found.
 	to string
+	// failed says said is the reason for a failure, and only means something under idle: failure sets
+	// it.
+	failed bool
 	// beta is the gesture offered on the beta outside of work, and betaOut the beta installBeta takes.
 	beta    deed
 	betaOut string
@@ -118,6 +153,9 @@ const (
 	idle
 )
 
+// failure is the update that did not succeed: its reason reads as an error, and one can search again.
+func failure(err error) renewal { return renewal{stage: idle, said: err.Error(), failed: true} }
+
 // doing is the update at work: it says where it stands, and there is nothing to click while it is.
 func doing(said string) renewal { return renewal{stage: working, said: said} }
 
@@ -130,48 +168,97 @@ type zone struct {
 	name   string
 }
 
-// faces are the panel's two fonts: the text, and the titles.
+// faces are the panel's fonts: the text, the titles, the discreet labels, and the fixed pitch of the
+// ports.
 type faces struct {
-	text font.Face
-	bold font.Face
+	text  font.Face
+	bold  font.Face
+	small font.Face
+	mono  font.Face
+}
+
+// view is how the panel is being looked at: where the pointer is, outside the image when it is
+// elsewhere, which zone it started pressing, the empty zone when none is, what height the screen
+// leaves, and the project chosen to unfold when not everything fits.
+type view struct {
+	at       image.Point
+	pressed  zone
+	room     int
+	unfolded string
 }
 
 // paint draws the sessions and returns the image to push, the zones to click, and the app rows as it
-// laid them out. at is the pointer: what is under it lights up, so that one sees what one is about to
-// click — and the drawing says where its rows are, so the window does not have to redo its geometry to
-// know when the hover changed. Nothing X11 here.
-func paint(projects []project, news renewal, with faces, now time.Time, at image.Point) (*image.RGBA, []zone, []image.Rectangle) {
-	p := &painter{with: with, now: now, at: at}
-	p.stretch(pad + headerRow + actionRow + pad)
+// laid them out. What is under the pointer lights up, so that one sees what one is about to click —
+// and the drawing says where its rows are, so the window does not have to redo its geometry to know
+// when the hover changed. Nothing X11 here.
+func paint(projects []project, news renewal, with faces, now time.Time, seen view) (*image.RGBA, []zone, []image.Rectangle) {
+	p := compose(projects, news, with, now, seen, "")
+	if p.y > seen.room {
+		p = compose(projects, news, with, now, seen, kept(projects, seen.unfolded))
+	}
+	return p.cropped(), p.zones, p.rows
+}
 
-	p.reserve(pad)
+// compose lays out the whole panel, except the running projects that kept does not name: folded into
+// a one-line summary. Without kept, nothing is folded.
+func compose(projects []project, news renewal, with faces, now time.Time, seen view, kept string) *painter {
+	p := &painter{view: seen, with: with, now: now}
+	p.stretch(headerRow + 2*ruleRow + actionRow)
+
 	p.header()
+	p.line()
 	if len(projects) == 0 {
-		p.write(pad, p.reserve(rowHeight)+15, "no project yet", with.text, faint)
+		top := p.reserve(56)
+		p.write(pad, top+22, "No project yet", with.bold, faint)
+		p.write(pad, top+42, "Run "+build.Name()+" in a folder with a "+config.Names[0]+".", with.text, faint)
 	}
 	named := labels(projects)
 	for i, one := range projects {
 		if i > 0 {
 			p.line()
 		}
+		if one.live != nil && kept != "" && one.config != kept {
+			p.summary(one, named[one.config])
+			continue
+		}
 		p.project(one, named[one.config])
 	}
 	p.line()
 	p.global(projects, news)
-	p.reserve(pad)
-	return p.cropped(), p.zones, p.rows
+	p.reserve(4)
+	return p
+}
+
+// kept is the project that stays unfolded when not everything fits: the chosen one if it is still
+// running, otherwise the first one with a fallen app, failing that the first one starting, failing
+// that the first one running. A cold project already fits on one line, it does not enter the choice.
+func kept(projects []project, chosen string) string {
+	living := slices.DeleteFunc(slices.Clone(projects), func(one project) bool { return one.live == nil })
+	if slices.ContainsFunc(living, func(one project) bool { return one.config == chosen }) {
+		return chosen
+	}
+	for _, wanted := range []glyph{cross, half} {
+		for _, one := range living {
+			if slices.ContainsFunc(one.live.Apps, func(app attach.App) bool { shape, _ := form(app); return shape == wanted }) {
+				return one.config
+			}
+		}
+	}
+	if len(living) > 0 {
+		return living[0].config
+	}
+	return ""
 }
 
 // painter carries the drawing in progress: the canvas, the line being written, and the zones already
 // laid out.
 type painter struct {
+	view
 	canvas *image.RGBA
 	with   faces
 	now    time.Time
-	// at is the pointer, outside the image when it is elsewhere.
-	at    image.Point
-	y     int
-	zones []zone
+	y      int
+	zones  []zone
 	// rows are the app rows, in the order they are painted: they are what hover lights up, and the
 	// window uses them to know when it changed row.
 	rows []image.Rectangle
@@ -212,106 +299,169 @@ func (p *painter) cropped() *image.RGBA {
 // see.
 func (p *painter) header() {
 	top := p.reserve(headerRow)
-	p.write(pad, top+16, build.Label(), p.with.bold, faint)
-	box := image.Rect(width-pad-18, top+3, width-pad, top+21)
-	if p.at.In(box) {
-		draw.Draw(p.canvas, box, image.NewUniform(keyLit), image.Point{}, draw.Src)
+	labelX := pad
+	if build.Name() != build.Stable {
+		p.round(image.Rect(pad, top+13, pad+10, top+23), 2, branch)
+		labelX += 16
 	}
-	p.cross(box.Inset(5), ink)
-	p.zones = append(p.zones, zone{at: box, do: dismiss})
-}
-
-// cross draws the close cross with strokes: nothing to ask of a font, which might not have the
-// glyph.
-func (p *painter) cross(inner image.Rectangle, tint color.Color) {
-	side := min(inner.Dx(), inner.Dy())
-	for i := range side {
-		for thick := range 2 {
-			p.canvas.Set(inner.Min.X+i+thick, inner.Min.Y+i, tint)
-			p.canvas.Set(inner.Min.X+side-1-i+thick, inner.Min.Y+i, tint)
-		}
-	}
+	p.write(labelX, top+22, build.Label(), p.with.small, faint)
+	close := zone{at: image.Rect(width-pad-buttonHeight, top+6, width-pad, top+6+buttonHeight), do: dismiss}
+	p.round(close.at, 4, p.tone(close, ground, keyLit, keyDown))
+	p.pictogram(dismiss, close.at.Min.X+buttonHeight/2, close.at.Min.Y+buttonHeight/2, ink)
+	p.zones = append(p.zones, close)
 }
 
 // project writes a project: its title, what of it runs, and what can be done to it. Cold, there is
 // only its path and a way to start it — that is what remains of a project between two sessions.
 func (p *painter) project(one project, named string) {
 	top := p.reserve(titleRow)
-	right := "not running"
-	if one.live != nil {
-		right = ":" + strconv.Itoa(one.live.Port)
+	cold := one.live == nil
+	nameTint, right := ink, width-pad
+	switch {
+	case one.waking:
+		nameTint, right = faint, right-p.widthOf(starting, p.with.text)
+		p.write(right, top+22, starting, p.with.text, faint)
+		right -= 8
+	case cold:
+		// Cold, both gestures move up to the title line: a sleeping project fits on one line.
+		nameTint = faint
+		right = p.button(top+6, right, "forget", forget, one.config, "")
+		right = p.button(top+6, right, "start", open, one.config, "")
+	default:
+		port := ":" + strconv.Itoa(one.live.Port)
+		right -= p.widthOf(port, p.with.mono)
+		p.write(right, top+22, port, p.with.mono, faint)
+		right -= 8
 	}
-	at := width - pad - p.widthOf(right, p.with.text)
-	p.write(pad, top+15, p.fitting(named, at-8-pad, p.with.bold), p.with.bold, ink)
-	p.write(at, top+15, right, p.with.text, faint)
+	p.write(pad, top+22, p.fitting(named, right-pad-8, p.with.bold), p.with.bold, nameTint)
 
 	// A failure reason comes from elsewhere and has no promised length: it takes the lines it needs
 	// rather than ending in an ellipsis, the panel having no height decided in advance.
-	for _, line := range wrapped(one.failed, width-2*pad-18, func(text string) int { return p.widthOf(text, p.with.text) }) {
-		p.write(pad+18, p.reserve(rowHeight)+16, line, p.with.text, broken)
-	}
-	if one.live != nil {
-		for _, app := range one.live.Apps {
-			p.app(one.config, app)
+	lines := wrapped(one.failed, width-pad-nameX, func(text string) int { return p.widthOf(text, p.with.text) })
+	for i, line := range lines {
+		at := p.reserve(errorRow)
+		if i == 0 {
+			p.mark(glyphX, at+errorRow/2, cross, broken)
 		}
-		p.facades(one.config, one.live.Facades, one.live.Port)
+		p.write(nameX, at+14, line, p.with.text, brokenText)
 	}
+	if len(lines) > 0 {
+		p.reserve(6)
+	}
+	if cold {
+		p.reserve(4)
+		return
+	}
+	p.stale(one.live.NotApplied)
+	for _, app := range one.live.Apps {
+		p.app(one, app)
+	}
+	p.facades(one.config, one.live.Facades, one.live.Port)
 	p.actions(one)
 }
+
+// stale writes, on one line and under a status cross, why the session keeps the previous
+// configuration. It is elided, unlike the other reasons: the details are in the log and in dsvs
+// state, and the line only says there is something to read there.
+func (p *painter) stale(why string) {
+	if why == "" {
+		return
+	}
+	at := p.reserve(errorRow)
+	p.mark(glyphX, at+errorRow/2, cross, broken)
+	p.write(nameX, at+14, p.fitting(notApplied+": "+why, width-pad-nameX, p.with.text), p.with.text, brokenText)
+	p.reserve(6)
+}
+
+// summary writes a folded project: its name, how many apps are in each state — each count behind its
+// shape — its port, and nothing else. A click unfolds it. A failure's reason reads by unfolding, and
+// a lone cross, without a count, says there is one.
+func (p *painter) summary(one project, named string) {
+	top := p.reserve(titleRow)
+	z := zone{at: image.Rect(bleed, top+2, width-bleed, top+titleRow-2), do: unfold, config: one.config}
+	p.round(z.at, 4, p.tone(z, ground, rowLit, keyDown))
+	p.zones = append(p.zones, z)
+	p.pictogram(unfold, pad+4, top+17, faint)
+
+	port := ":" + strconv.Itoa(one.live.Port)
+	x := width - pad - p.widthOf(port, p.with.mono)
+	p.write(x, top+22, port, p.with.mono, faint)
+	x -= 14
+	if one.failed != "" || one.live.NotApplied != "" {
+		x -= 7
+		p.mark(x, top+17, cross, broken)
+		x -= 7 + 14
+	}
+
+	counts, tints := map[glyph]int{}, map[glyph]color.Color{}
+	for _, app := range one.live.Apps {
+		shape, tint := form(app)
+		counts[shape]++
+		tints[shape] = tint
+	}
+	for _, shape := range []glyph{ring, filled, half, cross} {
+		if counts[shape] == 0 {
+			continue
+		}
+		count := strconv.Itoa(counts[shape])
+		x -= p.widthOf(count, p.with.mono)
+		p.write(x, top+22, count, p.with.mono, faint)
+		x -= 10
+		p.mark(x, top+17, shape, tints[shape])
+		x -= 14
+	}
+	p.write(pad+16, top+22, p.fitting(named, x-pad-16-8, p.with.bold), p.with.bold, ink)
+}
+
+// facadePadX is the breathing room around a host: it is what gives its zone something to be clicked.
+const facadePadX = 6
 
 // facades writes the hosts this session serves, one by one and clickable: they are the links one
 // opens, and a host cut in the middle can be neither read nor typed. So they wrap to the next line
 // rather than being elided, like the failure reason above — the panel has no height set in advance.
 // Only a host too long for a whole line ends in an ellipsis.
 func (p *painter) facades(config string, facades []attach.Facade, port int) {
-	const left = pad + 18
+	const left = nameX - facadePadX
 	right := width - pad
 	// x at the right edge: the first host wraps there, and with no facade no line is taken.
 	top, x := 0, right
 	for _, facade := range facades {
-		host := p.fitting(facade.Host, right-left-2*buttonPadX, p.with.text)
-		wide := p.widthOf(host, p.with.text) + 2*buttonPadX
+		host := p.fitting(facade.Host, right-left-facadePadX*2, p.with.text)
+		wide := p.widthOf(host, p.with.text) + 2*facadePadX
 		if x+wide > right {
 			top, x = p.reserve(facadeRow), left
 		}
-		box := image.Rect(x, top+1, x+wide, top+facadeRow-1)
+		z := zone{at: image.Rect(x, top, x+wide, top+facadeRow), do: browse, config: config, name: url(facade.Host, port)}
 		tint := faint
-		if p.at.In(box) {
-			draw.Draw(p.canvas, box, image.NewUniform(keyLit), image.Point{}, draw.Src)
+		if p.at.In(z.at) {
 			tint = ink
 		}
-		p.write(x+buttonPadX, top+14, host, p.with.text, tint)
-		draw.Draw(p.canvas, image.Rect(x+buttonPadX, top+16, box.Max.X-buttonPadX, top+17),
+		p.round(z.at.Inset(1), 4, p.tone(z, ground, keyLit, keyDown))
+		p.write(x+facadePadX, top+17, host, p.with.text, tint)
+		draw.Draw(p.canvas, image.Rect(x+facadePadX, top+19, z.at.Max.X-facadePadX, top+20),
 			image.NewUniform(tint), image.Point{}, draw.Src)
-		p.zones = append(p.zones, zone{at: box, do: browse, config: config, name: url(facade.Host, port)})
-		x = box.Max.X
+		p.zones = append(p.zones, z)
+		x = z.at.Max.X + 2
 	}
 }
 
-// app writes an app row: its shape, its name, what it is doing, and the buttons that drive it. The
-// shape says the state without depending on a glyph a font might lack.
-func (p *painter) app(config string, app attach.App) {
+// notApplied opens the line of a configuration the session does not apply.
+const notApplied = "not applied"
+
+// app writes an app row: its shape, its name, what it is doing, and two fixed slots for the
+// pictograms that drive it — the first starts or stops, the second restarts, empty for a stopped app.
+// A pictogram therefore never moves under the pointer. The shape says the state without depending on
+// a glyph a font might lack.
+func (p *painter) app(one project, app attach.App) {
 	top := p.reserve(rowHeight)
-	row := image.Rect(pad-4, top, width-pad+4, top+rowHeight)
+	row := image.Rect(bleed, top, width-bleed, top+rowHeight)
 	p.rows = append(p.rows, row)
-	if p.at.In(row) {
-		draw.Draw(p.canvas, row, image.NewUniform(rowLit), image.Point{}, draw.Src)
+	lit := p.at.In(row)
+	if lit {
+		p.round(image.Rect(row.Min.X, row.Min.Y+1, row.Max.X, row.Max.Y-1), 4, rowLit)
 	}
 	shape, tint := form(app)
-	p.mark(pad+7, top+rowHeight/2, shape, tint)
-	// The name stops before the state column, which is at the same height: two texts on one row share
-	// the width, they do not overlap.
-	p.write(pad+18, top+16, p.fitting(app.Name, statusX-8-pad-18, p.with.text), p.with.text, ink)
-
-	// The buttons first: what can be done depends on what the app is doing, and they decide the room
-	// left to the text — otherwise it would run under them.
-	right := width - pad
-	if app.Status == "idle" {
-		right = p.button(top, right, "start", start, config, app.Name)
-	} else {
-		right = p.button(top, right, "restart", restart, config, app.Name)
-		right = p.button(top, right, "stop", stop, config, app.Name)
-	}
+	p.mark(glyphX, top+rowHeight/2, shape, tint)
 
 	// What the shape already says is not written again: a ready app only has to say since when.
 	said := app.Status
@@ -323,29 +473,64 @@ func (p *painter) app(config string, app attach.App) {
 	case app.Status == "ready" && !app.Since.IsZero():
 		said = age(p.now.Sub(app.Since))
 	}
-	p.write(statusX, top+16, p.fitting(said, right-8-statusX, p.with.text), p.with.text, faint)
+	saidTint := faint
+	if shape == cross {
+		saidTint = brokenText
+	}
+
+	second := image.Rect(width-pad-buttonHeight, top+2, width-pad, top+2+buttonHeight)
+	first := second.Sub(image.Pt(buttonHeight+4, 0))
+	slots := []struct {
+		box image.Rectangle
+		do  deed
+	}{{first, start}}
+	if app.Status != "idle" {
+		slots = []struct {
+			box image.Rectangle
+			do  deed
+		}{{first, stop}, {second, restart}}
+	}
+	waiting := one.pending[app.Name].After(p.now)
+	restFill, restTint := ground, faint
+	if lit {
+		restFill, restTint = key, ink
+	}
+	for _, slot := range slots {
+		centerX, centerY := slot.box.Min.X+buttonHeight/2, slot.box.Min.Y+buttonHeight/2
+		if waiting {
+			p.pictogram(slot.do, centerX, centerY, asleep)
+			continue
+		}
+		// The zone covers the row's full height: the pictogram looks small, and clicks large.
+		z := zone{at: image.Rect(slot.box.Min.X-2, top, slot.box.Max.X+2, top+rowHeight),
+			do: slot.do, config: one.config, name: app.Name}
+		p.round(slot.box, 4, p.tone(z, restFill, keyLit, keyDown))
+		p.pictogram(slot.do, centerX, centerY, restTint)
+		p.zones = append(p.zones, z)
+		if p.at.In(z.at) {
+			said, saidTint = string(slot.do), ink // the state column says what the click will do
+		}
+	}
+	if waiting {
+		said, saidTint = "…", faint
+	}
+
+	// The name stops before the state column, which is at the same height: two texts on one row share
+	// the width, they do not overlap.
+	p.write(nameX, top+19, p.fitting(app.Name, statusX-8-nameX, p.with.text), p.with.text, ink)
+	p.write(statusX, top+19, p.fitting(said, first.Min.X-8-statusX, p.with.text), p.with.text, saidTint)
 }
 
 // starting is what the row of a project whose session is coming up says: there is no button anymore,
 // hence no second click possible, and the wait shows.
 const starting = "starting…"
 
-// actions writes a project's two gestures — stop its apps, or forget it: two intents, two buttons —
-// and the way to its interface. Cold, there is nothing to stop: starting takes its place. A project
-// whose session is coming up offers nothing at all: waking and forgetting are incompatible on the same
-// row, and forgetting would take away the one where the link was about to show.
+// actions writes a session's two gestures — stop its apps, or forget it: two intents, two buttons —
+// and the way to its interface. A cold project has none: it has nothing to stop, and its gestures are
+// on its title line.
 func (p *painter) actions(one project) {
-	top := p.reserve(actionRow)
-	right := width - pad
-	if one.waking {
-		p.write(right-p.widthOf(starting, p.with.text), top+16, starting, p.with.text, faint)
-		return
-	}
-	right = p.button(top, right, "forget", forget, one.config, "")
-	if one.live == nil {
-		p.button(top, right, "start", open, one.config, "")
-		return
-	}
+	top := p.reserve(actionRow) + (actionRow-buttonHeight)/2
+	right := p.button(top, width-pad, "forget", forget, one.config, "")
 	right = p.button(top, right, "stop apps", closeAll, one.config, "")
 	label := "open the TUI"
 	if watching(*one.live) {
@@ -356,11 +541,18 @@ func (p *painter) actions(one project) {
 
 // global writes the two gestures that apply to everything: stop the apps of every project, or go away
 // — icon included. Two distinct intents, hence never the same button.
+//
+// The beta's gesture takes a row of its own below them, and the beta offered comes with the violet
+// square of the icon it will bring.
 func (p *painter) global(projects []project, news renewal) {
-	for _, line := range wrapped(news.said, width-2*pad, func(text string) int { return p.widthOf(text, p.with.text) }) {
-		p.write(pad, p.reserve(rowHeight)+16, line, p.with.text, faint)
+	newsTint := faint
+	if news.failed {
+		newsTint = brokenText
 	}
-	top := p.reserve(actionRow)
+	for _, line := range wrapped(news.said, width-2*pad, func(text string) int { return p.widthOf(text, p.with.text) }) {
+		p.write(pad, p.reserve(newsRow)+15, line, p.with.text, newsTint)
+	}
+	top := p.reserve(actionRow) + (actionRow-buttonHeight)/2
 	right := width - pad
 	right = p.button(top, right, "quit "+build.Name(), quitDsvs, "", "")
 	for _, one := range projects {
@@ -378,28 +570,48 @@ func (p *painter) global(projects []project, news renewal) {
 	if news.stage == working || news.beta == nothing {
 		return
 	}
-	top = p.reserve(actionRow)
+	top = p.reserve(actionRow) + (actionRow-buttonHeight)/2
 	left := p.button(top, width-pad, string(news.beta), news.beta, "", "")
 	if news.beta == installBeta {
-		p.write(pad, top+16, p.fitting(news.betaOut+" is out", left-pad, p.with.text), p.with.text, faint)
+		p.round(image.Rect(pad, top+7, pad+10, top+17), 2, branch)
+		p.write(pad+16, top+17, p.fitting(build.Beta+" "+news.betaOut+" is out", left-pad-16, p.with.text), p.with.text, faint)
 	}
 }
 
-// button lays a button whose right edge is at right, and returns the left edge: buttons thus follow
-// one another from right to left, without any of them having to know its neighbors' width. It never
-// leaves the panel: the margin bounds its left edge, and its label is elided on the box that remains —
-// a label that comes from elsewhere, like a version found, has no promised length.
+// button lays a button whose top edge is at top and right edge at right, and returns the left edge of
+// the next one. Its look depends only on the gesture it carries: primary for the update, discreet for
+// those that forget or quit, the same everywhere else: buttons thus follow one another from right to
+// left, without any of them having to know its neighbors' width. It never leaves the panel: the
+// margin bounds its left edge, and its label is elided on the box that remains — a label that comes
+// from elsewhere, like a version found, has no promised length.
 func (p *painter) button(top, right int, label string, do deed, config, name string) int {
-	text := p.widthOf(label, p.with.text)
-	box := image.Rect(max(pad, right-text-2*buttonPadX), top+3, right, top+rowHeight-3)
-	fill := key
-	if p.at.In(box) {
-		fill = keyLit
+	labelWidth := p.widthOf(label, p.with.text)
+	z := zone{at: image.Rect(max(pad, right-labelWidth-2*buttonPadX), top, right, top+buttonHeight), do: do, config: config, name: name}
+	rest, lit, down, text := key, keyLit, keyDown, ink
+	switch do {
+	case renew:
+		rest, lit, down, text = accent, accentLit, accentDown, white
+	case forget, quitDsvs, removeBeta:
+		if !p.at.In(z.at) {
+			text = subdued
+		}
 	}
-	draw.Draw(p.canvas, box, image.NewUniform(fill), image.Point{}, draw.Src)
-	p.write(box.Min.X+buttonPadX, top+16, p.fitting(label, box.Dx()-2*buttonPadX, p.with.text), p.with.text, ink)
-	p.zones = append(p.zones, zone{at: box, do: do, config: config, name: name})
-	return box.Min.X - 6
+	p.round(z.at, 4, p.tone(z, rest, lit, down))
+	p.write(z.at.Min.X+buttonPadX, top+17, p.fitting(label, z.at.Dx()-2*buttonPadX, p.with.text), p.with.text, text)
+	p.zones = append(p.zones, z)
+	return z.at.Min.X - buttonGap
+}
+
+// tone is a control's background: pressed while the gesture started here is held here, lit under the
+// pointer, at rest otherwise. Dragged elsewhere, the background comes back.
+func (p *painter) tone(z zone, rest, lit, down color.RGBA) color.RGBA {
+	switch {
+	case !p.at.In(z.at):
+		return rest
+	case p.pressed == z:
+		return down
+	}
+	return lit
 }
 
 // line separates two sessions.
@@ -462,26 +674,158 @@ func wrapped(text string, room int, widthOf func(string) int) []string {
 
 // mark draws a state's shape: a filled disc, a ring, a half disc or a cross.
 func (p *painter) mark(cx, cy int, shape glyph, tint color.Color) {
-	const r = 5
-	for dy := -r; dy <= r; dy++ {
-		for dx := -r; dx <= r; dx++ {
-			d := dx*dx + dy*dy
-			paint := false
-			switch shape {
-			case filled:
-				paint = d <= r*r
-			case ring:
-				paint = d <= r*r && d >= (r-2)*(r-2)
-			case half:
-				paint = d <= r*r && (dx <= 0 || d >= (r-2)*(r-2))
-			case cross:
-				paint = abs(dx-dy) <= 1 || abs(dx+dy) <= 1
-			}
-			if paint {
-				p.canvas.Set(cx+dx, cy+dy, tint)
-			}
+	const r = 5.5
+	x, y := float32(cx), float32(cy)
+	p.fill(image.Rect(cx-7, cy-7, cx+7, cy+7), tint, func(n pen) {
+		switch shape {
+		case filled:
+			n.circle(x, y, r, solid)
+		case half:
+			n.wedge(x, y, r, math.Pi/2, 3*math.Pi/2)
+			fallthrough
+		case ring:
+			n.circle(x, y, r, solid)
+			n.circle(x, y, r-1.75, hollow)
+		case cross:
+			n.stroke(x-4.2, y-4.2, x+4.2, y+4.2, 2)
+			n.stroke(x-4.2, y+4.2, x+4.2, y-4.2, 2)
 		}
+	})
+}
+
+// pictogram draws what a gesture does: a triangle to start, a square to stop, an arrowed ring to
+// restart, a cross to close, a chevron to unfold. A drawn shape, not a font glyph — which the font
+// might lack.
+func (p *painter) pictogram(do deed, cx, cy int, tint color.Color) {
+	x, y := float32(cx), float32(cy)
+	p.fill(image.Rect(cx-8, cy-8, cx+8, cy+8), tint, func(n pen) {
+		switch do {
+		case start:
+			n.polygon(x-3, y-5, x+5, y, x-3, y+5)
+		case stop:
+			n.roundBox(image.Rect(cx-4, cy-4, cx+4, cy+4), 1)
+		case restart:
+			n.loop(x, y)
+		case dismiss:
+			n.stroke(x-4.5, y-4.5, x+4.5, y+4.5, 1.6)
+			n.stroke(x-4.5, y+4.5, x+4.5, y-4.5, 1.6)
+		case unfold:
+			n.polygon(x-2, y-4, x+2.5, y, x-2, y+4)
+		}
+	})
+}
+
+// round fills a box with rounded corners.
+func (p *painter) round(box image.Rectangle, radius float32, tint color.Color) {
+	p.fill(box, tint, func(n pen) { n.roundBox(box, radius) })
+}
+
+// fill paints into this box the outlines the drawing traces, anti-aliased. The raster is only the
+// size of the box: a rasterizer over the whole canvas would reset on every shape.
+func (p *painter) fill(box image.Rectangle, tint color.Color, trace func(pen)) {
+	z := vector.NewRasterizer(box.Dx(), box.Dy())
+	trace(pen{z: z, dx: float32(box.Min.X), dy: float32(box.Min.Y)})
+	z.Draw(p.canvas, box, image.NewUniform(tint), image.Point{})
+}
+
+// pen traces outlines in canvas coordinates into a box's raster. Outlines fill by winding: a circle
+// traced backwards makes a hole in the one around it.
+type pen struct {
+	z      *vector.Rasterizer
+	dx, dy float32
+}
+
+// solid and hollow are a circle's direction: filled, or carved out of what surrounds it.
+const (
+	solid  = 1
+	hollow = -1
+)
+
+// kappa approximates a quarter circle with a cubic Bezier curve.
+const kappa = 0.5523
+
+func (n pen) move(x, y float32) { n.z.MoveTo(x-n.dx, y-n.dy) }
+
+func (n pen) line(x, y float32) { n.z.LineTo(x-n.dx, y-n.dy) }
+
+func (n pen) curve(x1, y1, x2, y2, x, y float32) {
+	n.z.CubeTo(x1-n.dx, y1-n.dy, x2-n.dx, y2-n.dy, x-n.dx, y-n.dy)
+}
+
+func (n pen) polygon(points ...float32) {
+	n.move(points[0], points[1])
+	for i := 2; i < len(points); i += 2 {
+		n.line(points[i], points[i+1])
 	}
+	n.z.ClosePath()
+}
+
+func (n pen) roundBox(box image.Rectangle, radius float32) {
+	x0, y0, x1, y1 := float32(box.Min.X), float32(box.Min.Y), float32(box.Max.X), float32(box.Max.Y)
+	c := radius * (1 - kappa)
+	n.move(x0+radius, y0)
+	n.line(x1-radius, y0)
+	n.curve(x1-c, y0, x1, y0+c, x1, y0+radius)
+	n.line(x1, y1-radius)
+	n.curve(x1, y1-c, x1-c, y1, x1-radius, y1)
+	n.line(x0+radius, y1)
+	n.curve(x0+c, y1, x0, y1-c, x0, y1-radius)
+	n.line(x0, y0+radius)
+	n.curve(x0, y0+c, x0+c, y0, x0+radius, y0)
+	n.z.ClosePath()
+}
+
+func (n pen) circle(cx, cy, r, turn float32) {
+	n.move(cx+r, cy)
+	n.curve(cx+r, cy+turn*r*kappa, cx+r*kappa, cy+turn*r, cx, cy+turn*r)
+	n.curve(cx-r*kappa, cy+turn*r, cx-r, cy+turn*r*kappa, cx-r, cy)
+	n.curve(cx-r, cy-turn*r*kappa, cx-r*kappa, cy-turn*r, cx, cy-turn*r)
+	n.curve(cx+r*kappa, cy-turn*r, cx+r, cy-turn*r*kappa, cx+r, cy)
+	n.z.ClosePath()
+}
+
+// wedge is a sector of a disc, from one angle to the other, clockwise on screen.
+func (n pen) wedge(cx, cy, r float32, from, to float64) {
+	const steps = 24
+	n.move(cx, cy)
+	for i := range steps + 1 {
+		angle := from + (to-from)*float64(i)/steps
+		n.line(cx+r*float32(math.Cos(angle)), cy+r*float32(math.Sin(angle)))
+	}
+	n.z.ClosePath()
+}
+
+// stroke is a thick line, traced as a quadrilateral.
+func (n pen) stroke(x0, y0, x1, y1, thickness float32) {
+	dx, dy := x1-x0, y1-y0
+	length := float32(math.Hypot(float64(dx), float64(dy)))
+	nx, ny := -dy/length*thickness/2, dx/length*thickness/2
+	n.polygon(x0+nx, y0+ny, x1+nx, y1+ny, x1-nx, y1-ny, x0-nx, y0-ny)
+}
+
+// loop is the restart's arrowed ring: a ring open towards noon, whose tip turns clockwise.
+func (n pen) loop(cx, cy float32) {
+	const r, thickness, steps = 5.0, 1.7, 32
+	from, to := -math.Pi/2+0.95, 3*math.Pi/2-0.2
+	at := func(i int, radius float32) (float32, float32) {
+		angle := from + (to-from)*float64(i)/steps
+		return cx + radius*float32(math.Cos(angle)), cy + radius*float32(math.Sin(angle))
+	}
+	n.move(at(0, r))
+	for i := 1; i <= steps; i++ {
+		n.line(at(i, r))
+	}
+	for i := steps; i >= 0; i-- {
+		n.line(at(i, r-thickness))
+	}
+	n.z.ClosePath()
+
+	tipX, tipY := at(steps, r-thickness/2)
+	tangentX, tangentY := float32(-math.Sin(to)), float32(math.Cos(to))
+	normalX, normalY := float32(math.Cos(to)), float32(math.Sin(to))
+	n.polygon(tipX+tangentX*3.4, tipY+tangentY*3.4,
+		tipX-tangentX*0.6+normalX*3, tipY-tangentY*0.6+normalY*3,
+		tipX-tangentX*0.6-normalX*3, tipY-tangentY*0.6-normalY*3)
 }
 
 type glyph int
@@ -572,11 +916,4 @@ func age(d time.Duration) string {
 	default:
 		return fmt.Sprintf("%dh%02d", int(d.Hours()), int(d.Minutes())%60)
 	}
-}
-
-func abs(n int) int {
-	if n < 0 {
-		return -n
-	}
-	return n
 }
