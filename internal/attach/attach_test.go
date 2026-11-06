@@ -511,6 +511,47 @@ func TestSetRefusesWhatTheConfigurationDoesNotTake(t *testing.T) {
 	}
 }
 
+// draft is the interfaces' gesture: the choice that requires another field is kept, where set refuses
+// it, and the form waits for the field that completes it.
+func TestADraftKeepsWhatSetRefuses(t *testing.T) {
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	path := filepath.Join(t.TempDir(), "config.dsvs.ts")
+	body := `import { config, form, required } from "dsvs";
+export default config(form({ api: ["local", "staging"], client: "" }, (p) => {
+  required(p.client, { when: ({ valueOf }) => valueOf(p.api) === "staging", message: "staging needs a test account" });
+}), () => ({
+  port: 4399,
+  ingress: [{ host: "shop.localhost", routes: [{ path: "/", app: "sleeper" }] }],
+  apps: [{ name: "sleeper", command: ["sh", "-c", "sleep 30", "{port}"] }],
+}));`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	form, cfg, err := config.Load(path, nil, config.Input{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := supervised(t, form, *cfg)
+	server := bind(t, path)
+	ctx, stop := context.WithCancel(context.Background())
+	t.Cleanup(stop)
+	server.Ready(ctx, session, stop)
+
+	if err := Set(path, map[string]string{"api": "staging"}); err == nil {
+		t.Fatal("set api=staging should be refused: the account is missing")
+	}
+	if err := Draft(path, map[string]string{"api": "staging"}); err != nil {
+		t.Fatal(err)
+	}
+	if field, _ := session.Form().Field("api"); field.Value != "staging" || session.NotApplied() != "client: staging needs a test account" {
+		t.Errorf("api = %q, not applied = %q; want staging, waiting for the account", field.Value, session.NotApplied())
+	}
+	if err := Draft(path, map[string]string{"client": "jane"}); err != nil || session.NotApplied() != "" {
+		t.Errorf("draft client=jane = %v, not applied = %q; want everything applied", err, session.NotApplied())
+	}
+}
+
 // An order asked as a question gets its answer: nothing when the session took it, its reason when it
 // refuses it — a name it does not know, whatever the verb.
 func TestAnOrderAnswersWhatTheSessionMadeOfIt(t *testing.T) {

@@ -38,9 +38,12 @@
 // file's fault. No rule writes: the graph has no effect, a circular dependency is an error that names
 // its fields, and one evaluation by replay is enough.
 //
-// Accept is the only guard of writes: a value a field does not take, or that would leave the form
-// invalid, changes nothing. Keeping and Following say, on the form being applied, what to keep and
-// where. A gesture never yields: memory yields to it, when the gesture contradicts it.
+// Takes and Accept are the only guards of writes. A value a field does not take changes
+// nothing. A command-line gesture is a submission: Accept also refuses what would leave the form
+// invalid. The panel's and the TUI's fill a form: Takes keeps a value its field takes even while the
+// form still awaits the field that completes it, and nothing applies until then. Keeping and
+// Following say, on the form being applied, what to keep and where. A gesture never yields: memory
+// yields to it, when the gesture contradicts it.
 //
 // # What replays the configuration is a program
 //

@@ -35,14 +35,16 @@
 // replay hands it those intents, what the project keeps for itself and for the observed network,
 // and what a gesture asks for, and the configuration engine derives the values from them. Coming
 // back to a network therefore brings back its values without an extra replay. Only a gesture
-// writes: the session's intents, as soon as the form accepts them, then, once the configuration is
-// applied, what the form that built it keeps, for the project and for the network that evaluated
-// it. A value the network brings back becomes, once applied, the session's intent: on a network
-// that kept nothing for its field, the value in force stays, not a choice made elsewhere before it.
-// An evaluation that fails, or that yields an invalid form, keeps the configuration in force, and
-// the session says why (NotApplied) — it is the only one to say it, and the panel, the TUI and the
-// status read it there — until the evaluation that applies the file again, whether it is a save, a
-// gesture or a network, and which the log tells.
+// writes: the session's intents, as soon as the form accepts them — a Set requires it to be valid,
+// a Draft lets it wait for the field that completes it —, then, once the configuration is applied,
+// what the form that built it keeps, for the project and for the network that evaluated it. A draft
+// therefore keeps nothing as long as it does not apply. A value the network brings back becomes,
+// once applied, the session's intent: on a network that kept nothing for its field, the value in
+// force stays, not a choice made elsewhere before it. An evaluation that fails, or that yields an
+// invalid form, keeps the configuration in force, and the session says why (NotApplied) — it is the
+// only one to say it, and the panel, the TUI and the status read it there — until the evaluation
+// that applies the file again, whether it is a save, a gesture or a network, and which the log
+// tells.
 //
 // # The handover, and what Pdeathsig costs it
 //

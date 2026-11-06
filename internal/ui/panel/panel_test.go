@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -19,6 +20,7 @@ import (
 	"github.com/jezek/xgb/xproto"
 
 	"dsvs/internal/attach"
+	"dsvs/internal/config"
 	"dsvs/internal/projects"
 )
 
@@ -230,6 +232,499 @@ func demo(t *testing.T) ([]project, faces) {
 	return shown, with
 }
 
+// parametrized is the panel of a shop's front: two flags, the server its API comes from — a short
+// select — the catalog the local API serves — a select of five values — and the network the machine
+// observes, the office's.
+func parametrized(t *testing.T) ([]project, faces) {
+	t.Helper()
+	with, err := load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := attach.State{
+		Config: "/one/dsvs.json", Port: 4300,
+		Apps: []attach.App{{Name: "front", Status: "ready", Ready: true}},
+		Params: []config.Field{
+			{Name: "slowApi", Type: "flag", Choices: []string{"false", "true"}, Value: "true"},
+			{Name: "verbose proxy", Type: "flag", Choices: []string{"false", "true"}, Value: "false"},
+			{Name: "api", Type: "choice", Choices: []string{"local", "staging", "demo"}, Value: "local"},
+			{Name: "catalog", Type: "choice", Choices: []string{"empty", "small", "full", "black-friday-2026", "broken-images"},
+				Value: "black-friday-2026"},
+		},
+		Observed: &config.Observed{Links: []config.Link{{Name: "tun0", Type: "tun"}, {Name: "wlan0", Type: "wlan"}},
+			Exits: []config.Exit{{Via: "198.51.100.2", Dev: "wlan0"}}},
+	}
+	return []project{{config: state.Config, live: &state}}, with
+}
+
+// A hidden field is not drawn, a disabled field is inert, whatever its type, and an imposed value
+// reads without offering anything to click: only what a gesture can set has a zone.
+func TestOnlyWhatAGestureCanSetOffersAZone(t *testing.T) {
+	shown, with := parametrized(t)
+	shown[0].live = withState(shown[0].live, func(s *attach.State) { s.Params = inert })
+	canvas, zones, _ := paint(shown, looking, with, time.Now(), aside)
+	checkZones(t, canvas, zones)
+	named := map[string]bool{}
+	for _, z := range zones {
+		if z.do == choose || z.do == drop || z.do == edit {
+			named[z.name] = true
+		}
+	}
+	if want := map[string]bool{"api": true, "products": true, "branch": true}; !reflect.DeepEqual(named, want) {
+		t.Errorf("parameter zones %v, wanted %v", named, want)
+	}
+}
+
+// inert is a form carrying each state of a field: three are set by a gesture, a choice, a number and
+// a text.
+var inert = []config.Field{
+	{Name: "api", Type: "choice", Choices: []string{"local", "staging"}, Value: "staging"},
+	{Name: "deployed.version", Type: "choice", Choices: []string{"v2", "v3"}, Value: "v2", Hidden: true},
+	{Name: "deployed.traces", Type: "flag", Choices: []string{"false", "true"}, Value: "false", Disabled: true,
+		Reasons: []string{"traces are only reachable from the company network"}},
+	{Name: "deployed.retries", Type: "number", Value: "3", Disabled: true},
+	{Name: "deployed.token", Type: "text", Value: "t0k3n", Disabled: true, Reasons: []string{"set by the vault"}},
+	{Name: "locale", Type: "choice", Choices: []string{"en", "fr"}, Value: "en", Readonly: true},
+	{Name: "products", Type: "number", Value: "250", Min: bound(0), Max: bound(10000)},
+	{Name: "branch", Type: "text", Value: "main"},
+	{Name: "slowApi", Type: "flag", Choices: []string{"false", "true"}, Value: "false", Hidden: true},
+}
+
+func bound(value float64) *float64 { return &value }
+
+// A group is written under its title, and leaves with it when everything it contains is hidden.
+func TestAGroupIsTitledAndLeavesWithItsFields(t *testing.T) {
+	shown, with := parametrized(t)
+	height := func(fields ...config.Field) int {
+		shown[0].live = withState(shown[0].live, func(s *attach.State) { s.Params = fields })
+		canvas, zones, _ := paint(shown, looking, with, time.Now(), aside)
+		checkZones(t, canvas, zones)
+		return canvas.Bounds().Dy()
+	}
+	api := config.Field{Name: "api", Type: "choice", Choices: []string{"local", "staging"}, Value: "local"}
+	version := config.Field{Name: "deployed.version", Type: "choice", Choices: []string{"v2", "v3"}, Value: "v2"}
+	traces := config.Field{Name: "deployed.traces", Type: "flag", Choices: []string{"false", "true"}, Value: "false"}
+	alone := height(api)
+	if got := height(api, version, traces); got != alone+titleHeight+2*rowHeight {
+		t.Errorf("a group of two fields takes %d px, wanted its title and two rows (%d)", got-alone, titleHeight+2*rowHeight)
+	}
+	version.Hidden, traces.Hidden = true, true
+	if got := height(api, version, traces); got != alone {
+		t.Errorf("a fully hidden group leaves %d px", got-alone)
+	}
+}
+
+// A disabled field's reasons are written under it, with nothing of an error, like a kept value that
+// yields, in amber; a field error is written under the field, a form error under the block, in the
+// error color.
+func TestReasonsAndErrorsAreWrittenUnderWhatTheyConcern(t *testing.T) {
+	shown, with := parametrized(t)
+	drawn := func(change func(*attach.State)) *image.RGBA {
+		one := append([]project(nil), shown...)
+		one[0].live = withState(shown[0].live, change)
+		canvas, zones, _ := paint(one, looking, with, time.Now(), aside)
+		checkZones(t, canvas, zones)
+		return canvas
+	}
+	products := config.Field{Name: "products", Type: "number", Value: "250"}
+	calm := drawn(func(s *attach.State) { s.Params = []config.Field{products} })
+	if slices.Contains(colorsOf(calm), brokenText) {
+		t.Fatal("a valid form is written in the error color")
+	}
+
+	disabled := products
+	disabled.Disabled, disabled.Reasons = true, []string{"only the local api has a catalog"}
+	reasoned := drawn(func(s *attach.State) { s.Params = []config.Field{disabled} })
+	if got := reasoned.Bounds().Dy() - calm.Bounds().Dy(); got != errorRow+6 || slices.Contains(colorsOf(reasoned), brokenText) {
+		t.Errorf("a disabled field's reason takes %d px, wanted one line (%d) with nothing of an error", got, errorRow+6)
+	}
+
+	yielding := products
+	yielding.Yielded = &config.Yield{Value: "12000", From: "kept", Errors: []string{"at most 10000"}}
+	yielded := drawn(func(s *attach.State) { s.Params = []config.Field{yielding} })
+	if got := yielded.Bounds().Dy() - calm.Bounds().Dy(); got < errorRow+6 || !slices.Contains(colorsOf(yielded), waking) || slices.Contains(colorsOf(yielded), brokenText) {
+		t.Errorf("a kept value that yields takes %d px, wanted its lines (%d each) in amber, with nothing of an error", got, errorRow)
+	}
+
+	noticed := drawn(func(s *attach.State) {
+		s.Params, s.Notices = []config.Field{products}, []string{"remise is hidden, yet apps.api.env.REMISE depends on it"}
+	})
+	if noticed.Bounds().Dy() <= calm.Bounds().Dy() || !slices.Contains(colorsOf(noticed), waking) || slices.Contains(colorsOf(noticed), brokenText) {
+		t.Error("a form notice is not written under the block, in amber, with nothing of an error")
+	}
+
+	wrong := products
+	wrong.Errors = []string{"at most 10000"}
+	for what, change := range map[string]func(*attach.State){
+		"field": func(s *attach.State) { s.Params = []config.Field{wrong} },
+		"form":  func(s *attach.State) { s.Params, s.Errors = []config.Field{products}, []string{"demo has no fr build"} },
+	} {
+		if canvas := drawn(change); canvas.Bounds().Dy() != calm.Bounds().Dy()+errorRow+6 || !slices.Contains(colorsOf(canvas), brokenText) {
+			t.Errorf("a %s error is not written on its line, in the error color", what)
+		}
+	}
+}
+
+// A disabled option shows, greyed out, its reason under the field, and offers nothing to click: as
+// segments as in an unfolded list.
+func TestADisabledChoiceIsShownAndOffersNothing(t *testing.T) {
+	shown, with := parametrized(t)
+	api := config.Field{Name: "api", Type: "choice", Choices: []string{"local", "staging", "demo"}, Value: "local",
+		DisabledChoices: map[string]string{"staging": "staging needs the VPN"}}
+	long := api
+	long.Choices = []string{"local", "staging", "demo", "a-server-whose-name-does-not-fit-in-segments"}
+	for _, field := range []config.Field{api, long} {
+		one := append([]project(nil), shown...)
+		one[0].live = withState(shown[0].live, func(s *attach.State) { s.Params = []config.Field{field} })
+		seen := aside
+		seen.dropped = slot{one[0].config, "api"}
+		_, zones, _ := paint(one, looking, with, time.Now(), seen)
+		var offered []string
+		for _, z := range zones {
+			if z.do == choose && z.name == "api" {
+				offered = append(offered, z.value)
+			}
+		}
+		if slices.Contains(offered, "staging") || !slices.Contains(offered, "demo") {
+			t.Errorf("%d choices: the panel offers %q, wanted everything but staging", len(field.Choices), offered)
+		}
+	}
+}
+
+// azerty is a reduced keyboard table, as an X server returns it: the second column is Shift, the
+// fifth AltGr; a letter only has its lower case.
+var azerty = func() keyboard {
+	rows := map[xproto.Keycode][]xproto.Keysym{
+		9: {xkEscape}, 10: {'&', '1'}, 12: {'"', '3'}, 17: {'_', '8', 0, 0, '\\'}, 19: {0xe0, '0'},
+		22: {xkBackSpace}, 24: {'a'}, 36: {xkReturn}, 87: {xkKPEnd, 0xffb1}, 110: {xkHome}, 113: {xkLeft},
+		119: {xkDelete},
+	}
+	k := keyboard{first: 8, per: 6, syms: make([]xproto.Keysym, 6*248)}
+	for code, row := range rows {
+		copy(k.syms[(int(code)-8)*6:], row)
+	}
+	return k
+}()
+
+// A key writes what the current layout makes it write: Shift, Caps Lock for a letter, AltGr and Num
+// Lock decide.
+func TestAKeyWritesWhatTheLayoutSays(t *testing.T) {
+	const shift, lock, numLock, altGr = xproto.ModMaskShift, xproto.ModMaskLock, xproto.ModMask2, xproto.ModMask5
+	for _, c := range []struct {
+		code  xproto.Keycode
+		state uint16
+		want  rune
+	}{
+		{10, 0, '&'}, {10, shift, '1'}, {10, lock, '&'},
+		{24, 0, 'a'}, {24, shift, 'A'}, {24, lock, 'A'}, {24, shift | lock, 'a'},
+		{17, altGr, '\\'}, {87, numLock, '1'}, {87, 0, 0}, {200, 0, 0},
+	} {
+		if got := runeOf(azerty.symbol(c.code, c.state)); got != c.want {
+			t.Errorf("keycode %d under %#x writes %q, wanted %q", c.code, c.state, got, c.want)
+		}
+	}
+}
+
+// A click on a text or a number opens it for entry, on its value. What is typed is written at the
+// cursor, Enter sends the value to the session, and Escape or a click elsewhere abandon it without
+// sending anything; outside an entry, Escape closes the panel.
+func TestTypingSendsOnEnterAndNothingOtherwise(t *testing.T) {
+	shown, with := parametrized(t)
+	const one = "/one/dsvs.json"
+	var said []map[string]string
+	p := &panel{order: []string{one}, state: map[string]attach.State{one: *withState(shown[0].live, func(s *attach.State) { s.Params = inert })},
+		replaying: map[string]change{}, refused: map[string]string{}, replayed: make(chan replay, 4),
+		done: make(chan struct{}), failed: map[string]string{}, waking: map[string]bool{},
+		pending: map[string]map[string]time.Time{}, keys: azerty}
+	p.setting = func(_ string, values map[string]string) error {
+		said = append(said, values)
+		return nil
+	}
+	held, given := 0, 0
+	p.claim = func() (func(), bool) {
+		held++
+		return func() { given++ }, true
+	}
+	editing := func(name string) {
+		t.Helper()
+		canvas, zones, _ := paint(p.snapshot(), looking, with, time.Now(), p.view())
+		checkZones(t, canvas, zones)
+		for _, z := range zones {
+			if z.do == edit && z.name == name {
+				p.act(z)
+				return
+			}
+		}
+		t.Fatalf("%s offers no entry", name)
+	}
+	keys := func(strokes ...[2]int) {
+		for _, stroke := range strokes {
+			if !p.pressed(xproto.KeyPressEvent{Detail: xproto.Keycode(stroke[0]), State: uint16(stroke[1])}) {
+				t.Fatal("a key of the entry closed the panel")
+			}
+		}
+	}
+	backspace, enter, cancel, home, del := [2]int{22, 0}, [2]int{36, 0}, [2]int{9, 0}, [2]int{110, 0}, [2]int{119, 0}
+	three, zero := [2]int{12, xproto.ModMaskShift}, [2]int{19, xproto.ModMaskShift}
+
+	editing("products")
+	if got := string(p.typing.text); got != "250" || p.typing.at != 3 {
+		t.Fatalf("the entry opens on %q, cursor at %d, wanted 250 and the cursor at the end", got, p.typing.at)
+	}
+	canvas, zones, _ := paint(p.snapshot(), looking, with, time.Now(), p.view())
+	checkZones(t, canvas, zones)
+	for _, z := range zones {
+		if z.name == "products" {
+			t.Errorf("the entry in progress offers a zone %v", z.do)
+		}
+	}
+	keys(backspace, backspace, backspace, three, zero, zero, enter)
+	<-p.replayed
+	delete(p.replaying, one)
+	if want := []map[string]string{{"products": "300"}}; !reflect.DeepEqual(said, want) {
+		t.Errorf("the entry asked for %v, wanted %v", said, want)
+	}
+	if p.typing.name != "" {
+		t.Error("the entry stays open after Enter")
+	}
+
+	editing("branch")
+	keys(home, del, [2]int{24, xproto.ModMaskShift}, [2]int{10, 0})
+	if got := string(p.typing.text); got != "A&ain" {
+		t.Errorf("the entry at the start gives %q, wanted A&ain", got)
+	}
+	keys(cancel)
+	editing("branch")
+	keys([2]int{24, 0})
+	p.act(zone{do: drop, config: one, name: "api"})
+	if len(said) != 1 || p.typing.name != "" {
+		t.Errorf("Escape or a click elsewhere sent %v, or left the entry open", said[1:])
+	}
+	if p.pressed(xproto.KeyPressEvent{Detail: escape}) {
+		t.Error("outside an entry, Escape does not close the panel")
+	}
+	if held != 3 || given != 3 {
+		t.Errorf("three entries took the focus %d times and gave it back %d times, wanted 3 and 3", held, given)
+	}
+}
+
+// An entry only exists with the focus: refused, the box does not switch to entry and says how to set
+// the field, until the next gesture; lost along the way, the entry ends without taking it back from
+// whoever took it, and keys write nothing anymore.
+func TestTypingNeedsTheKeyboard(t *testing.T) {
+	shown, with := parametrized(t)
+	const one = "/one/dsvs.json"
+	p := &panel{order: []string{one}, state: map[string]attach.State{one: *withState(shown[0].live, func(s *attach.State) { s.Params = inert })},
+		replaying: map[string]change{}, refused: map[string]string{}, replayed: make(chan replay, 4),
+		done: make(chan struct{}), failed: map[string]string{}, waking: map[string]bool{},
+		pending: map[string]map[string]time.Time{}, keys: azerty}
+	p.setting = func(_ string, values map[string]string) error {
+		t.Errorf("without the keyboard, the panel asked for %v", values)
+		return nil
+	}
+	drawn := func() (*image.RGBA, zone) {
+		canvas, zones, _ := paint(p.snapshot(), looking, with, time.Now(), p.view())
+		checkZones(t, canvas, zones)
+		for _, z := range zones {
+			if z.do == edit && z.name == "products" {
+				return canvas, z
+			}
+		}
+		t.Fatal("products offers no entry")
+		return nil, zone{}
+	}
+
+	p.claim = func() (func(), bool) { return nil, false }
+	calm, z := drawn()
+	p.act(z)
+	told, _ := drawn()
+	if p.typing.name != "" || told.Bounds().Dy() <= calm.Bounds().Dy() {
+		t.Errorf("without the keyboard, the entry opens (%q) or says nothing (%d more px)", p.typing.name, told.Bounds().Dy()-calm.Bounds().Dy())
+	}
+	if !p.pressed(xproto.KeyPressEvent{Detail: 12, State: xproto.ModMaskShift}) || p.typing.name != "" {
+		t.Error("without an entry, a key writes somewhere")
+	}
+	p.act(zone{do: drop, config: one, name: "api"})
+	if again, _ := drawn(); again.Bounds().Dy() != calm.Bounds().Dy() {
+		t.Error("the note about the keyboard survives the next gesture")
+	}
+
+	given := 0
+	p.claim = func() (func(), bool) { return func() { given++ }, true }
+	_, z = drawn()
+	p.act(z)
+	p.lost()
+	p.pressed(xproto.KeyPressEvent{Detail: 36})
+	if p.typing.name != "" || given != 0 {
+		t.Errorf("the lost focus leaves the entry open (%q), or the panel takes it back (%d)", p.typing.name, given)
+	}
+}
+
+// A flag is a switch whose whole row is clickable, and a click sends the opposite of its value; what
+// the machine observes is shown without offering anything to click.
+func TestAFlagToggleSendsTheOppositeValue(t *testing.T) {
+	shown, with := parametrized(t)
+	canvas, zones, _ := paint(shown, looking, with, time.Now(), aside)
+	checkZones(t, canvas, zones)
+
+	var chosen []zone
+	for _, z := range zones {
+		if z.do == choose && (z.name == "slowApi" || z.name == "verbose proxy") {
+			chosen = append(chosen, z)
+		}
+	}
+	if len(chosen) != 2 {
+		t.Fatalf("the flags' zones are %v, wanted one per flag", chosen)
+	}
+	for _, z := range zones {
+		if z.name == "network" {
+			t.Errorf("what is observed offers %v", z)
+		}
+	}
+
+	var said []map[string]string
+	p := &panel{replaying: map[string]change{}, refused: map[string]string{}, replayed: make(chan replay, 2),
+		done: make(chan struct{})}
+	p.setting = func(config string, values map[string]string) error {
+		if config != "/one/dsvs.json" {
+			t.Errorf("the change goes to %s", config)
+		}
+		said = append(said, values)
+		return nil
+	}
+	for _, z := range chosen {
+		p.act(z)
+		<-p.replayed
+		delete(p.replaying, z.config)
+	}
+	want := []map[string]string{{"slowApi": "false"}, {"verbose proxy": "true"}}
+	if !reflect.DeepEqual(said, want) {
+		t.Errorf("the panel asked for %v, wanted %v", said, want)
+	}
+}
+
+// A select with short values is a frame of segments: a click on a segment sends its value — not the
+// next one — and the chosen value is not a zone. A select of more than four values fits in a button
+// whose list unfolds in the panel, one at a time; choosing a value folds it.
+func TestSelectsChooseBySegmentOrByList(t *testing.T) {
+	shown, with := parametrized(t)
+	const one = "/one/dsvs.json"
+	var said []map[string]string
+	p := &panel{order: []string{one}, state: map[string]attach.State{one: *shown[0].live},
+		replaying: map[string]change{}, refused: map[string]string{}, replayed: make(chan replay, 4),
+		done: make(chan struct{}), failed: map[string]string{}, waking: map[string]bool{},
+		pending: map[string]map[string]time.Time{}}
+	p.setting = func(_ string, values map[string]string) error {
+		said = append(said, values)
+		return nil
+	}
+	zonesOf := func(name string) []zone {
+		canvas, zones, _ := paint(p.snapshot(), looking, with, time.Now(), p.view())
+		checkZones(t, canvas, zones)
+		var mine []zone
+		for _, z := range zones {
+			if z.name == name {
+				mine = append(mine, z)
+			}
+		}
+		return mine
+	}
+
+	segments := zonesOf("api")
+	if len(segments) != 2 || segments[0].value != "staging" || segments[1].value != "demo" {
+		t.Fatalf("api's segments offer %v, wanted staging and demo, not the chosen value", segments)
+	}
+	p.act(segments[1])
+	<-p.replayed
+	delete(p.replaying, one)
+	if want := (map[string]string{"api": "demo"}); !reflect.DeepEqual(said, []map[string]string{want}) {
+		t.Errorf("a click on the demo segment asks for %v", said)
+	}
+
+	if closed := zonesOf("catalog"); len(closed) != 1 || closed[0].do != drop {
+		t.Fatalf("a select of five values offers %v, wanted a single button", closed)
+	}
+	p.act(zonesOf("catalog")[0])
+	open := zonesOf("catalog")
+	if len(open) != 6 {
+		t.Fatalf("the unfolded list offers %d zones, wanted the button and five values", len(open))
+	}
+	p.act(open[1])
+	<-p.replayed
+	delete(p.replaying, one)
+	if want := (map[string]string{"catalog": "empty"}); !reflect.DeepEqual(said[1], want) {
+		t.Errorf("choosing a value from the list asks for %v", said[1])
+	}
+	if len(zonesOf("catalog")) != 1 {
+		t.Error("the list stays unfolded after a value is chosen")
+	}
+
+	p.act(zonesOf("catalog")[0])
+	p.act(zonesOf("catalog")[0])
+	if len(zonesOf("catalog")) != 1 {
+		t.Error("a second click on the button does not fold the list")
+	}
+}
+
+// While a session replays, none of its parameters offers anything: a second replay cannot cross a
+// first. A refusal leaves its reason under the parameters, until the next change.
+func TestNothingIsOfferedWhileASessionReplays(t *testing.T) {
+	shown, with := parametrized(t)
+	const one = "/one/dsvs.json"
+	paramZones := func(zones []zone) int {
+		seen := 0
+		for _, z := range zones {
+			if z.do == choose || z.do == drop {
+				seen++
+			}
+		}
+		return seen
+	}
+	_, calm, _ := paint(shown, looking, with, time.Now(), aside)
+	if paramZones(calm) == 0 {
+		t.Fatal("a session replaying nothing offers no parameter")
+	}
+
+	shown[0].replaying = &change{"api", "staging"}
+	canvas, zones, _ := paint(shown, looking, with, time.Now(), aside)
+	checkZones(t, canvas, zones)
+	if got := paramZones(zones); got != 0 {
+		t.Errorf("during the replay, %d parameter zones", got)
+	}
+	shown[0].replaying = nil
+
+	p := &panel{order: []string{one}, state: map[string]attach.State{one: *shown[0].live},
+		replaying: map[string]change{}, refused: map[string]string{}, replayed: make(chan replay, 2),
+		done: make(chan struct{}), failed: map[string]string{}, waking: map[string]bool{},
+		pending: map[string]map[string]time.Time{}}
+	p.setting = func(string, map[string]string) error { return errors.New(`api: "staging" is not one of local, demo`) }
+
+	p.act(zone{do: choose, config: one, name: "api", value: "staging"})
+	if p.snapshot()[0].replaying == nil {
+		t.Error("the requested change is not being replayed")
+	}
+	p.answered(<-p.replayed)
+	if p.snapshot()[0].replaying != nil {
+		t.Error("the replay is over and the parameters stay inert")
+	}
+	refused := p.snapshot()
+	if !strings.Contains(refused[0].refused, "not one of local, demo") {
+		t.Errorf("the refusal's reason is %q", refused[0].refused)
+	}
+	before, _, _ := paint(shown, looking, with, time.Now(), aside)
+	after, _, _ := paint(refused, looking, with, time.Now(), aside)
+	if after.Bounds().Dy() <= before.Bounds().Dy() {
+		t.Error("the refusal is not written under the parameters")
+	}
+
+	p.setting = func(string, map[string]string) error { return nil }
+	p.act(zone{do: choose, config: one, name: "api", value: "demo"})
+	if p.snapshot()[0].refused != "" {
+		t.Error("the refusal survives the next change")
+	}
+	p.answered(<-p.replayed)
+}
+
 // tall is a screen height that leaves everything unfolded.
 const tall = 10000
 
@@ -281,6 +776,9 @@ func TestLookLeavesThePanelAsAPNG(t *testing.T) {
 	full, with := demo(t)
 	found := renewal{stage: found, to: "v0.1.1-rc.1+build.2026"}
 	upToDate := renewal{stage: idle, said: "up to date"}
+	betaOut, betaIn := found, upToDate
+	betaOut.beta, betaOut.betaOut = installBeta, "v0.2.0-beta.1"
+	betaIn.beta = removeBeta
 
 	cold := []project{{config: "/home/user/front/dsvs.json"}, {config: "/home/user/shop-api/dsvs.json"},
 		{config: "/home/user/wt/feat-cart/front/dsvs.json", waking: true}}
@@ -305,17 +803,83 @@ func TestLookLeavesThePanelAsAPNG(t *testing.T) {
 	overflowing[0].live = &attach.State{Config: full[0].config, Port: 4400, Apps: many,
 		Facades: []attach.Facade{{Host: "localhost"}, {Host: "api.localhost"}}}
 
+	params, _ := parametrized(t)
+	inertly := append([]project(nil), params...)
+	inertly[0].live = withState(params[0].live, func(s *attach.State) { s.Params = inert })
+	replaying := append([]project(nil), params...)
+	replaying[0].replaying = &change{"api", "staging"}
+	refusing := append([]project(nil), params...)
+	refusing[0].refused = `api: "staging" is not one of local, demo`
+
+	unseen, invalid := append([]project(nil), params...), append([]project(nil), params...)
+	unseen[0].live = withState(params[0].live, func(s *attach.State) { s.Observed = nil })
+	invalid[0].live = withState(params[0].live, func(s *attach.State) { s.NotApplied = "locale: demo has no fr build" })
+	stale := append([]project(nil), full...)
+	stale[0].live = withState(full[0].live, func(s *attach.State) {
+		s.NotApplied = "SyntaxError [ERR_INVALID_TYPESCRIPT_SYNTAX]: Unexpected token `,`. Expected identifier, string literal, numeric literal or [ for the computed key"
+	})
+
+	withForm := func(api string, change func([]config.Field) []config.Field) []project {
+		fields := []config.Field{
+			{Name: "api", Type: "choice", Choices: []string{"local", "staging", "demo"}, Value: api, Network: true},
+			{Name: "deployed.version", Type: "choice", Choices: []string{"v2", "v3"}, Value: "v2", Hidden: api == "local", Keep: true},
+			{Name: "deployed.traces", Type: "flag", Choices: []string{"false", "true"}, Value: "false", Hidden: api == "local",
+				Disabled: true, Reasons: []string{"traces are only reachable from the company network"}},
+			{Name: "products", Type: "number", Value: "20", Hidden: api != "local", Min: bound(0), Max: bound(5000)},
+			{Name: "locale", Type: "choice", Choices: []string{"en", "fr"}, Value: "en", Keep: true},
+			{Name: "branch", Type: "text", Value: "main"},
+		}
+		if change != nil {
+			fields = change(fields)
+		}
+		return []project{{config: params[0].config, live: withState(params[0].live, func(s *attach.State) { s.Params = fields })}}
+	}
+	formed, local := withForm("staging", nil), withForm("local", nil)
+	typed := view{at: image.Pt(-1, -1), room: tall, typing: draft{slot{local[0].config, "products"}, []rune("300"), 3}}
+	overLimit := append([]project(nil), local...)
+	overLimit[0].refused = "products: at most 5000"
+	wrong := withForm("staging", func(fields []config.Field) []config.Field {
+		fields[4].Value, fields[4].Errors = "fr", []string{"staging has no fr build"}
+		return fields
+	})
+	wrong[0].live.Errors = []string{"staging is down for maintenance until 14:00"}
+	long := withForm("staging", func(fields []config.Field) []config.Field {
+		fields[2].Reasons = []string{"traces are only reachable from the company network", "and its tunnel is down since the certificate of the concentrator expired this morning"}
+		fields[5].Errors = []string{"must match ^[a-z0-9-]*$: a branch name is made of lowercase letters, digits and dashes, and this one holds a slash"}
+		return fields
+	})
+	long[0].live.NotApplied = stale[0].live.NotApplied
+	long[0].live.Observed = &config.Observed{Exits: []config.Exit{{Via: "198.51.100.2", Dev: "wlan0"}},
+		Links: []config.Link{{Name: "tun0"}, {Name: "wg0"}, {Name: "docker0"}, {Name: "br-5f3c2a91d0e4"}, {Name: "veth7a1b2c3"}}}
+
 	scenes := []struct {
 		name     string
 		projects []project
 		news     renewal
 		seen     view
 	}{
+		{"form", formed, upToDate, aside},
+		{"form-hidden-group", local, upToDate, aside},
+		{"form-errors", wrong, upToDate, aside},
+		{"entry", local, upToDate, typed},
+		{"entry-without-keyboard", local, upToDate, view{at: image.Pt(-1, -1), room: tall, keyless: slot{local[0].config, "products"}}},
+		{"entry-refused", overLimit, upToDate, aside},
+		{"long-message", long, upToDate, aside},
 		{"full", full, found, view{at: image.Pt(292, 52), room: tall}},
 		{"empty", nil, looking, aside},
 		{"cold", cold, upToDate, aside},
 		{"errors", failing, failure(errors.New("update failed: git fetch: could not resolve host")), aside},
 		{"overflow", overflowing, upToDate, view{at: image.Pt(-1, -1), room: 760}},
+		{"params", params, upToDate, view{at: image.Pt(200, 150), room: tall}},
+		{"params-replay", replaying, upToDate, aside},
+		{"params-refused", refusing, upToDate, aside},
+		{"params-inert", inertly, upToDate, aside},
+		{"network-nothing", unseen, upToDate, aside},
+		{"form-invalid", invalid, upToDate, aside},
+		{"config-refused", stale, upToDate, aside},
+		{"params-dropdown", params, upToDate, view{at: image.Pt(200, 330), room: tall, dropped: slot{params[0].config, "catalog"}}},
+		{"beta-offered", full, betaOut, aside},
+		{"beta-removal", full, betaIn, aside},
 	}
 	for _, scene := range scenes {
 		canvas, _, _ := paint(scene.projects, scene.news, with, time.Now(), scene.seen)
@@ -330,19 +894,58 @@ func TestLookLeavesThePanelAsAPNG(t *testing.T) {
 	}
 }
 
-// A configuration the session does not apply is said on one line, whatever the length of its
-// reason, and a folded project keeps its cross.
-func TestAConfigurationNotAppliedTakesOneLine(t *testing.T) {
+// A configuration the session does not apply is said under the project's title, and reads whole: a
+// long reason takes the lines it needs, like any reason.
+func TestAConfigurationNotAppliedReadsWhole(t *testing.T) {
 	shown, with := demo(t)
 	calm, _, _ := paint(shown, looking, with, time.Now(), aside)
-	for _, why := range []string{"locale: demo has no fr build", strings.Repeat("SyntaxError: Unexpected token ", 20)} {
+	grown := func(why string) int {
 		stale := append([]project(nil), shown...)
 		stale[0].live = withState(shown[0].live, func(s *attach.State) { s.NotApplied = why })
 		canvas, zones, _ := paint(stale, looking, with, time.Now(), aside)
 		checkZones(t, canvas, zones)
-		if grown := canvas.Bounds().Dy() - calm.Bounds().Dy(); grown != errorRow+6 {
-			t.Errorf("%d characters of reason grow the panel by %d px, wanted one line (%d)", len(why), grown, errorRow+6)
+		return canvas.Bounds().Dy() - calm.Bounds().Dy()
+	}
+	if got := grown("locale: demo has no fr build"); got != errorRow+6 {
+		t.Errorf("a short reason grows the panel by %d px, wanted one line (%d)", got, errorRow+6)
+	}
+	if got := grown(strings.Repeat("SyntaxError: Unexpected token ", 20)); got < 8*errorRow {
+		t.Errorf("600 characters of reason grow the panel by %d px: it is cut", got)
+	}
+}
+
+// What the machine observes and an imposed value read in full: beside their label when they fit,
+// below otherwise, over the lines they need.
+func TestAValueReadsWhole(t *testing.T) {
+	shown, with := parametrized(t)
+	height := func(change func(*attach.State)) int {
+		one := append([]project(nil), shown...)
+		one[0].live = withState(shown[0].live, func(s *attach.State) {
+			s.Params = nil
+			change(s)
+		})
+		canvas, zones, _ := paint(one, looking, with, time.Now(), aside)
+		checkZones(t, canvas, zones)
+		return canvas.Bounds().Dy()
+	}
+	office := config.Exit{Via: "198.51.100.2", Dev: "wlan0"}
+	calm := height(func(s *attach.State) { s.Observed = &config.Observed{Exits: []config.Exit{office}} })
+	links := []config.Link{}
+	for _, name := range []string{"tun0", "tun1", "wg0", "wg1", "docker0", "br-shop", "veth-shop", "veth-api"} {
+		links = append(links, config.Link{Name: name})
+	}
+	if got := height(func(s *attach.State) { s.Observed = &config.Observed{Links: links, Exits: []config.Exit{office}} }); got < calm+2*errorRow {
+		t.Errorf("a network with nine links grows the panel by %d px: it is cut", got-calm)
+	}
+	imposed := func(value string) func(*attach.State) {
+		return func(s *attach.State) {
+			s.Observed = &config.Observed{Exits: []config.Exit{office}}
+			s.Params = []config.Field{{Name: "api", Type: "text", Value: value, Readonly: true}}
 		}
+	}
+	short := height(imposed("staging"))
+	if got := height(imposed(strings.Repeat("https://staging.example.test/v2 ", 4))); got < short+2*errorRow {
+		t.Errorf("an imposed value of 128 characters grows the panel by %d px: it is cut", got-short)
 	}
 }
 
@@ -681,10 +1284,18 @@ func TestEachGestureGoesToWhoItConcerns(t *testing.T) {
 		state:  map[string]attach.State{one: {Config: one}, two: {Config: two}},
 		links:  map[string]*attach.Link{one: {}, two: {}},
 		failed: map[string]string{}, waking: map[string]bool{}, pending: map[string]map[string]time.Time{},
+		forgot: make(chan replay, 1), done: make(chan struct{}),
 	}
 	p.ordered = func(config string, do deed, name string) error {
 		said = append(said, heard{config, do, name})
 		return nil
+	}
+	forgetting := func(config string) bool {
+		if !p.act(zone{do: forget, config: config}) {
+			return false
+		}
+		p.forgotten(<-p.forgot)
+		return true
 	}
 
 	for _, z := range []zone{
@@ -715,11 +1326,11 @@ func TestEachGestureGoesToWhoItConcerns(t *testing.T) {
 		}
 	}
 
-	// Forgetting a cold project removes its row; what runs keeps its own.
-	if !p.act(zone{do: forget, config: cold}) || slices.Contains(p.order, cold) {
+	// Forgetting a cold project removes its row; an open session keeps its own.
+	if !forgetting(cold) || slices.Contains(p.order, cold) {
 		t.Errorf("after the forget, the rows are %v", p.order)
 	}
-	if !p.act(zone{do: forget, config: one}) || !slices.Contains(p.order, one) {
+	if !forgetting(one) || !slices.Contains(p.order, one) {
 		t.Errorf("forgetting a running project removed its row: %v", p.order)
 	}
 
@@ -918,7 +1529,7 @@ func TestThePaletteKeepsItsContrasts(t *testing.T) {
 		{"accent/ground", accent, ground, shape},
 		{"ready/ground", ready, ground, shape},
 		{"ready/rowLit", ready, rowLit, shape},
-		{"waking/ground", waking, ground, shape},
+		{"waking/ground", waking, ground, text},
 		{"waking/rowLit", waking, rowLit, shape},
 		{"broken/ground", broken, ground, shape},
 		{"broken/rowLit", broken, rowLit, shape},

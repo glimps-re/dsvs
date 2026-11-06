@@ -41,6 +41,9 @@ type Handover struct {
 	// file does not say them. A default is never among them: it is resolved again on the other
 	// side.
 	Params map[string]string `json:"params,omitempty"`
+	// Awaiting are those of a draft the configuration does not apply yet: they are kept on the
+	// other side, when it applies them.
+	Awaiting map[string]string `json:"awaiting,omitempty"`
 	// Answer is the response that built the configuration in force. The new image starts again from
 	// it without evaluating anything, then replays the file as after a save: a binary that refuses
 	// the file therefore keeps the configuration in force and says so, instead of losing the
@@ -126,9 +129,9 @@ func (s *Session) refused(err error) error {
 // clear their FD_CLOEXEC, right before leaving.
 func (s *Session) Export() (Handover, error) {
 	s.mu.RLock()
-	intents := maps.Clone(s.intents)
+	intents, awaiting := maps.Clone(s.intents), maps.Clone(s.awaiting)
 	s.mu.RUnlock()
-	out := Handover{Version: HandoverVersion, Fallback: s.net.Mode().Reason, Log: s.Log.Dump(), Params: intents,
+	out := Handover{Version: HandoverVersion, Fallback: s.net.Mode().Reason, Log: s.Log.Dump(), Params: intents, Awaiting: awaiting,
 		Answer: s.Config().Answer}
 	for _, in := range s.Facades() {
 		out.Facades = append(out.Facades, FacadeState{Name: in.Cfg.Name, Log: in.Log.Dump()})
@@ -158,6 +161,7 @@ func (s *Session) Adopt(taken Handover) error {
 	s.Log.Write([]byte(taken.Log))
 	s.mu.Lock()
 	maps.Copy(s.intents, taken.Params)
+	maps.Copy(s.awaiting, taken.Awaiting)
 	s.mu.Unlock()
 	for _, facade := range taken.Facades {
 		if in := s.facade(facade.Name); in != nil {
@@ -175,7 +179,7 @@ func (s *Session) Adopt(taken Handover) error {
 			return err
 		}
 	}
-	_ = s.replay(nil) // a refusal is told in the log and in the status, and the session serves anyway
+	_ = s.replay(nil, config.Form.Accept) // a refusal is told in the log and in the status, and the session serves anyway
 	return nil
 }
 
