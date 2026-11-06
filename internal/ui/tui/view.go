@@ -262,11 +262,29 @@ func (m Model) ingressCard(in *core.Ingress) []string {
 		section("routes", routes))
 }
 
-// sessionCard is the full card: the network the apps live in, their state, and what each facade does
-// with each path.
+// sessionCard is the full card: what the session does not apply of its configuration and why, what
+// its form says without refusing anything, the network the apps live in, their state, and what each
+// facade does with each path.
 func (m Model) sessionCard() []string {
+	var stale []string
+	if why := m.session.NotApplied(); why != "" {
+		// The card sizes itself on its content within the screen's width: a long reason wraps there
+		// rather than being cut.
+		for _, line := range strings.Split(ansi.Wrap(why, max(1, m.width-2-boxMargin), ""), "\n") {
+			stale = append(stale, colour(red).Render(line))
+		}
+	}
+	var notices []string
+	for _, notice := range m.session.Form().Notices {
+		for _, line := range strings.Split(ansi.Wrap(notice, max(1, m.width-2-boxMargin), ""), "\n") {
+			notices = append(notices, colour(yellow).Render(line))
+		}
+	}
 	sets := []([]string){
-		section("network", append([]string{"port " + strconv.Itoa(m.session.Config().Port)}, m.modeLines()...)),
+		section("not applied", stale),
+		section("notice", notices),
+		section("network", append(append([]string{"port " + strconv.Itoa(m.session.Config().Port)}, m.modeLines()...),
+			"observed · "+m.session.Observed().String())),
 		section("apps", appLines(m.session.Apps())),
 	}
 	for _, in := range m.session.Facades() {
@@ -413,6 +431,8 @@ func (m Model) listRows(width int, active bool) (rows []string, of []int) {
 	}
 	for i, it := range m.items {
 		switch {
+		case it.kind == kindParam && it.group != "":
+			add(row([]part{{indent(childIndent) + it.group, dim}}, width, plain, false), -1)
 		case it.group != "":
 			if i > 0 {
 				add("", -1)
@@ -471,6 +491,25 @@ func (m Model) listRow(index, width int, active bool) string {
 	if active {
 		back = cursorOn
 	}
+	if it.kind == kindParam {
+		field, _ := m.session.Form().Field(it.name)
+		group, label := field.Group()
+		left := []part{{indent(childIndent), plain}, {label, plain}}
+		if group != "" {
+			left[0].text += indent(2)
+		}
+		if field.Disabled || field.Readonly {
+			left[1].style = dim
+		}
+		value := []part{{valueOf(field) + " ", dim}}
+		if field.Yielded != nil {
+			value = append([]part{{"↓ ", colour(yellow)}}, value...)
+		}
+		if m.input == paramInput && m.draft.name == it.name {
+			value = m.editor()
+		}
+		return row(aligned(width, left, value), width, back, on)
+	}
 
 	star := part{indent(starWidth), plain}
 	name := plain
@@ -492,13 +531,39 @@ func (m Model) listRow(index, width int, active bool) string {
 	return row(aligned(width, left, m.rightSlot(it)), width, back, on)
 }
 
+// editor writes the current input in place of the value, the block cursor where typing inserts.
+func (m Model) editor() []part {
+	text, at := m.draft.text, m.draft.at
+	under := " "
+	if at < len(text) {
+		under = string(text[at])
+	}
+	return []part{{"[" + string(text[:at]), plain}, {under, ptyCursor}, {string(text[min(at+1, len(text)):]) + "] ", plain}}
+}
+
+// valueOf writes a parameter's value: a flag reads by its dot, the rest by its text.
+func valueOf(field config.Field) string {
+	switch {
+	case field.Type != "flag":
+		return field.Value
+	case field.Value == "true":
+		return "●"
+	}
+	return "○"
+}
+
 // rightSlot says what an app has worth noting right of its name: the time it spends in transition,
 // the missing answer at startup. Nothing the rest of the time.
 func (m Model) rightSlot(it item) []part {
 	switch it.kind {
 	case kindSession:
-		// The port is the session's first-class information: it reads on its line.
-		return []part{{"port " + strconv.Itoa(m.session.Config().Port) + " ", dim}}
+		// The port is the session's first-class information: it reads on its line, and a cross
+		// before it says the session does not apply a configuration; the card says why.
+		port := part{"port " + strconv.Itoa(m.session.Config().Port) + " ", dim}
+		if m.session.NotApplied() != "" {
+			return []part{{"✗ ", colour(red)}, port}
+		}
+		return []part{port}
 	case kindApp:
 		if glyph, ansi := driftMark(it.app.Drift()); glyph != "" {
 			return []part{{glyph + " ", colour(ansi)}}
@@ -551,7 +616,55 @@ func (m Model) logPanel(active bool) []string {
 	for i := from; i < to; i++ {
 		rows = append(rows, m.highlighted(screen[i], at[i]))
 	}
+	// What the parameter under the cursor says covers the oldest lines of the log, rather than
+	// trimming its height: that height is what the apps receive as their terminal's size.
+	if said := m.paramSays(); len(said) > 0 {
+		said = append(said, dim.Render(strings.Repeat("─", max(1, m.logWidth()-1))))
+		rows = append(said, rows[min(len(said), len(rows)):]...)
+	}
 	return panel(m.logHead(len(lines), active), rows, m.logPanelWidth(), m.height-1, active)
+}
+
+// paramSays returns what the parameter under the cursor has to say, wrapped to the log's width: its
+// reasons if it is disabled, that it is imposed, its disabled choices, the kept value it no longer
+// takes, its errors and the form's, and the refusal of the last gesture made on it. Nothing when
+// the cursor is not on a parameter, or the list does not have the keyboard.
+func (m Model) paramSays() []string {
+	if m.focus != onList || m.items[m.cursor].kind != kindParam {
+		return nil
+	}
+	form := m.session.Form()
+	field, _ := form.Field(m.items[m.cursor].name)
+	var said []string
+	say := func(style lipgloss.Style, text string) {
+		for _, line := range strings.Split(ansi.Wrap(text, m.logWidth(), ""), "\n") {
+			said = append(said, style.Render(line))
+		}
+	}
+	switch {
+	case field.Disabled && len(field.Reasons) > 0:
+		say(dim, "disabled: "+strings.Join(field.Reasons, "; "))
+	case field.Disabled:
+		say(dim, "disabled here")
+	case field.Readonly:
+		say(dim, "read-only here")
+	}
+	for _, off := range field.Unavailables() {
+		say(dim, off)
+	}
+	if said := field.Yields(); said != "" {
+		say(colour(yellow), "↓ "+said)
+	}
+	for _, notice := range form.Notices {
+		say(colour(yellow), notice)
+	}
+	for _, err := range append(slices.Clone(field.Errors), form.Errors...) {
+		say(colour(red), "✗ "+err)
+	}
+	if m.refusal.name == field.Name && m.refusal.why != "" {
+		say(colour(red), "✗ "+m.refusal.why)
+	}
+	return said
 }
 
 // logWindow is the slice of screen lines the panel shows, and the number of empty lines set above
@@ -762,6 +875,10 @@ func (m Model) footer() string {
 	switch m.input {
 	case filterInput:
 		return pad(" "+accent.Render("/")+m.filter+cursorOn.Render(" "), m.width)
+	case paramInput:
+		field, _ := m.session.Form().Field(m.draft.name)
+		return pad(" "+cursorOn.Render(" "+m.draft.name+" ")+" "+dim.Render(strings.Join(append(field.Bounds(), ""), " · "))+
+			accent.Render("⏎")+dim.Render(" applies · ")+accent.Render("esc")+dim.Render(" cancels"), m.width)
 	case consoleInput:
 		name := m.items[m.selected].name
 		return pad(" "+cursorOn.Render(" console ")+" "+
@@ -940,6 +1057,8 @@ func helpLines(leaving string) []string {
 		{"↑↓ jk", "cursor in the list, scroll in the log"},
 		{"→ l ⏎", "shows the item under the cursor, then enters it"},
 		{"⏎", "the console of the shown app"},
+		{"⏎ space", "on a parameter: its next value"},
+		{"⏎", "on a text or a number: edits it, ⏎ applies, esc cancels"},
 		{"i", "card of the item; ↑↓ moves through the cards"},
 		{"space", "shows without leaving the list"},
 		{"← h esc", "back to the list; esc closes the card first"},

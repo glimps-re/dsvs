@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,13 +25,15 @@ const (
 	onLog
 )
 
-// Where typing goes. The filter and the console cannot be open at the same time.
+// Where typing goes. The filter, the console and a parameter's input cannot be open at the same
+// time.
 type input int
 
 const (
 	noInput input = iota
 	filterInput
 	consoleInput
+	paramInput
 )
 
 // One modal at a time: two floating panels cannot be open together.
@@ -61,6 +64,8 @@ const (
 	// The session holds the port and the network plumbing. It is not driven: it is there as long as
 	// the tool runs.
 	kindSession kind = iota
+	// A parameter is set, not watched: the log stays on what it was showing.
+	kindParam
 	// A group is declared in the configuration: it starts its members and merges their logs.
 	kindGroup
 	kindApp
@@ -107,13 +112,29 @@ type Model struct {
 	asked  string
 	input  input
 	filter string
-	offset int
+	// draft is a parameter's input: it only holds under paramInput, and nothing goes out before ⏎.
+	draft draft
+	// refusal is the refusal of the last gesture on a parameter: it is written at the top of the
+	// log as long as the cursor is on that parameter, and the next gesture clears it.
+	refusal refusal
+	offset  int
 	// sel is what the mouse took in the log. Its zero value says no anchor is set: there is then
 	// nothing to extend, nothing to paint and nothing to copy.
 	sel selection
 
 	width, height int
 }
+
+// draft is a text being written for the parameter it names — a click that moves the list's cursor
+// does not divert it —, and the cursor's position in that text.
+type draft struct {
+	name string
+	text []rune
+	at   int
+}
+
+// refusal is what a session answered to a gesture on a parameter, when it refused it.
+type refusal struct{ name, why string }
 
 // spot is a point of the log: the line, among those lines returns, and the column in its unwrapped
 // text. A selection lives there rather than on the screen, to follow scrolling and so that a line
@@ -210,6 +231,19 @@ func itemsOf(session *core.Session) []item {
 	// The session opens the list: it holds the port, and the log of what belongs to no facade. No
 	// section title above it, it is the only one of its kind.
 	items := []item{{kind: kindSession, name: session.Log.Name()}}
+	// A parameter opens its group's title when the group changes: a group whose fields are all
+	// hidden therefore has none.
+	group := ""
+	for _, field := range session.Form().Fields {
+		if field.Hidden {
+			continue
+		}
+		row := item{kind: kindParam, name: field.Name}
+		if within, _ := field.Group(); within != group {
+			group, row.group = within, within
+		}
+		items = append(items, row)
+	}
 	for i, group := range session.Config().Groups {
 		set := item{kind: kindGroup, name: group.Name}
 		if i == 0 {
@@ -295,6 +329,8 @@ func (m Model) press(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.editFilter(key), nil
 	case consoleInput:
 		return m.typeInto(key)
+	case paramInput:
+		return m.editParam(key), nil
 	}
 
 	switch name {
@@ -319,6 +355,8 @@ func (m Model) press(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		// Three steps: choose what to watch, enter it, then write into it. When narrow there is
 		// nothing to watch until it is entered, so the first two happen at once.
 		switch {
+		case m.target().kind == kindParam && name == "enter":
+			m = m.enterParam()
 		case m.focus == onLog && name == "enter":
 			m.attach()
 		case m.selectCursor() || m.narrow():
@@ -326,9 +364,13 @@ func (m Model) press(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "space", " ":
-		m.selectCursor()
-		if m.narrow() {
-			m.focus = onLog
+		if m.target().kind == kindParam {
+			m = m.turn()
+		} else {
+			m.selectCursor()
+			if m.narrow() {
+				m.focus = onLog
+			}
 		}
 
 	case "left", "h", "esc", "escape":
@@ -351,13 +393,13 @@ func (m Model) press(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, lendSize(m.view, m.logWidth(), m.logHeight())
 
 	case "s":
-		m.apply(func(app *core.App) { app.Start() })
+		m.apply((*core.App).Start, m.appsOf)
 
 	case "x":
-		m.apply(func(app *core.App) { app.Stop() })
+		m.apply((*core.App).Stop, m.released)
 
 	case "r":
-		m.apply(func(app *core.App) { app.Restart() })
+		m.apply((*core.App).Restart, m.appsOf)
 
 	case "g":
 		m.offset = m.scrolled(m.logLength())
@@ -483,14 +525,20 @@ func (m Model) release(msg tea.MouseReleaseMsg) (tea.Model, tea.Cmd) {
 	return m, copyText(m.copied(), m.session.Log)
 }
 
-// synced lays the list out on the configuration in force when its generation has moved, and touches
-// nothing otherwise.
+// synced lays the list out on the configuration in force when its generation has moved, or when the
+// form shows other fields without it moving — a field the network hides —, and touches nothing
+// otherwise.
 func (m Model) synced() Model {
-	if gen := m.session.Generation(); gen != m.gen {
+	if gen := m.session.Generation(); gen != m.gen || !sameRows(itemsOf(m.session), m.items) {
 		m.gen = gen
 		return m.relist()
 	}
 	return m
+}
+
+// sameRows says that two lists hold the same rows, in the same order.
+func sameRows(a, b []item) bool {
+	return slices.EqualFunc(a, b, func(x, y item) bool { return x.kind == y.kind && x.name == y.name && x.group == y.group })
 }
 
 // relist lays the list out on the configuration just reloaded. The cursor and the displayed item
@@ -498,7 +546,7 @@ func (m Model) synced() Model {
 // facade brings back to the session. This is the only place that rebuilds the list — whether the
 // reload comes from a save or from the key.
 func (m Model) relist() Model {
-	cursor, shown := m.items[m.cursor].name, m.items[m.selected].name
+	cursor, shown := m.items[m.cursor], m.items[m.selected]
 	// The log no longer returns the same lines: what the mouse held no longer exists.
 	m.sel = selection{}
 	m.items = itemsOf(m.session)
@@ -506,14 +554,83 @@ func (m Model) relist() Model {
 	return m
 }
 
-// indexOf returns the rank of the item of this name, or the session's, which is always there.
-func indexOf(items []item, name string) int {
+// indexOf returns this item's rank, a parameter possibly bearing an app's name, or the session's,
+// which is always there.
+func indexOf(items []item, wanted item) int {
 	for i, it := range items {
-		if it.name == name {
+		if it.kind == wanted.kind && it.name == wanted.name {
 			return i
 		}
 	}
 	return 0
+}
+
+// turn moves the parameter under the cursor to its next choice. The session replays its
+// configuration; a refusal is written at the top of the log. An inert field, or one with no choices
+// to cycle, does not move.
+func (m Model) turn() Model {
+	field, _ := m.session.Form().Field(m.target().name)
+	if turns := field.Choices != nil && !field.Disabled && !field.Readonly; turns {
+		return m.set(field.Name, field.Next())
+	}
+	return m
+}
+
+// enterParam is ⏎ on a parameter: a text or a number opens for input on its value, the rest moves
+// to the next choice.
+func (m Model) enterParam() Model {
+	field, _ := m.session.Form().Field(m.target().name)
+	if field.Choices != nil || field.Disabled || field.Readonly {
+		return m.turn()
+	}
+	m.input, m.draft = paramInput, draft{name: field.Name, text: []rune(field.Value), at: len([]rune(field.Value))}
+	return m
+}
+
+// set gives a parameter a value, and keeps the refusal if there is one.
+func (m Model) set(name, value string) Model {
+	m.refusal = refusal{}
+	if err := m.session.Set(map[string]string{name: value}); err != nil {
+		m.refusal = refusal{name, err.Error()}
+	}
+	return m
+}
+
+// editParam carries a keystroke to a parameter's input: ⏎ sends what was written, esc drops it, and
+// the rest is written at the cursor or moves it.
+func (m Model) editParam(key tea.KeyPressMsg) Model {
+	d := m.draft
+	text := slices.Clone(d.text)
+	switch key.String() {
+	case "enter":
+		m.input = noInput
+		return m.set(d.name, string(text))
+	case "esc", "escape":
+		m.input = noInput
+	case "left":
+		d.at = max(0, d.at-1)
+	case "right":
+		d.at = min(len(text), d.at+1)
+	case "home", "ctrl+a":
+		d.at = 0
+	case "end", "ctrl+e":
+		d.at = len(text)
+	case "backspace":
+		if d.at > 0 {
+			text, d.at = slices.Delete(text, d.at-1, d.at), d.at-1
+		}
+	case "delete":
+		if d.at < len(text) {
+			text = slices.Delete(text, d.at, d.at+1)
+		}
+	default:
+		if typed := []rune(key.Key().Text); len(typed) > 0 {
+			text, d.at = slices.Insert(text, d.at, typed...), d.at+len(typed)
+		}
+	}
+	d.text = text
+	m.draft = d
+	return m
 }
 
 // attach gives the keyboard to what the log displays: the console of a running app. A facade has
@@ -609,10 +726,11 @@ func (m Model) editFilter(key tea.KeyPressMsg) Model {
 	return m
 }
 
-// selectCursor makes the item under the cursor the one the log displays, and says whether it already
-// was.
+// selectCursor makes the item under the cursor the one the log displays, and says whether it
+// already was. A parameter has no log: it is never the displayed item, and that is what spares the
+// rest of the view from mentioning it.
 func (m *Model) selectCursor() (already bool) {
-	if m.selected == m.cursor {
+	if m.selected == m.cursor || m.items[m.cursor].kind == kindParam {
 		return true
 	}
 	m.selected, m.offset = m.cursor, 0
@@ -705,16 +823,21 @@ func (m Model) target() item {
 	return m.items[m.targetIndex()]
 }
 
-// apply runs a command on the target: on a group or a facade, the apps it brings along; on an app,
-// that app alone.
-func (m Model) apply(do func(*core.App)) {
+// apply runs a command on the target: on a group or a facade, the apps resolve draws from it; on an
+// app, that app alone. A refusal is written to the session's log, which the TUI shows.
+func (m Model) apply(do func(*core.App) error, resolve func(name string) []*core.App) {
+	steer := func(app *core.App) {
+		if err := do(app); err != nil {
+			m.session.Log.Addf("!! %v", err)
+		}
+	}
 	switch target := m.target(); target.kind {
 	case kindGroup, kindIngress:
-		for _, app := range m.appsOf(target.name) {
-			do(app)
+		for _, app := range resolve(target.name) {
+			steer(app)
 		}
 	case kindApp:
-		do(target.app)
+		steer(target.app)
 	case kindSession:
 		m.session.Log.Add("-- the session is not steered; its groups and its apps are")
 	}
@@ -723,6 +846,23 @@ func (m Model) apply(do func(*core.App)) {
 // appsOf returns the apps a name brings along: its own, a facade's, a group's.
 func (m Model) appsOf(name string) []*core.App {
 	names, _ := m.session.Config().AppsOf(name)
+	return m.supervised(names)
+}
+
+// released returns the apps a stop of this name takes along, like dsvs stop: a facade keeps those
+// another facade still serves, and the session's log says which.
+func (m Model) released(name string) []*core.App {
+	cfg := m.session.Config()
+	names, _ := cfg.AppsOf(name)
+	release := cfg.Release([]string{name}, names)
+	if said := release.String(); said != "" {
+		m.session.Log.Addf("-- %s", said)
+	}
+	return m.supervised(release.Stops)
+}
+
+// supervised returns the supervisors of these apps, those the session holds.
+func (m Model) supervised(names []string) []*core.App {
 	out := make([]*core.App, 0, len(names))
 	for _, n := range names {
 		if app := m.session.App(n); app != nil {
