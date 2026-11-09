@@ -12,7 +12,7 @@ require (
 	github.com/jezek/xgb v1.3.1
 	github.com/vishvananda/netlink v1.3.1
 	golang.org/x/image v0.45.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.49.0
 	gvisor.dev/gvisor v0.0.0-20250523182742-eede7a881b20
 )
 
