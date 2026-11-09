@@ -1,11 +1,11 @@
-# Pushing to main publishes nothing: a release is a signed tag, see release.yml, which calls this
+# Pushing to a branch publishes nothing: a release is a signed tag, see release.yml, which calls this
 # workflow before building anything.
 name: ci
 
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, beta]
   workflow_call:
 
 permissions:
