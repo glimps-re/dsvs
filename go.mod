@@ -11,8 +11,8 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/jezek/xgb v1.3.1
 	github.com/vishvananda/netlink v1.3.1
-	golang.org/x/image v0.47.0
-	golang.org/x/sys v0.49.0
+	golang.org/x/image v0.48.0
+	golang.org/x/sys v0.50.0
 	gvisor.dev/gvisor v0.0.0-20250523182742-eede7a881b20
 )
 
@@ -31,7 +31,7 @@ require (
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/xo/terminfo v1.0.0 // indirect
 	golang.org/x/exp v0.0.0-20260811152304-ee035b5b010f // indirect
-	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/text v0.43.0 // indirect
+	golang.org/x/sync v0.25.0 // indirect
+	golang.org/x/text v0.44.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 )
