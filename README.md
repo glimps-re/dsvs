@@ -262,9 +262,37 @@ A click opens the panel. The projects you have opened stay listed from one login
 
 ## Configuration
 
-The project folder holds a `config.dsvs.ts` — code, that node evaluates once — or a `dsvs.json`, when it has no reason to require node. Both follow the same contract: the extension decides what reads the file, and nothing downstream knows which one it was. dsvs searches for it up from the current directory; `--config` names another one. [Try it](#try-it) shows a minimal `dsvs.json`.
+The project folder holds a `config.dsvs.ts` — code, that node evaluates once — or a `dsvs.json`, when it has no reason to require node. Both follow the same contract: the extension decides what reads the file, and nothing downstream knows which one it was. dsvs searches for it up from the current directory; `--config` names another one. [Try it](#try-it) shows a minimal `dsvs.json`; here is the whole shop — the front and its API on one host, the back office on another, and a `tsc --watch` beside them:
 
-The same in TypeScript, in a `config.dsvs.ts`:
+```json
+{
+  "port": 4200,
+  "ingress": [
+    {
+      "host": "shop.localhost",
+      "routes": [
+        { "path": "/", "app": "front" },
+        { "path": "/api", "app": "api" }
+      ]
+    },
+    {
+      "host": "admin.shop.localhost",
+      "routes": [{ "path": "/", "app": "admin" }]
+    }
+  ],
+  "apps": [
+    { "name": "front", "command": ["pnpm", "start", "--port={port}"], "reload": { "stdin": "r\n" } },
+    { "name": "admin", "command": ["pnpm", "vite", "--port", "{port}"], "reload": "page" },
+    { "name": "api", "command": ["node", "api.mjs", "--port={port}"], "dir": "../api", "env": { "LOG_LEVEL": "debug" }, "ready": { "http": "/health" } },
+    { "name": "types", "command": ["pnpm", "tsc", "--watch", "--preserveWatchOutput"], "ready": { "log": "Watching for file changes" } }
+  ],
+  "groups": [{ "name": "back", "members": ["api", "types"] }]
+}
+```
+
+The [reference](#reference) details each key. `reload` says what a new configuration does for the app, `ready` what says it is ready — see [ready and reload](#ready-and-reload). `types` takes no `{port}`: no route leads to it. The group `back` starts the API and its types in one go: `dsvs start back`.
+
+The same kind of file in TypeScript, a `config.dsvs.ts`:
 
 ```ts
 import type { Config } from "dsvs";

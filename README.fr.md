@@ -197,9 +197,37 @@ Un clic ouvre le panneau. Les projets ouverts y restent listés d'une ouverture 
 
 ## Configuration
 
-Le dossier du projet porte un `config.dsvs.ts` — du code, que node évalue une fois — ou un `dsvs.json`, quand il n'a pas de raison d'exiger node. Les deux suivent le même contrat : l'extension décide de qui lit le fichier, et rien en aval ne sait duquel il vient. dsvs le cherche en remontant depuis le dossier courant ; `--config` en nomme un autre. [L'essayer](#lessayer) montre un `dsvs.json` minimal.
+Le dossier du projet porte un `config.dsvs.ts` — du code, que node évalue une fois — ou un `dsvs.json`, quand il n'a pas de raison d'exiger node. Les deux suivent le même contrat : l'extension décide de qui lit le fichier, et rien en aval ne sait duquel il vient. dsvs le cherche en remontant depuis le dossier courant ; `--config` en nomme un autre. [L'essayer](#lessayer) montre un `dsvs.json` minimal ; voici la boutique entière — le front et son API sur un hôte, le back-office sur un autre, et un `tsc --watch` à côté :
 
-Le même en TypeScript, dans un `config.dsvs.ts` :
+```json
+{
+  "port": 4200,
+  "ingress": [
+    {
+      "host": "shop.localhost",
+      "routes": [
+        { "path": "/", "app": "front" },
+        { "path": "/api", "app": "api" }
+      ]
+    },
+    {
+      "host": "admin.shop.localhost",
+      "routes": [{ "path": "/", "app": "admin" }]
+    }
+  ],
+  "apps": [
+    { "name": "front", "command": ["pnpm", "start", "--port={port}"], "reload": { "stdin": "r\n" } },
+    { "name": "admin", "command": ["pnpm", "vite", "--port", "{port}"], "reload": "page" },
+    { "name": "api", "command": ["node", "api.mjs", "--port={port}"], "dir": "../api", "env": { "LOG_LEVEL": "debug" }, "ready": { "http": "/health" } },
+    { "name": "types", "command": ["pnpm", "tsc", "--watch", "--preserveWatchOutput"], "ready": { "log": "Watching for file changes" } }
+  ],
+  "groups": [{ "name": "back", "members": ["api", "types"] }]
+}
+```
+
+La [référence](#référence) détaille chaque clé. `reload` dit ce que fait une nouvelle configuration pour l'app, `ready` ce qui la dit prête — voir [prête, et rechargement](#prête-et-rechargement). `types` ne reçoit pas de `{port}` : aucune route n'y mène. Le groupe `back` démarre l'API et ses types d'un coup : `dsvs start back`.
+
+Le même genre de fichier en TypeScript, un `config.dsvs.ts` :
 
 ```ts
 import type { Config } from "dsvs";
