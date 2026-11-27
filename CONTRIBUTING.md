@@ -50,6 +50,8 @@ Two long-lived branches, both protected, both with a linear history:
 
 When a beta has proven itself, `main` fast-forwards to `beta` and the stable release is tagged there.
 
+Dependabot proposes a dependency once its version is seven days old, minor and patch updates grouped by ecosystem, against `main`; they merge by themselves once the checks pass, and a major update waits for a human.
+
 1. Branch from `main` for a fix, from `beta` for a feature, and keep your branch rebased on it rather than merging it in.
 2. Keep commits small and about one thing each: they land as they are, and each one should build and pass the tests.
 3. Open the pull request against the branch you started from. The `tests` and `commits` checks must pass, and it is merged by rebase.

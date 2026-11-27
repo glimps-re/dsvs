@@ -1,9 +1,17 @@
+# A version waits seven days before Dependabot proposes it: a compromised release is usually caught and
+# pulled within that time. Minor and patch updates come in one pull request per ecosystem, which
+# dependabot-automerge.yml merges once the checks pass; a major update comes alone, for a human.
 version: 2
 updates:
   - package-ecosystem: gomod
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      go:
+        update-types: [minor, patch]
     commit-message:
       prefix: build
       include: scope
@@ -11,6 +19,11 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        update-types: [minor, patch]
     commit-message:
       prefix: ci
       include: scope
